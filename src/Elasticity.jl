@@ -1,0 +1,314 @@
+module Elasticity
+
+using Diffinitive
+using Diffinitive.Grids
+using Diffinitive.SbpOperators
+using Diffinitive.LazyTensors
+using SparseArrays
+using Tokens # loads DiffinitiveSparseArraysExt, which defines sparse(::LazyTensor)
+using StaticArrays
+
+export elastic_operator, halfspace_system, traction_blocks,
+       flatten, unflatten, dof_index, inject_dirichlet!,
+       fault_neumann_rhs_correction
+
+# ==============================================================================
+# Constant-coefficient isotropic elastic (Navier) operator, adapted from
+# context/notebooks/elastic.jl's variable-coefficient IsotropicElasticOperator.
+#
+# The λ (Hessian-of-divergence) terms ALWAYS use the "wide" sandwich form
+# Dᵢ∘Dⱼ (composed first derivatives), including the diagonal i=j entries —
+# this is not just a variable-coefficient necessity: the notebook's own
+# comment is explicit that the diagonal must stay wide "to avoid dispersion
+# errors" between the λ- and μ-driven parts of the operator, and that holds
+# for constant coefficients too. Only μ's *diagonal* (same-direction, i=j)
+# term gets the compact "narrow" native `second_derivative` — it's a
+# genuinely separate physical piece (the shear-Laplacian term), not part of
+# the λ Hessian structure, so there's nothing to stay consistent with.
+# μ's off-diagonal terms have no narrow equivalent (no mixed-partial SBP
+# operator exists) and use the same wide sandwich as λ.
+# ==============================================================================
+
+struct IsotropicElasticOperator{D,TL<:NTuple{D,NTuple{D,LazyTensor{D,D}}},TM<:NTuple{D,NTuple{D,LazyTensor{D,D}}}} <: LazyTensor{D,D}
+    lambda::TL   # lambda[i][j] = λ*(Dᵢ∘Dⱼ), for all i,j
+    mu::TM       # mu[i][j] = μ*Dᵢᵢ (narrow) if i==j, else μ*(Dᵢ∘Dⱼ) (wide)
+    size::NTuple{D,Int}
+end
+
+"""
+    isotropic_lambda_mu(g, λ, μ, stencil_set)
+
+Builds the `D×D` tuples of λ- and μ-weighted second-derivative operators
+(see module notes above for the wide/narrow split) used by both
+`elastic_operator` and `elastic_blocks`.
+"""
+function isotropic_lambda_mu(g, λ, μ, stencil_set)
+    D = ndims(g)
+    D1 = ntuple(i -> first_derivative(g, stencil_set, i), D)
+    D2 = ntuple(i -> second_derivative(g, stencil_set, i), D)
+    lambda = ntuple(Val(D)) do i
+        ntuple(Val(D)) do j
+            λ * (D1[i] ∘ D1[j])
+        end
+    end
+    mu = ntuple(Val(D)) do i
+        ntuple(Val(D)) do j
+            i == j ? μ * D2[i] : μ * (D1[i] ∘ D1[j])
+        end
+    end
+    return lambda, mu
+end
+
+"""
+    elastic_operator(g, λ, μ, stencil_set)
+
+The constant-coefficient isotropic Navier operator as a `LazyTensor` acting
+on vector-valued (`SVector{D}`) grid functions.
+"""
+function elastic_operator(g, λ, μ, stencil_set)
+    lambda, mu = isotropic_lambda_mu(g, λ, μ, stencil_set)
+    return IsotropicElasticOperator(lambda, mu, size(g))
+end
+
+"""
+    elastic_blocks(g, λ, μ, stencil_set)
+
+The `D×D` tuple of scalar operators `M[j][k]` (coefficient of `u_k` in
+equation `j`) for the assembled Navier operator, combining the λ/μ pieces
+from `isotropic_lambda_mu`: `M[j][j] = μ∇² + μ*Dⱼⱼ + λ*(Dⱼ∘Dⱼ)`,
+`M[j][k] = μ*(Dⱼ∘Dₖ) + λ*(Dⱼ∘Dₖ)` for `k≠j`.
+"""
+function elastic_blocks(g, λ, μ, stencil_set)
+    D = ndims(g)
+    lambda, mu = isotropic_lambda_mu(g, λ, μ, stencil_set)
+    Δμ = μ * laplace(g, stencil_set)
+    return ntuple(Val(D)) do j
+        ntuple(Val(D)) do k
+            j == k ? Δμ + mu[j][j] + lambda[j][j] : mu[j][k] + lambda[j][k]
+        end
+    end
+end
+
+LazyTensors.range_size(op::IsotropicElasticOperator) = op.size
+LazyTensors.domain_size(op::IsotropicElasticOperator) = op.size
+
+# General D-dimensional apply, kept as a correctness reference (mirrors
+# elastic.jl's general case) — allocates due to Julia/Diffinitive inference
+# limitations on the generic `ntuple`+loop form (documented in the notebook
+# as a known issue), which is why the 3D case below is hand-specialized.
+function LazyTensors.apply(op::IsotropicElasticOperator{D}, u::AbstractArray{Tu,D}, I...) where {D,Tu}
+    S = eltype(Tu)
+    return ntuple(Val(D)) do j
+        uⱼ = componentview(u, j)
+        res = S(2) * apply(op.mu[j][j], uⱼ, I...)
+        for i in 1:D
+            res += apply(op.lambda[j][i], componentview(u, i), I...)
+        end
+        for i in Iterators.flatten((1:j-1, j+1:D))
+            uᵢ = componentview(u, i)
+            res += apply(op.mu[i][i], uⱼ, I...) + apply(op.mu[i][j], uᵢ, I...)
+        end
+        res
+    end |> SVector
+end
+
+# Non-allocating specialized 3D apply (this project is always 3D), directly
+# mirroring elastic.jl's hand-unrolled 3D specialization.
+@inline function LazyTensors.apply(op::IsotropicElasticOperator{3}, u::AbstractArray{Tu,3}, I...) where Tu
+    u1 = componentview(u, 1)
+    u2 = componentview(u, 2)
+    u3 = componentview(u, 3)
+
+    D₁₁λ = op.lambda[1][1]; D₁₂λ = op.lambda[1][2]; D₁₃λ = op.lambda[1][3]
+    D₂₁λ = op.lambda[2][1]; D₂₂λ = op.lambda[2][2]; D₂₃λ = op.lambda[2][3]
+    D₃₁λ = op.lambda[3][1]; D₃₂λ = op.lambda[3][2]; D₃₃λ = op.lambda[3][3]
+
+    D₁₁μ = op.mu[1][1]; D₁₂μ = op.mu[1][2]; D₁₃μ = op.mu[1][3]
+    D₂₁μ = op.mu[2][1]; D₂₂μ = op.mu[2][2]; D₂₃μ = op.mu[2][3]
+    D₃₁μ = op.mu[3][1]; D₃₂μ = op.mu[3][2]; D₃₃μ = op.mu[3][3]
+
+    res1 = apply(D₁₁λ, u1, I...) + apply(D₁₂λ, u2, I...) + apply(D₁₃λ, u3, I...) +
+         2 * apply(D₁₁μ, u1, I...) + apply(D₂₂μ, u1, I...) + apply(D₂₁μ, u2, I...) +
+         apply(D₃₁μ, u3, I...) + apply(D₃₃μ, u1, I...)
+
+    res2 = apply(D₂₁λ, u1, I...) + apply(D₂₂λ, u2, I...) + apply(D₂₃λ, u3, I...) +
+         apply(D₁₁μ, u2, I...) + apply(D₁₂μ, u1, I...) +
+         2 * apply(D₂₂μ, u2, I...) + apply(D₃₂μ, u3, I...) + apply(D₃₃μ, u2, I...)
+
+    res3 = apply(D₃₁λ, u1, I...) + apply(D₃₂λ, u2, I...) + apply(D₃₃λ, u3, I...) +
+         apply(D₁₁μ, u3, I...) + apply(D₁₃μ, u1, I...) +
+         apply(D₂₂μ, u3, I...) + apply(D₂₃μ, u2, I...) +
+         2 * apply(D₃₃μ, u3, I...)
+
+    return SVector{3,eltype(Tu)}(res1, res2, res3)
+end
+
+# Non-allocating specialized 2D apply, mirroring elastic.jl's 2D
+# specialization (used e.g. for 2D elastic wave simulations).
+@inline function LazyTensors.apply(op::IsotropicElasticOperator{2}, u::AbstractArray{Tu,2}, I...) where Tu
+    u1 = componentview(u, 1)
+    u2 = componentview(u, 2)
+
+    D₁₁λ = op.lambda[1][1]; D₁₂λ = op.lambda[1][2]
+    D₂₁λ = op.lambda[2][1]; D₂₂λ = op.lambda[2][2]
+
+    D₁₁μ = op.mu[1][1]; D₁₂μ = op.mu[1][2]
+    D₂₁μ = op.mu[2][1]; D₂₂μ = op.mu[2][2]
+
+    res1 = apply(D₁₁λ, u1, I...) + apply(D₁₂λ, u2, I...) +
+         2 * apply(D₁₁μ, u1, I...) + apply(D₂₂μ, u1, I...) + apply(D₂₁μ, u2, I...)
+
+    res2 = apply(D₂₁λ, u1, I...) + apply(D₂₂λ, u2, I...) +
+         2 * apply(D₂₂μ, u2, I...) + apply(D₁₁μ, u2, I...) + apply(D₁₂μ, u1, I...)
+
+    return SVector{2,eltype(Tu)}(res1, res2)
+end
+
+# ==============================================================================
+# Half-space linear system with the fault boundary condition at x1=0
+# (Dirichlet/injection on u2,u3; Neumann/SAT on u1) and far-field boundaries
+# left for the caller to inject (via `inject_dirichlet!`).
+# ==============================================================================
+
+const FAULT_BOUNDARY = CartesianBoundary{1,LowerBoundary}()
+
+"""
+    halfspace_system(g, λ, μ, stencil_set)
+
+Builds the `3N × 3N` sparse matrix (`N = length(g)`, component-major: rows/cols
+`1:N` are the u1 equations/unknowns, `N+1:2N` are u2, `2N+1:3N` are u3) for
+the constant-coefficient Navier operator on `g`, with the Neumann condition
+`∂u1/∂x1 = 0` at the fault (x1=0, the grid's lower boundary in dimension 1)
+already folded in via SAT. Far-field and fault-tangential (u2,u3) Dirichlet
+conditions are NOT applied here — use `inject_dirichlet!` with `dof_index`
+for those, since their data depends on the (possibly time-varying) slip.
+"""
+function halfspace_system(g, λ, μ, stencil_set)
+    D = ndims(g)
+    M = elastic_blocks(g, λ, μ, stencil_set)
+
+    # Neumann SAT correction for u1's own equation at the fault. M[1][1] has
+    # three normal-direction-second-derivative pieces needing correction:
+    # μ*Δ (full Laplace), μ*D₁₁ (narrow), and λ*(D₁∘D₁) (wide) — but
+    # sat_tensors only depends on the grid/stencil_set, not on the wrapped
+    # operator, so the same two correction terms (weighted by μ and λ+μ
+    # respectively) cover all three regardless of narrow vs wide.
+    Δ_full = Laplace(g, stencil_set)
+    Δ_11 = Laplace(second_derivative(g, stencil_set, 1), stencil_set)
+    penalty_full, d_full = sat_tensors(Δ_full, g, NeumannCondition(0.0, FAULT_BOUNDARY))
+    penalty_11, d_11 = sat_tensors(Δ_11, g, NeumannCondition(0.0, FAULT_BOUNDARY))
+    sat11 = μ * (penalty_full ∘ d_full) + (λ + μ) * (penalty_11 ∘ d_11)
+
+    blocks = [sparse(j == k == 1 ? M[j][k] + sat11 : M[j][k]) for j in 1:D, k in 1:D]
+    return reduce(vcat, [reduce(hcat, blocks[j, :]) for j in 1:D])
+end
+
+"""
+    fault_neumann_rhs_correction(g, λ, μ, stencil_set, neumann_data)
+
+The right-hand-side correction to add to the u1 (first `N = length(g)`)
+block of the RHS when the fault's Neumann condition `∂u1/∂x1 = neumann_data`
+is non-homogeneous. `neumann_data` is a grid function on
+`boundary_grid(g, FAULT_BOUNDARY)`. Only needed for testing against a
+manufactured solution — the physical problem always has `neumann_data = 0`,
+for which this correction is zero (already the case built into
+`halfspace_system`).
+"""
+function fault_neumann_rhs_correction(g, λ, μ, stencil_set, neumann_data)
+    Δ_full = Laplace(g, stencil_set)
+    Δ_11 = Laplace(second_derivative(g, stencil_set, 1), stencil_set)
+    penalty_full, _ = sat_tensors(Δ_full, g, NeumannCondition(0.0, FAULT_BOUNDARY))
+    penalty_11, _ = sat_tensors(Δ_11, g, NeumannCondition(0.0, FAULT_BOUNDARY))
+    return vec(collect(μ * (penalty_full * neumann_data))) +
+           vec(collect((λ + μ) * (penalty_11 * neumann_data)))
+end
+
+"""
+    traction_blocks(g, λ, μ, stencil_set, bid)
+
+The `D × D` matrix of sparse operators `T[i,k]` such that the traction
+component `τᵢ = σᵢ,dim` (with respect to the fixed `+dim` axis direction,
+`dim = grid_id(bid)` — NOT the outward-normal sign convention) on boundary
+`bid` is `τᵢ = Σₖ T[i,k]*uₖ`.
+"""
+function traction_blocks(g, λ, μ, stencil_set, bid)
+    D = ndims(g)
+    dim = grid_id(bid)
+    e = boundary_restriction(g, stencil_set, bid)
+    Dk = ntuple(k -> first_derivative(g, stencil_set, k), D)
+    Nb = prod(size(boundary_grid(g, bid)))
+    N = length(g)
+
+    T = [spzeros(Nb, N) for _ in 1:D, _ in 1:D]
+    T[dim, dim] = sparse((λ + 2μ) * (e ∘ Dk[dim]))
+    for k in 1:D
+        k == dim && continue
+        T[dim, k] = sparse(λ * (e ∘ Dk[k]))
+    end
+    for i in 1:D
+        i == dim && continue
+        T[i, dim] = sparse(μ * (e ∘ Dk[i]))
+        T[i, i] = sparse(μ * (e ∘ Dk[dim]))
+    end
+    return T
+end
+
+# ==============================================================================
+# Vector-valued grid function <-> flat component-major vector utilities.
+# ==============================================================================
+
+"""
+    dof_index(g, component, I::CartesianIndex)
+
+Linear index into the flattened, component-major `D*length(g)`-vector
+representation of a `D`-component vector-valued grid function on `g`.
+"""
+dof_index(g, component, I::CartesianIndex) = (component - 1) * length(g) + LinearIndices(size(g))[I]
+
+"""
+    flatten(u::AbstractArray{<:SVector{D}})
+
+Flattens a `D`-component vector-valued grid function into a component-major
+vector of length `D*length(u)`, matching `dof_index`/`halfspace_system`'s
+ordering.
+"""
+function flatten(u::AbstractArray{<:SVector{D}}) where D
+    N = length(u)
+    v = Vector{Float64}(undef, D * N)
+    for comp in 1:D
+        v[(comp-1)*N+1:comp*N] .= vec(collect(componentview(u, comp)))
+    end
+    return v
+end
+
+"""
+    unflatten(v::AbstractVector, g, D)
+
+Inverse of `flatten`: reshapes a component-major flat vector back into a
+`D`-component vector-valued grid function on `g`.
+"""
+function unflatten(v::AbstractVector, g, D)
+    li = LinearIndices(size(g))
+    N = length(g)
+    return map(CartesianIndices(size(g))) do I
+        SVector(ntuple(comp -> v[(comp-1)*N+li[I]], D))
+    end
+end
+
+"""
+    inject_dirichlet!(A, rhs, rows, values)
+
+Strongly enforces `rhs[rows] .= values` by zeroing those rows of `A` and
+setting the diagonal to `1` (no Diffinitive helper exists for this — it's
+only needed for strong/injection boundary conditions, not SAT).
+"""
+function inject_dirichlet!(A::SparseMatrixCSC, rhs::AbstractVector, rows, values)
+    for (r, v) in zip(rows, values)
+        A[r, :] .= 0.0
+        A[r, r] = 1.0
+        rhs[r] = v
+    end
+    return A, rhs
+end
+
+end # module Elasticity

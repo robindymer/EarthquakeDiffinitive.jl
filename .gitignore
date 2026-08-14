@@ -4,3 +4,7 @@
 /Manifest*.toml
 /docs/Manifest*.toml
 /docs/build/
+/scripts/Manifest*.toml
+/scripts/*.mp4
+/scripts/*.gif
+/scripts/*.png

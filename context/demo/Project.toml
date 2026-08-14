@@ -1,0 +1,11 @@
+[deps]
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Diffinitive = "5a373a26-915f-4769-bcab-bf03835de17b"
+ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
+PlutoUI = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+Tokens = "040c2ec2-8d69-4aca-bf03-7d3a7092f2f6"
+WGLMakie = "276b4fcb-3e11-5398-bf8b-a0c2d153d008"

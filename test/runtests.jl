@@ -2,5 +2,6 @@ using EarthquakeDiffinitive
 using Test
 
 @testset "EarthquakeDiffinitive.jl" begin
-    # Write your tests here.
+    include("pore_pressure_test.jl")
+    include("elasticity_test.jl")
 end

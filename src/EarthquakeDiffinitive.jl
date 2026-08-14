@@ -2,11 +2,10 @@ module EarthquakeDiffinitive
 
 using Diffinitive
 
-# re-export or wrap functionality as needed
-export my_earthquake_model
+include("PorePressure.jl")
+using .PorePressure
 
-function my_earthquake_model(args...)
-    # call into Diffinitive here
-end
+include("Elasticity.jl")
+using .Elasticity
 
 end

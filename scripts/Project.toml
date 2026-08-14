@@ -1,0 +1,4 @@
+[deps]
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Diffinitive = "5a373a26-915f-4769-bcab-bf03835de17b"
+EarthquakeDiffinitive = "9fa83511-5388-4054-9589-4ce011e12b61"
