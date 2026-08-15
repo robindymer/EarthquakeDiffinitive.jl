@@ -97,8 +97,10 @@ half-space shortcut.
   subtlety beyond building the traction operator from Diffinitive's
   SBP-compatible `first_derivative`, which `traction_blocks` already does.
   Applied half-weighted to *both* sides (the note also allows applying it
-  fully to one side, "since P averages it out" — that produced an
-  asymmetric, non-PSD system empirically, so used the symmetric variant).
+  fully to one side, "since P averages it out" — full-weight-one-side
+  produced a *more* asymmetric, non-PSD system empirically than
+  half-weighted-both-sides, so used the latter — though, per below,
+  neither is the exact symmetric construction the reference note assumes).
 - **P**: sparse projection — averages tangential (u2,u3) fault DOF pairs,
   zeroes far-field DOFs, identity elsewhere. Confirmed symmetric and
   idempotent.
@@ -117,6 +119,32 @@ half-space shortcut.
   leaves *explicit* zeros stored in the sparsity pattern rather than
   removing them, silently breaking a `nzrange`-based "is this DOF free"
   check until `dropzeros!`ed.)
+- **The reduced system is *not* symmetric/PSD as the reference note
+  assumes** (checked numerically: ~54% relative asymmetry, ~200 negative
+  eigenvalues out of ~2300 at a small test grid), so CG genuinely isn't
+  usable yet — this is a structural gap, not a bug in the delivered
+  answer (the self-consistency test below still passes via direct solve).
+  Dug into why: the far-field/bulk part of the assembled system *is*
+  exactly symmetric (~1e-14) once far-field DOFs are projected out, so
+  `elastic_blocks` itself is fine — the gap is entirely in the fault SAT.
+  Literature (Almquist & Dunham, arXiv:2003.12811) confirms a symmetric
+  interface SAT needs *two* term types (`E'·traction` **and**
+  `T'·displacement-jump`), not just the one (`E'·traction`) implemented
+  here. Building the second term properly surfaced a deeper mismatch:
+  `traction_blocks` — accurate as a *physical* traction operator — is not
+  the operator that actually appears in `elastic_blocks`'s own discrete
+  SBP identity. Two confirmed discrepancies: (1) the narrow (μ) shear
+  pieces need `normal_derivative` (outward-signed), not the fixed-axis
+  `e∘∂/∂xₙ` `traction_blocks` uses — confirmed numerically these are
+  genuinely different operators, not just a sign flip; (2) the wide
+  (λ+μ) cross terms in `elastic_blocks` carry an extra μ contribution
+  (from expanding `(λ+μ)∇(∇·u)`) with no counterpart in the physical
+  traction formula at all. A provably symmetric SAT would need a second,
+  separately-derived "SBP-consistent flux operator" distinct from
+  `traction_blocks` — real work, and low-value right now since
+  `reduced_solve`'s direct solve already gives verified-correct results;
+  CG would only be a performance optimization. Deferred until it's
+  actually needed at production scale.
 - Validated in `test/elasticity_split_node_test.jl` via an algebraic
   self-consistency check (deliberately avoiding another continuum-PDE
   derivation after the half-space episode): pick an arbitrary smooth,
