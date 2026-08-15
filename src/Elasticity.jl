@@ -1,3 +1,15 @@
+# This module used to also provide `halfspace_system`, a single-grid
+# reduction of the fault problem to x1≥0 exploiting the whole-space
+# reflection symmetry — since removed. That reduction's `∂u1/∂x1=0` fault
+# condition assumed the tangential displacement gradients (∂2u2, ∂3u3)
+# vanish at the fault, which is only true for spatially uniform slip; for
+# general slip it under-counts a genuine jump in normal stress (σ11)
+# proportional to the slip gradient. See `ElasticitySplitNode.jl` (matching
+# `context/SEAS_benchmark.pdf`'s two-sided P+SAT+χ formulation) for the
+# correct treatment. The building blocks below (`elastic_operator`,
+# `elastic_blocks`, `traction_blocks`) are unaffected — the error was
+# specifically in how the fault boundary condition was derived, not in the
+# operators themselves — and `ElasticitySplitNode` reuses them directly.
 module Elasticity
 
 using Diffinitive
@@ -8,9 +20,8 @@ using SparseArrays
 using Tokens # loads DiffinitiveSparseArraysExt, which defines sparse(::LazyTensor)
 using StaticArrays
 
-export elastic_operator, halfspace_system, traction_blocks,
-       flatten, unflatten, dof_index, inject_dirichlet!,
-       fault_neumann_rhs_correction
+export elastic_operator, elastic_blocks, traction_blocks,
+       flatten, unflatten, dof_index, inject_dirichlet!
 
 # ==============================================================================
 # Constant-coefficient isotropic elastic (Navier) operator, adapted from
@@ -162,65 +173,6 @@ end
          2 * apply(D₂₂μ, u2, I...) + apply(D₁₁μ, u2, I...) + apply(D₁₂μ, u1, I...)
 
     return SVector{2,eltype(Tu)}(res1, res2)
-end
-
-# ==============================================================================
-# Half-space linear system with the fault boundary condition at x1=0
-# (Dirichlet/injection on u2,u3; Neumann/SAT on u1) and far-field boundaries
-# left for the caller to inject (via `inject_dirichlet!`).
-# ==============================================================================
-
-const FAULT_BOUNDARY = CartesianBoundary{1,LowerBoundary}()
-
-"""
-    halfspace_system(g, λ, μ, stencil_set)
-
-Builds the `3N × 3N` sparse matrix (`N = length(g)`, component-major: rows/cols
-`1:N` are the u1 equations/unknowns, `N+1:2N` are u2, `2N+1:3N` are u3) for
-the constant-coefficient Navier operator on `g`, with the Neumann condition
-`∂u1/∂x1 = 0` at the fault (x1=0, the grid's lower boundary in dimension 1)
-already folded in via SAT. Far-field and fault-tangential (u2,u3) Dirichlet
-conditions are NOT applied here — use `inject_dirichlet!` with `dof_index`
-for those, since their data depends on the (possibly time-varying) slip.
-"""
-function halfspace_system(g, λ, μ, stencil_set)
-    D = ndims(g)
-    M = elastic_blocks(g, λ, μ, stencil_set)
-
-    # Neumann SAT correction for u1's own equation at the fault. M[1][1] has
-    # three normal-direction-second-derivative pieces needing correction:
-    # μ*Δ (full Laplace), μ*D₁₁ (narrow), and λ*(D₁∘D₁) (wide) — but
-    # sat_tensors only depends on the grid/stencil_set, not on the wrapped
-    # operator, so the same two correction terms (weighted by μ and λ+μ
-    # respectively) cover all three regardless of narrow vs wide.
-    Δ_full = Laplace(g, stencil_set)
-    Δ_11 = Laplace(second_derivative(g, stencil_set, 1), stencil_set)
-    penalty_full, d_full = sat_tensors(Δ_full, g, NeumannCondition(0.0, FAULT_BOUNDARY))
-    penalty_11, d_11 = sat_tensors(Δ_11, g, NeumannCondition(0.0, FAULT_BOUNDARY))
-    sat11 = μ * (penalty_full ∘ d_full) + (λ + μ) * (penalty_11 ∘ d_11)
-
-    blocks = [sparse(j == k == 1 ? M[j][k] + sat11 : M[j][k]) for j in 1:D, k in 1:D]
-    return reduce(vcat, [reduce(hcat, blocks[j, :]) for j in 1:D])
-end
-
-"""
-    fault_neumann_rhs_correction(g, λ, μ, stencil_set, neumann_data)
-
-The right-hand-side correction to add to the u1 (first `N = length(g)`)
-block of the RHS when the fault's Neumann condition `∂u1/∂x1 = neumann_data`
-is non-homogeneous. `neumann_data` is a grid function on
-`boundary_grid(g, FAULT_BOUNDARY)`. Only needed for testing against a
-manufactured solution — the physical problem always has `neumann_data = 0`,
-for which this correction is zero (already the case built into
-`halfspace_system`).
-"""
-function fault_neumann_rhs_correction(g, λ, μ, stencil_set, neumann_data)
-    Δ_full = Laplace(g, stencil_set)
-    Δ_11 = Laplace(second_derivative(g, stencil_set, 1), stencil_set)
-    penalty_full, _ = sat_tensors(Δ_full, g, NeumannCondition(0.0, FAULT_BOUNDARY))
-    penalty_11, _ = sat_tensors(Δ_11, g, NeumannCondition(0.0, FAULT_BOUNDARY))
-    return vec(collect(μ * (penalty_full * neumann_data))) +
-           vec(collect((λ + μ) * (penalty_11 * neumann_data)))
 end
 
 """

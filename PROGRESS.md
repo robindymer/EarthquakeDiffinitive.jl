@@ -31,18 +31,10 @@ Gaussian-source variant of the fault's 2D pore-pressure diffusion equation
 - Validated in `test/pore_pressure_test.jl` against the closed-form
   analytic solution (PDF eq. 21) and via grid-refinement convergence.
 
-### Elastic solver (`src/Elasticity.jl`)
+### Elastic operator building blocks (`src/Elasticity.jl`)
 Homogeneous isotropic elasticity (PDF §1) relating fault slip to fault
 traction.
 
-- **Key finding**: no need for a two-block/interface-SAT scheme (Diffinitive
-  has no multiblock support anyway). Because BP8's medium is identical on
-  both sides of the fault and slip is the only forcing, the whole-space
-  problem is provably odd in tangential displacement / even in normal
-  displacement about the fault — reducing the whole-space problem to a
-  **single half-space grid** (x1≥0) with a mixed boundary condition at
-  x1=0: `u2=s2/2, u3=s3/2` (Dirichlet/injection) and `∂u1/∂x1=0`
-  (Neumann/SAT). Far-field truncation is plain Dirichlet/injection (`u=0`).
 - `elastic_operator`/`elastic_blocks`: the constant-coefficient Navier
   operator, matching `context/notebooks/elastic.jl`'s discretization choice
   term-for-term rather than just its continuous-level simplification: the λ
@@ -54,25 +46,84 @@ traction.
   shear-Laplacian piece). An initial version collapsed λ and μ's diagonal
   terms together (valid only by commuting partial derivatives at the
   *continuous* level) and used narrow throughout — caught before it caused
-  real damage, since `elastic_blocks`/`halfspace_system` were still young.
-  `IsotropicElasticOperator` also has a hand-specialized, allocation-free 3D
-  `apply` (mirroring the notebook's own non-allocating 2D/3D specializations,
-  needed because Diffinitive's generic D-dimensional `apply` doesn't infer
-  well) — confirmed 0 bytes/point for a full in-place `E*u`.
-- `halfspace_system`: assembles the `3N×3N` sparse block matrix with the
-  fault's Neumann SAT baked in.
-- `traction_blocks`: extracts fault traction (σ21, σ31 — what the friction
-  law needs) from a solved displacement field.
+  real damage. `IsotropicElasticOperator` also has hand-specialized,
+  allocation-free 2D/3D `apply` methods (mirroring the notebook's own
+  non-allocating specializations, needed because Diffinitive's generic
+  D-dimensional `apply` doesn't infer well) — confirmed 0 bytes/point for a
+  full in-place `E*u`. Used directly by `scripts/elastic_wave_2d.jl` (a 2D
+  elastic wave simulation validating the operator qualitatively — clean
+  P/S wavefront separation at the right speed ratio, correct non-circular
+  S-wave radiation pattern, stable reflections).
+- `traction_blocks`: extracts fault traction (σᵢ,dim, fixed `+dim`-axis
+  convention, not outward-normal) from a solved displacement field.
 - `inject_dirichlet!`, `dof_index`, `flatten`/`unflatten`: strong-injection
   and vector-grid-function utilities (no Diffinitive helper exists for
   strong Dirichlet row-injection).
-- Validated in `test/elasticity_test.jl`: exact polynomial differentiation,
-  a manufactured-solution full-BVP solve (converges under refinement), and
-  traction accuracy. **Bug found and fixed along the way**: Diffinitive's
-  `normal_derivative`/`NeumannCondition` use the *outward*-normal sign
-  convention, not the fixed `+x1`-axis convention assumed at first — caused
-  an order-1 solution error that didn't shrink under refinement (the
-  giveaway it was a real bug, not discretization error).
+- Validated in `test/elasticity_test.jl` (polynomial exactness, sparse vs.
+  `LazyTensor` consistency, traction accuracy against a manufactured field).
+
+**This module used to also provide `halfspace_system`**, a single-grid
+reduction of the fault problem to x1≥0, derived from an (apparently)
+reflection symmetry of the whole-space problem. **That derivation had a
+real physics bug**, found while cross-validating the newer split-node
+solver against it: it assumed the tangential displacement gradients
+(∂2u2, ∂3u3) vanish at the fault, which is only true for *spatially
+uniform* slip — for general slip there's a genuine jump in normal stress
+(σ11) proportional to the slip gradient, which `∂u1/∂x1=0` silently
+dropped. Confirmed numerically: the old solver produced a normal-stress
+perturbation at the fault of the same order of magnitude as the shear
+tractions for a Gaussian slip profile — not the ~0 the derivation assumed.
+MMS testing never caught this because MMS validates that the discretization
+correctly solves the equations *as written*, not that those equations
+match BP8's actual physics — a good reminder that discretization-accuracy
+tests and physical-model-correctness are genuinely different questions.
+`halfspace_system` has been removed; `ElasticitySplitNode` (below) is now
+the standard approach. The building blocks above were unaffected — the
+error was specifically in the fault boundary condition, not the operators.
+
+### Two-sided split-node elastic solver (`src/ElasticitySplitNode.jl`)
+Implements `context/SEAS_benchmark.pdf`'s reference formulation exactly:
+`-HP(D+SAT)P u = HP(D+SAT)χ(s)`, two separate grids (`g_minus`/`g_plus`)
+glued at the fault via a genuine interface SAT, rather than the (flawed)
+half-space shortcut.
+
+- **D**: block-diagonal, reusing `Elasticity.elastic_blocks` per side
+  unchanged.
+- **SAT**: interface traction coupling — generalizes the scalar Neumann-SAT
+  pattern (`-H⁻¹∘e'∘Hᵧ`) by swapping the scalar normal-derivative for the
+  vector traction operator (`Elasticity.traction_blocks`). Verified against
+  the literature this session (Duru & Virta, JCP 2014, is the foundational
+  reference for exactly this construction) — standard, no elasticity-specific
+  subtlety beyond building the traction operator from Diffinitive's
+  SBP-compatible `first_derivative`, which `traction_blocks` already does.
+  Applied half-weighted to *both* sides (the note also allows applying it
+  fully to one side, "since P averages it out" — that produced an
+  asymmetric, non-PSD system empirically, so used the symmetric variant).
+- **P**: sparse projection — averages tangential (u2,u3) fault DOF pairs,
+  zeroes far-field DOFs, identity elsewhere. Confirmed symmetric and
+  idempotent.
+- **χ(s)**: forcing vector, `±s_j/2` at the fault for j=2,3 — same
+  convention the (now-removed) half-space solver used as Dirichlet data, a
+  good independent consistency signal that survived the rewrite.
+- `A = -HP(D+SAT)P` is **singular by construction** (P's null space —
+  far-field DOFs and the antisymmetric half of each tangential pair — is
+  ~40% of the system). The reference note itself flags this and suggests
+  CG; plain GMRES stalled well short of convergence (large null space).
+  `reduced_solve` instead eliminates the redundant/zero DOFs directly from
+  P's own sparsity structure (regular DOFs kept, far-field dropped,
+  tangential pairs merged into one unknown) and solves the resulting
+  genuinely non-singular system directly — robust where the Krylov
+  approach wasn't. (Hit a classic Julia gotcha along the way: `P[i,:] .= 0.0`
+  leaves *explicit* zeros stored in the sparsity pattern rather than
+  removing them, silently breaking a `nzrange`-based "is this DOF free"
+  check until `dropzeros!`ed.)
+- Validated in `test/elasticity_split_node_test.jl` via an algebraic
+  self-consistency check (deliberately avoiding another continuum-PDE
+  derivation after the half-space episode): pick an arbitrary smooth,
+  localized two-sided field, derive the exact forcing that makes it a
+  solution *directly from the assembled discrete operator itself*, then
+  confirm solving recovers it — this tests D, SAT, P, χ, and the solve
+  together without assuming anything about the true physics.
 
 ## Not started yet
 
@@ -81,16 +132,18 @@ Roughly in the order they'd naturally come next:
 1. **Rate-and-state friction + aging law** (PDF eq. 9-12): the ODE for slip
    rate `V` and state `θ`, coupled to elasticity via traction and the
    radiation-damping term `-ηV` (eq. 8).
-2. **Wire physical slip into the elastic solver**: `halfspace_system`
-   currently gets Dirichlet/Neumann data from a manufactured test solution;
-   needs to instead take `s2(x2,x3,t)/2, s3(x2,x3,t)/2` from the friction
-   ODE state.
-3. **Factorize-once performance**: since λ,μ are constant, `halfspace_system`
-   builds the same matrix every call today (tests just call `A \ rhs`
-   fresh). Production use should factorize once and reuse across
-   timesteps/RK stages, updating only the RHS's Dirichlet rows as slip
-   evolves — this was the original architectural motivation for going
-   constant-coefficient.
+2. **Wire physical slip into the elastic solver**: `build_chi` currently
+   takes a manufactured test slip function; needs to instead take
+   `s2(x2,x3,t), s3(x2,x3,t)` from the friction ODE state, and the friction
+   law needs traction computed from `reconstruct_U`'s output, not the raw
+   solve variable.
+3. **Factorize-once performance**: since λ,μ are constant, `split_node_system`
+   rebuilds `A` from scratch every call today. Production use should
+   factorize once (`reduced_solve`'s reduced, non-singular system is a
+   natural factorization target) and reuse across timesteps/RK stages,
+   updating only `χ(s)` (and hence the RHS) as slip evolves — the original
+   architectural motivation for going constant-coefficient in the first
+   place.
 4. **Full coupling**: pore pressure → effective normal stress → friction
    law ⇄ elasticity (slip ⇄ traction), integrated together in time
    (likely `OrdinaryDiffEq`, matching the stiff aging-law dynamics).

@@ -8,4 +8,7 @@ using .PorePressure
 include("Elasticity.jl")
 using .Elasticity
 
+include("ElasticitySplitNode.jl")
+using .ElasticitySplitNode
+
 end
