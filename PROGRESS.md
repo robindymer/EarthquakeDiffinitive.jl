@@ -68,15 +68,25 @@ reflection symmetry of the whole-space problem. **That derivation had a
 real physics bug**, found while cross-validating the newer split-node
 solver against it: it assumed the tangential displacement gradients
 (∂2u2, ∂3u3) vanish at the fault, which is only true for *spatially
-uniform* slip — for general slip there's a genuine jump in normal stress
-(σ11) proportional to the slip gradient, which `∂u1/∂x1=0` silently
-dropped. Confirmed numerically: the old solver produced a normal-stress
-perturbation at the fault of the same order of magnitude as the shear
-tractions for a Gaussian slip profile — not the ~0 the derivation assumed.
-MMS testing never caught this because MMS validates that the discretization
-correctly solves the equations *as written*, not that those equations
-match BP8's actual physics — a good reminder that discretization-accuracy
-tests and physical-model-correctness are genuinely different questions.
+uniform* slip. Confirmed numerically: the old solver produced a
+normal-stress perturbation at the fault of the same order of magnitude as
+the shear tractions for a Gaussian slip profile.
+
+**Correction (this review):** an earlier version of this note read that
+nonzero σ11 as the real physics the half-space BC had dropped. It is the
+other way round. The mirror symmetry x1 → -x1 (u1 even, u2/u3 odd) makes
+σ11 *odd* across the fault, and eq. 6a requires it *continuous*, so
+**σ11 ≡ 0 on the fault** — achieved by a nonzero ∂1u1 exactly cancelling
+the λ(∂2u2+∂3u3) term. Forcing ∂1u1=0 left σ11 ≈ λ(∂2s2+∂3s3)/2, so the
+spurious normal stress was the symptom of the bad BC, not the physics it
+was missing. The removal was right regardless, and σ11 → 0 is now a
+regression test — the one that caught the split-node SAT sign error below.
+
+MMS testing never caught the original bug because MMS validates that the
+discretization correctly solves the equations *as written*, not that those
+equations match BP8's actual physics — a good reminder that
+discretization-accuracy tests and physical-model-correctness are genuinely
+different questions.
 `halfspace_system` has been removed; `ElasticitySplitNode` (below) is now
 the standard approach. The building blocks above were unaffected — the
 error was specifically in the fault boundary condition, not the operators.
@@ -101,9 +111,26 @@ half-space shortcut.
   produced a *more* asymmetric, non-PSD system empirically than
   half-weighted-both-sides, so used the latter — though, per below,
   neither is the exact symmetric construction the reference note assumes).
-- **P**: sparse projection — averages tangential (u2,u3) fault DOF pairs,
-  zeroes far-field DOFs, identity elsewhere. Confirmed symmetric and
-  idempotent.
+  **The `+` side originally had the wrong sign** (fixed in this review):
+  the Neumann/traction SAT is written in terms of the *outward-normal*
+  traction — in Diffinitive's own `sat_tensors(::NeumannCondition)` the
+  `-H⁻¹∘e'∘Hᵧ` prefactor is side-independent and all side-dependence lives
+  in `normal_derivative`'s outward sign. `traction_blocks` is
+  fixed-`+x₁`-axis, so it *is* the outward traction on `g_minus` (fault =
+  its upper boundary) but its negative on `g_plus` (lower boundary). Using
+  one sign for both left the shear tractions discontinuous and inflated
+  the solution by ~200×.
+- **P**: sparse projection — averages **all three** (u1,u2,u3) fault DOF
+  pairs, zeroes far-field DOFs, identity elsewhere. Confirmed symmetric and
+  idempotent. Averaging `u1` is not decoration: it *is* how the no-opening
+  condition u1(0⁺)=u1(0⁻) (eq. 3) is imposed, and it is what the reference
+  note prescribes ("for j = 1, 2, 3"). An earlier version averaged only
+  j=2,3, leaving the two fault-normal DOFs with nothing coupling them; the
+  solve then opened the fault by twice the field amplitude. Nodes on the
+  ring where the fault meets the truncation boundary are excluded from the
+  pairing (`fault_node_pairs`) so they keep their far-field Dirichlet —
+  previously the pairing loop ran after the far-field zeroing and silently
+  overwrote it for j=2,3.
 - **χ(s)**: forcing vector, `±s_j/2` at the fault for j=2,3 — same
   convention the (now-removed) half-space solver used as Dirichlet data, a
   good independent consistency signal that survived the rewrite.
@@ -119,11 +146,13 @@ half-space shortcut.
   leaves *explicit* zeros stored in the sparsity pattern rather than
   removing them, silently breaking a `nzrange`-based "is this DOF free"
   check until `dropzeros!`ed.)
-- **The reduced system is *not* symmetric/PSD as the reference note
-  assumes** (checked numerically: ~54% relative asymmetry, ~200 negative
-  eigenvalues out of ~2300 at a small test grid), so CG genuinely isn't
-  usable yet — this is a structural gap, not a bug in the delivered
-  answer (the self-consistency test below still passes via direct solve).
+- **The reduced system is still not quite symmetric/PSD as the reference
+  note assumes**, though much closer than it looked: most of the original
+  gap was the `+`-side SAT sign error above. At a small test grid the
+  numbers went from ~54% relative asymmetry and 195 negative eigenvalues
+  out of 2318, to **~19% and 3 out of 2205** once the sign, the `u1`
+  averaging and the fault-edge ring were fixed. CG still isn't usable, but
+  the residual is now a small structural gap rather than a broken operator.
   Dug into why: the far-field/bulk part of the assembled system *is*
   exactly symmetric (~1e-14) once far-field DOFs are projected out, so
   `elastic_blocks` itself is fine — the gap is entirely in the fault SAT.
@@ -145,13 +174,26 @@ half-space shortcut.
   `reduced_solve`'s direct solve already gives verified-correct results;
   CG would only be a performance optimization. Deferred until it's
   actually needed at production scale.
-- Validated in `test/elasticity_split_node_test.jl` via an algebraic
-  self-consistency check (deliberately avoiding another continuum-PDE
-  derivation after the half-space episode): pick an arbitrary smooth,
-  localized two-sided field, derive the exact forcing that makes it a
-  solution *directly from the assembled discrete operator itself*, then
-  confirm solving recovers it — this tests D, SAT, P, χ, and the solve
-  together without assuming anything about the true physics.
+- Validated in `test/elasticity_split_node_test.jl` two ways.
+  1. An algebraic self-consistency check (deliberately avoiding another
+     continuum-PDE derivation after the half-space episode): pick an
+     arbitrary smooth, localized two-sided field, derive the exact forcing
+     that makes it a solution *directly from the assembled discrete
+     operator itself*, then confirm solving recovers it — this tests D,
+     SAT, P, χ, and the solve together without assuming anything about the
+     true physics. (Its manufactured field must have continuous `u1`, since
+     `P*U + χ = U` only holds then; that is eq. 3, not a test artifact.)
+  2. **Physics-level checks against BP8's interface conditions**, added
+     after the self-consistency test was found to be blind to both bugs
+     above — by construction it validates D/SAT/P/χ against *each other*,
+     which is exactly the class of error that killed `halfspace_system`.
+     For a prescribed Gaussian slip patch: no opening (eq. 3), the jump
+     really is the imposed slip (eq. 4), σ21/σ31 continuous across the
+     fault (eq. 6b,c), the antisymmetric split max‖U‖ = max|s|/2, and
+     σ11 → 0 under refinement. Current numbers: jumps and shear-traction
+     continuity at machine precision, max‖U‖ = 0.5 exactly for unit slip
+     at every resolution, and max|σ11| falling 0.264 → 0.068 for n = 9 →
+     21 while max|σ21| converges to ~3.03.
 
 ### Rate-and-state friction + aging law (`src/RateStateFriction.jl`)
 The fault friction law (PDF eq. 8-13) as a standalone, pointwise physics
@@ -170,6 +212,14 @@ kernel — not yet wired to the elastic solver's `Δτ` or pore pressure's
   Solved via Newton's method in `x=ln V` (closed-form derivative, no
   `ForwardDiff` needed) — robust across the ~10 decades of `V` the
   benchmark spans, since `f(V,θ)` is smooth and strictly increasing in `V`.
+  Steps are **clamped in log space** and non-convergence now throws.
+  Undamped, the iteration diverges whenever it is seeded below the root at
+  `V ≳ 1 m/s`: there `asinh(u) ≈ ln(2u)` is nearly linear in `x`, so the
+  step overshoots by many decades and `exp(x)` overflows, silently
+  returning `NaN` or a value wrong by ~1e18 (30 of 315 sweep points before
+  the fix, 0 after). BP8-QD-GS is velocity-strengthening and should never
+  reach that regime, but a warm start during acceleration always
+  approaches from below, so it stayed reachable in a time loop.
   No new dependency: the existing `NonlinearSolve` stack is only a
   transitive dep of `OrdinaryDiffEq`, and this is a small enough, well-behaved
   root to hand-roll instead.
@@ -185,7 +235,13 @@ kernel — not yet wired to the elastic solver's `Δτ` or pore pressure's
   regardless): aging-law steady state, strength monotonicity in `V`,
   forward round-trips (with and without radiation damping, swept across
   ~10 decades of `V`), `solve_slip_velocity`'s direction/magnitude, and the
-  eq. 28-29 initial condition's self-consistency.
+  eq. 28-29 initial condition's self-consistency, plus regression tests for
+  the seeded-from-below Newton divergence, the non-convergence error, and
+  `solve_slip_velocity` returning `V=0` (not `NaN`) at zero trial stress.
+  Sanity check at Table 1 values: θ₀ = 4.02e11 s, far above
+  θ_ss = D_RS/V_init = 5e8 s, consistent with τ_init = 14.6 MPa sitting
+  above τ_ss = 12.93 MPa — the fault starts over-healed, as an
+  injection-triggered benchmark requires.
 
 ## Not started yet
 
@@ -197,7 +253,12 @@ Roughly in the order they'd naturally come next:
    `RateStateFriction.solve_slip_velocity`, integrated over time), and the
    friction law needs traction computed from `reconstruct_U`'s output, not
    the raw solve variable. Also where eq. 13's `V=0` mask outside the
-   frictional domain `Ω_f` gets applied.
+   frictional domain `Ω_f` gets applied. Note the two fault-plane grids do
+   **not** coincide: pore pressure lives on `Ω_f = [-400,400]²` at
+   Δz = 10 m (81×81), while the elastic grids' fault plane has to extend
+   well beyond `Ω_f` for the far-field truncation to be harmless, so
+   `σ̄ = σ - p` needs `p` embedded into (zero-padded onto) the larger
+   elastic fault plane.
 2. **Factorize-once performance**: since λ,μ are constant, `split_node_system`
    rebuilds `A` from scratch every call today. Production use should
    factorize once (`reduced_solve`'s reduced, non-singular system is a

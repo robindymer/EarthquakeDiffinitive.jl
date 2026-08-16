@@ -11,7 +11,7 @@ using StaticArrays
 using ..Elasticity: elastic_blocks, traction_blocks
 
 export split_node_system, dof_index_minus, dof_index_plus, build_chi,
-       reconstruct_U, reduced_solve
+       reconstruct_U, reduced_solve, fault_node_pairs
 
 # ==============================================================================
 # Two-sided (split-node) SBP-SAT elastic system, matching the formulation in
@@ -21,13 +21,12 @@ export split_node_system, dof_index_minus, dof_index_plus, build_chi,
 #
 # D: block-diagonal elastic operator (Elasticity.elastic_blocks, unchanged,
 #    on each side's own grid).
-# SAT: interface traction coupling, applied to the `+` side only (per the
-#    note — it doesn't matter which side, P averages it out): the usual
-#    scalar Neumann-SAT pattern penalty = -H⁻¹∘e'∘Hᵧ, but with the scalar
-#    normal-derivative operator replaced by the (already fixed-+dim-axis
-#    convention) traction operator, and "data" being the OTHER side's
-#    traction.
-# P: projection — averages tangential (u2,u3) fault DOF pairs, zeroes
+# SAT: interface traction coupling — the usual scalar Neumann-SAT pattern
+#    penalty = -H⁻¹∘e'∘Hᵧ, but with the scalar normal-derivative operator
+#    replaced by the traction operator, and "data" being the OTHER side's
+#    traction. See the sign discussion in `split_node_system`.
+# P: projection — averages ALL THREE fault DOF pairs (u1 too: that is how the
+#    no-opening condition u1(0⁺)=u1(0⁻), BP8 eq. 3, gets imposed), zeroes
 #    far-field DOFs, identity elsewhere.
 # χ(s): forcing vector encoding the prescribed slip, ±s_j/2 at the fault.
 #
@@ -49,16 +48,28 @@ function _prolongation(g, stencil_set, bid)
 end
 
 """
-    matching_boundary_pairs(g_minus, bid_minus, g_plus, bid_plus)
+    fault_node_pairs(g_minus, g_plus)
 
 Pairs of `(I_minus, I_plus)` full-grid `CartesianIndex`es on the two grids'
 fault-facing boundaries that share the same `(x2,x3)` location, matched by
 coordinate value (robust to any difference in `boundary_indices` iteration
 order between the two grids).
+
+Nodes that lie on a far-field boundary as well as on the fault — the ring
+where the fault plane meets the truncated domain's sides — are **excluded**:
+those carry the far-field Dirichlet condition `u=0` (which the reference note
+applies to all of `j=1,2,3`), so they must be neither averaged by `P` nor
+given slip by `χ`. Physically consistent too: they sit outside the frictional
+domain `Ω_f`, where BP8 eq. 13 gives zero slip anyway.
 """
-function matching_boundary_pairs(g_minus, bid_minus, g_plus, bid_plus)
+function fault_node_pairs(g_minus, g_plus)
+    bid_minus = CartesianBoundary{1,UpperBoundary}()
+    bid_plus = CartesianBoundary{1,LowerBoundary}()
+    far_field = Set(Iterators.flatten(
+        boundary_indices(g_minus, bid) for bid in boundary_identifiers(g_minus) if bid != bid_minus))
     lookup = Dict(Tuple(g_plus[I][2:3]) => I for I in boundary_indices(g_plus, bid_plus))
-    return [(Im, lookup[Tuple(g_minus[Im][2:3])]) for Im in boundary_indices(g_minus, bid_minus)]
+    return [(Im, lookup[Tuple(g_minus[Im][2:3])])
+            for Im in boundary_indices(g_minus, bid_minus) if Im ∉ far_field]
 end
 
 """
@@ -88,6 +99,20 @@ function split_node_system(g_minus, g_plus, λ, μ, stencil_set)
     # (The note also allows applying it fully to one side only; that
     # produced an asymmetric, non-PSD system empirically, so using the
     # symmetric half-on-both-sides construction instead.)
+    #
+    # SIGNS. The Neumann/traction SAT `-H⁻¹∘e'∘Hᵧ ∘ (t_out - data)` is written
+    # in terms of the OUTWARD-normal traction: in Diffinitive's own
+    # `sat_tensors(::NeumannCondition)` the penalty prefactor `-H⁻¹∘e'∘Hᵧ` is
+    # side-independent and all of the side-dependence lives in
+    # `normal_derivative`'s outward sign. `traction_blocks` is deliberately
+    # fixed-`+x₁`-axis, so t_out = +T on `g_minus` (whose fault is its UPPER
+    # boundary, outward = +x₁) but t_out = -T on `g_plus` (LOWER boundary,
+    # outward = -x₁). The data is the other side's outward traction negated,
+    # since traction balance across the interface (BP8 eq. 6) reads
+    # t_out⁻ + t_out⁺ = 0. Both sides therefore penalize the same fixed-axis
+    # difference (τ₋ - τ₊), but the `+` side carries an extra overall minus
+    # from its outward normal. Getting this wrong leaves the shear tractions
+    # discontinuous and inflates the solution by orders of magnitude.
     Tm = traction_blocks(g_minus, λ, μ, stencil_set, bid_minus)
     Tp = traction_blocks(g_plus, λ, μ, stencil_set, bid_plus)
     Prolong_p = _prolongation(g_plus, stencil_set, bid_plus)
@@ -100,13 +125,13 @@ function split_node_system(g_minus, g_plus, λ, μ, stencil_set)
         Tp_j = reduce(hcat, Tp[j, :])   # Nb × Np
         Tm_j = reduce(hcat, Tm[j, :])   # Nb × Nm
 
-        # + side: ½ Prolong₊ (τ₊ - τ₋)
-        SATmat[rows_p, D*Nm+1:Ntot] .+= 0.5 .* (Prolong_p * Tp_j)
-        SATmat[rows_p, 1:D*Nm] .+= -0.5 .* (Prolong_p * Tm_j)
-
-        # - side: ½ Prolong₋ (τ₋ - τ₊)
+        # - side (fault = upper boundary, outward = +x₁):  ½ Prolong₋ (τ₋ - τ₊)
         SATmat[rows_m, 1:D*Nm] .+= 0.5 .* (Prolong_m * Tm_j)
         SATmat[rows_m, D*Nm+1:Ntot] .+= -0.5 .* (Prolong_m * Tp_j)
+
+        # + side (fault = lower boundary, outward = -x₁): -½ Prolong₊ (τ₊ - τ₋)
+        SATmat[rows_p, D*Nm+1:Ntot] .+= -0.5 .* (Prolong_p * Tp_j)
+        SATmat[rows_p, 1:D*Nm] .+= 0.5 .* (Prolong_p * Tm_j)
     end
 
     DSAT = Dmat + SATmat
@@ -123,8 +148,13 @@ function split_node_system(g_minus, g_plus, λ, μ, stencil_set)
         P[dof_index_plus(g_minus, g_plus, comp, I), :] .= 0.0
     end
 
-    for (Im, Ip) in matching_boundary_pairs(g_minus, bid_minus, g_plus, bid_plus)
-        for comp in 2:3
+    # All three components are averaged: u2,u3 so that χ supplies the slip
+    # jump, and u1 because averaging it IS the no-opening condition
+    # u1(0⁺)=u1(0⁻) (BP8 eq. 3). Leaving u1 unaveraged decouples the two
+    # fault-normal DOFs entirely — nothing else in the system constrains
+    # their difference.
+    for (Im, Ip) in fault_node_pairs(g_minus, g_plus)
+        for comp in 1:3
             rm = dof_index_minus(g_minus, comp, Im)
             rp = dof_index_plus(g_minus, g_plus, comp, Ip)
             for r in (rm, rp)
@@ -156,9 +186,7 @@ Builds `χ(s)`: zero everywhere except the fault, zero for `u1`, and
 function build_chi(g_minus, g_plus, slip_fn)
     Nm, Np = length(g_minus), length(g_plus)
     χ = zeros(3 * (Nm + Np))
-    bid_plus = CartesianBoundary{1,LowerBoundary}()
-    bid_minus = CartesianBoundary{1,UpperBoundary}()
-    for (Im, Ip) in matching_boundary_pairs(g_minus, bid_minus, g_plus, bid_plus)
+    for (Im, Ip) in fault_node_pairs(g_minus, g_plus)
         x = g_plus[Ip]
         s2, s3 = slip_fn(x[2], x[3])
         χ[dof_index_plus(g_minus, g_plus, 2, Ip)] = s2 / 2

@@ -63,19 +63,35 @@ strictly increasing in `V`, so the root is unique; solved via Newton's
 method in `x = ln V`, robust across the many decades of `V` this benchmark
 spans. `V0`, if given, seeds the iteration (a good warm-start during time
 stepping); otherwise `V_star` is used.
+
+Newton steps are clamped to `maxstep` in log space. Undamped, the iteration
+diverges whenever it is seeded *below* the root at high slip rate: there
+`asinh(u) ≈ ln(2u)` is nearly linear in `x`, so the step overshoots by many
+decades at once and `exp(x)` overflows to `Inf`, silently returning `NaN` or
+a value wrong by many orders of magnitude. A warm start during acceleration
+always approaches from below, so this is reachable in a time loop even
+though BP8-QD-GS is velocity-strengthening and should not itself get near
+the seismic slip rates where it first appears. Throws if the iteration has
+not converged within `maxiter` steps rather than returning a bad root.
 """
-function solve_slip_rate(T, θ, σ̄, η, p::FrictionParams; V0=nothing, tol=1e-12, maxiter=50)
+function solve_slip_rate(T, θ, σ̄, η, p::FrictionParams; V0=nothing, tol=1e-12, maxiter=50, maxstep=5.0)
     C = exp((p.f_star + p.b * log(p.V_star * θ / p.Dc)) / p.a)
     x = log(V0 === nothing ? p.V_star : V0)
+    converged = false
     for _ in 1:maxiter
         V = exp(x)
         u = V / (2p.V_star) * C
         g = η * V + σ̄ * p.a * asinh(u) - T
         dgdx = η * V + σ̄ * p.a * u / sqrt(1 + u^2)
-        dx = -g / dgdx
+        dx = clamp(-g / dgdx, -maxstep, maxstep)
         x += dx
-        abs(dx) < tol && break
+        if abs(dx) < tol
+            converged = true
+            break
+        end
     end
+    converged || error("solve_slip_rate failed to converge in $maxiter iterations " *
+                       "(T=$T, θ=$θ, σ̄=$σ̄, η=$η, V0=$V0, last V=$(exp(x)))")
     return exp(x)
 end
 
@@ -91,6 +107,9 @@ Returns the slip-rate vector `V`.
 function solve_slip_velocity(τ0::SVector{2}, Δτ::SVector{2}, θ, σ̄, η, p::FrictionParams; kwargs...)
     Tvec = τ0 + Δτ
     T = norm(Tvec)
+    # With no trial stress the direction is undefined, but `ηV + σ̄f(V,θ)` is
+    # strictly positive for `V>0`, so `V=0` is the (unique) answer.
+    iszero(T) && return zero(Tvec)
     V = solve_slip_rate(T, θ, σ̄, η, p; kwargs...)
     return V * Tvec / T
 end

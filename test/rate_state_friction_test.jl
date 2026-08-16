@@ -74,4 +74,31 @@ const η_rs = radiation_damping_coefficient(μ_rs, c_s_rs)
         F = fault_strength(V_init, θ_init, σ̄0, params)
         @test isapprox(F, τ_init, rtol=1e-10)
     end
+
+    @testset "solve_slip_rate: robust when seeded far below the root" begin
+        # Undamped Newton overshoots into `exp` overflow here and returns NaN
+        # or a value wrong by many orders of magnitude, without erroring. The
+        # regime (V ≳ 1 m/s) is beyond what this velocity-strengthening
+        # benchmark should reach, but a warm start during acceleration always
+        # approaches from below, so it stays reachable in a time loop.
+        for V_true in (1e-1, 1.0, 10.0, 100.0), σ̄ in (25.0e6, 10.0e6, 1.0e6)
+            θ = Dc_rs / V_true                     # steady state
+            T = η_rs * V_true + fault_strength(V_true, θ, σ̄, params)
+            @test isapprox(solve_slip_rate(T, θ, σ̄, η_rs, params), V_true, rtol=1e-8)
+            @test isapprox(solve_slip_rate(T, θ, σ̄, η_rs, params; V0=1e-8 * V_true),
+                           V_true, rtol=1e-8)
+        end
+    end
+
+    @testset "solve_slip_rate: reports non-convergence instead of a bad root" begin
+        θ = Dc_rs / 1e-6
+        T = η_rs * 1e-6 + fault_strength(1e-6, θ, σ̄0, params)
+        @test_throws ErrorException solve_slip_rate(T, θ, σ̄0, η_rs, params; V0=1e-20, maxiter=1)
+    end
+
+    @testset "solve_slip_velocity: zero trial stress gives zero slip rate" begin
+        V_vec = solve_slip_velocity(SVector(0.0, 0.0), SVector(0.0, 0.0),
+                                    1e4, σ̄0, η_rs, params)
+        @test all(iszero, V_vec)
+    end
 end

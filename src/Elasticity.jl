@@ -2,9 +2,15 @@
 # reduction of the fault problem to x1≥0 exploiting the whole-space
 # reflection symmetry — since removed. That reduction's `∂u1/∂x1=0` fault
 # condition assumed the tangential displacement gradients (∂2u2, ∂3u3)
-# vanish at the fault, which is only true for spatially uniform slip; for
-# general slip it under-counts a genuine jump in normal stress (σ11)
-# proportional to the slip gradient. See `ElasticitySplitNode.jl` (matching
+# vanish at the fault, which is only true for spatially uniform slip.
+# The correct statement is that σ11 *vanishes* on the fault: the mirror
+# symmetry x1 → -x1 (u1 even, u2/u3 odd) makes σ11 odd across the fault,
+# and BP8 eq. 6a requires it continuous, so it must be zero — which needs
+# a nonzero ∂1u1 cancelling the λ(∂2u2+∂3u3) term. Forcing ∂1u1=0 instead
+# left σ11 ≈ λ(∂2s2+∂3s3)/2, i.e. the spurious normal stress that surfaced
+# in cross-validation was the *symptom* of the bad BC, not real physics.
+# σ11 → 0 on the fault is now a regression test, and it is what caught the
+# split-node SAT sign error. See `ElasticitySplitNode.jl` (matching
 # `context/SEAS_benchmark.pdf`'s two-sided P+SAT+χ formulation) for the
 # correct treatment. The building blocks below (`elastic_operator`,
 # `elastic_blocks`, `traction_blocks`) are unaffected — the error was
