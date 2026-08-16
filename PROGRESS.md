@@ -153,36 +153,69 @@ half-space shortcut.
   confirm solving recovers it — this tests D, SAT, P, χ, and the solve
   together without assuming anything about the true physics.
 
+### Rate-and-state friction + aging law (`src/RateStateFriction.jl`)
+The fault friction law (PDF eq. 8-13) as a standalone, pointwise physics
+kernel — not yet wired to the elastic solver's `Δτ` or pore pressure's
+`σ̄` (that's the next item).
+
+- `friction_coefficient`/`fault_strength`/`aging_law_rhs` implement the
+  regularized friction coefficient (eq. 12), fault strength `F=σ̄f(V,θ)`
+  (eq. 10), and the aging law `dθ/dt=1-Vθ/D_RS` (eq. 11) directly.
+- `solve_slip_rate`: the force balance `τ=τ⁰+Δτ-ηV=F(V,θ)` (eq. 8-10)
+  combines into a vector equation where both the radiation-damping and
+  friction terms are parallel to `V` — so the trial stress `τ⁰+Δτ` must
+  itself be parallel to `V`, meaning direction comes for free and only the
+  *magnitude* needs solving: the scalar equation `T=ηV+σ̄f(V,θ)`, not
+  analytically invertible (`V` appears both linearly and inside `asinh`).
+  Solved via Newton's method in `x=ln V` (closed-form derivative, no
+  `ForwardDiff` needed) — robust across the ~10 decades of `V` the
+  benchmark spans, since `f(V,θ)` is smooth and strictly increasing in `V`.
+  No new dependency: the existing `NonlinearSolve` stack is only a
+  transitive dep of `OrdinaryDiffEq`, and this is a small enough, well-behaved
+  root to hand-roll instead.
+- `solve_slip_velocity`: the actual vector eq. 8-10, combining direction
+  (∝ `τ0+Δτ`) with `solve_slip_rate`'s magnitude — what the future time
+  integration will call directly.
+- `initial_state_from_strength`: unlike the forward solve, inverting eq. 12
+  for `θ` given `V` and a target strength (eq. 28-29's initial-condition
+  setup) *is* analytically closed-form — no iteration needed.
+- Validated in `test/rate_state_friction_test.jl` against Table 1's actual
+  physical parameters (not simplified O(1) values, unlike the elasticity
+  tests — rate-and-state parameters are naturally at these physical scales
+  regardless): aging-law steady state, strength monotonicity in `V`,
+  forward round-trips (with and without radiation damping, swept across
+  ~10 decades of `V`), `solve_slip_velocity`'s direction/magnitude, and the
+  eq. 28-29 initial condition's self-consistency.
+
 ## Not started yet
 
 Roughly in the order they'd naturally come next:
 
-1. **Rate-and-state friction + aging law** (PDF eq. 9-12): the ODE for slip
-   rate `V` and state `θ`, coupled to elasticity via traction and the
-   radiation-damping term `-ηV` (eq. 8).
-2. **Wire physical slip into the elastic solver**: `build_chi` currently
+1. **Wire physical slip into the elastic solver**: `build_chi` currently
    takes a manufactured test slip function; needs to instead take
-   `s2(x2,x3,t), s3(x2,x3,t)` from the friction ODE state, and the friction
-   law needs traction computed from `reconstruct_U`'s output, not the raw
-   solve variable.
-3. **Factorize-once performance**: since λ,μ are constant, `split_node_system`
+   `s2(x2,x3,t), s3(x2,x3,t)` from the friction ODE state (via
+   `RateStateFriction.solve_slip_velocity`, integrated over time), and the
+   friction law needs traction computed from `reconstruct_U`'s output, not
+   the raw solve variable. Also where eq. 13's `V=0` mask outside the
+   frictional domain `Ω_f` gets applied.
+2. **Factorize-once performance**: since λ,μ are constant, `split_node_system`
    rebuilds `A` from scratch every call today. Production use should
    factorize once (`reduced_solve`'s reduced, non-singular system is a
    natural factorization target) and reuse across timesteps/RK stages,
    updating only `χ(s)` (and hence the RHS) as slip evolves — the original
    architectural motivation for going constant-coefficient in the first
    place.
-4. **Full coupling**: pore pressure → effective normal stress → friction
+3. **Full coupling**: pore pressure → effective normal stress → friction
    law ⇄ elasticity (slip ⇄ traction), integrated together in time
    (likely `OrdinaryDiffEq`, matching the stiff aging-law dynamics).
-5. **Peaceman well (PW) variant**: deferred from the pore-pressure
+4. **Peaceman well (PW) variant**: deferred from the pore-pressure
    increment; only the Gaussian-source (GS) injection model exists so far.
-6. **Domain-size convergence** (PDF §6): how large `Lx,Ly,Lz` need to be
+5. **Domain-size convergence** (PDF §6): how large `Lx,Ly,Lz` need to be
    before results stop changing — meaningful only once real slip data
    drives the solve, not with manufactured test solutions.
-7. **Physical parameters**: plug in Table 1's actual values (currently the
+6. **Physical parameters**: plug in Table 1's actual values (currently the
    elasticity tests use simple O(1) λ,μ for clean MMS numerics, not the
    benchmark's GPa-scale values) and run the full 30-day simulation.
-8. **Benchmark output files** (PDF §4): the time-series, `global.dat`, and
+7. **Benchmark output files** (PDF §4): the time-series, `global.dat`, and
    slip/stress/pressure evolution file formats required for the CRESCENT
    DET uploader — not attempted yet.

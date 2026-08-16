@@ -11,4 +11,7 @@ using .Elasticity
 include("ElasticitySplitNode.jl")
 using .ElasticitySplitNode
 
+include("RateStateFriction.jl")
+using .RateStateFriction
+
 end
