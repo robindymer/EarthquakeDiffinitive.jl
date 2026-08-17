@@ -5,13 +5,14 @@ using Diffinitive.Grids
 using Diffinitive.SbpOperators
 using Diffinitive.LazyTensors
 using SparseArrays
-using LinearAlgebra: I
+using LinearAlgebra: I, lu
 using Tokens
 using StaticArrays
 using ..Elasticity: elastic_blocks, traction_blocks
 
 export split_node_system, dof_index_minus, dof_index_plus, build_chi,
-       reconstruct_U, reduced_solve, fault_node_pairs
+       reconstruct_U, reduced_solve, fault_node_pairs, ReducedSystem,
+       factorize_reduced
 
 # ==============================================================================
 # Two-sided (split-node) SBP-SAT elastic system, matching the formulation in
@@ -206,25 +207,43 @@ The true displacement field `U = P*u + χ`; tractions must be computed from
 reconstruct_U(P, u, χ) = P * u + χ
 
 """
-    reduced_solve(A, rhs, P)
+    ReducedSystem
+
+A factorized, non-redundant form of `A = -H*P*(D+SAT)*P`, produced by
+[`factorize_reduced`](@ref) and applied by [`reduced_solve`](@ref). Holds the
+LU factorization plus the bookkeeping needed to expand a reduced solution
+back onto the full DOF vector.
+
+`λ` and `μ` are constant in this benchmark, so `A` never changes as slip
+evolves — only `χ(s)` and hence the right-hand side do. Factorizing once and
+reusing the factorization across every time step / RK stage is the whole
+reason for going constant-coefficient.
+"""
+struct ReducedSystem{F}
+    keep::Vector{Int}                   # DOFs retained as unknowns
+    merge_pairs::Vector{Pair{Int,Int}}  # dropped DOF => the representative it equals
+    fact::F                             # LU of A restricted to `keep`
+    Ntot::Int
+end
+
+"""
+    factorize_reduced(A, P) -> ReducedSystem
 
 `A = -H*P*(D+SAT)*P` is singular by construction — `P`'s null space
-(far-field DOFs, and the antisymmetric half of each tangential fault pair)
-is a large fraction of the system, which makes plain Krylov solvers (GMRES)
-stall well short of convergence. This reduces the system to the
-non-redundant DOFs implied by `P`'s own structure (derived directly from
-`P`, not re-derived from the grids) — regular DOFs kept as-is, far-field
-DOFs dropped, and each tangential averaging pair merged into a single
-unknown — giving a genuinely non-singular system solvable directly.
-Dropped/far-field entries of the returned `u` are set to `0` (their value
-is irrelevant — `P` discards them regardless).
+(far-field DOFs, and the antisymmetric half of each fault pair) is a large
+fraction of the system, which makes plain Krylov solvers (GMRES) stall well
+short of convergence. This reduces the system to the non-redundant DOFs
+implied by `P`'s own structure (derived directly from `P`, not re-derived
+from the grids) — regular DOFs kept as-is, far-field DOFs dropped, and each
+averaging pair merged into a single unknown — giving a genuinely non-singular
+system, which is then LU-factorized.
 """
-function reduced_solve(A, rhs, P)
+function factorize_reduced(A, P)
     P = dropzeros(P) # explicit zeros (from `P[r,:] .= 0.0`) would otherwise
     # remain stored in the sparsity pattern, breaking the emptiness check below.
     Ntot = size(P, 1)
     keep = Int[]
-    col_merge = Dict{Int,Int}()
+    merge_pairs = Pair{Int,Int}[]
     seen = falses(Ntot)
 
     for i in 1:Ntot
@@ -240,7 +259,7 @@ function reduced_solve(A, rhs, P)
             partner = rows[1] == i ? rows[2] : rows[1]
             rep, other = max(i, partner), min(i, partner)
             seen[rep] || push!(keep, rep)
-            col_merge[other] = rep
+            push!(merge_pairs, other => rep)
             seen[i] = true
             seen[partner] = true
         else
@@ -249,20 +268,33 @@ function reduced_solve(A, rhs, P)
     end
 
     Amerged = copy(A)
-    for (other, rep) in col_merge
+    for (other, rep) in merge_pairs
         Amerged[:, rep] .+= Amerged[:, other]
     end
 
-    w = Amerged[keep, keep] \ rhs[keep]
+    return ReducedSystem(keep, merge_pairs, lu(Amerged[keep, keep]), Ntot)
+end
 
-    u = zeros(Ntot)
-    for (idx, k) in enumerate(keep)
-        u[k] = w[idx]
-    end
-    for (other, rep) in col_merge
+"""
+    reduced_solve(rs::ReducedSystem, rhs)
+    reduced_solve(A, rhs, P)
+
+Solves the reduced system for `rhs`. Dropped/far-field entries of the
+returned `u` are set to `0` (their value is irrelevant — `P` discards them
+regardless). The three-argument form factorizes on every call; prefer
+[`factorize_reduced`](@ref) plus this two-argument form when solving
+repeatedly with the same operator.
+"""
+function reduced_solve(rs::ReducedSystem, rhs)
+    w = rs.fact \ rhs[rs.keep]
+    u = zeros(rs.Ntot)
+    u[rs.keep] .= w
+    for (other, rep) in rs.merge_pairs
         u[other] = u[rep]
     end
     return u
 end
+
+reduced_solve(A, rhs, P) = reduced_solve(factorize_reduced(A, P), rhs)
 
 end # module ElasticitySplitNode

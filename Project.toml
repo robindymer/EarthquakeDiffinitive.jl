@@ -4,18 +4,22 @@ authors = ["Robin Dymér <robin.dymer@hotmail.com> and contributors"]
 version = "1.0.0-DEV"
 
 [deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 Diffinitive = "5a373a26-915f-4769-bcab-bf03835de17b"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Tokens = "040c2ec2-8d69-4aca-bf03-7d3a7092f2f6"
 
 [compat]
+Dates = "1.11.0"
 Diffinitive = "0.1.8"
 ForwardDiff = "1.4.5"
 LinearAlgebra = "1.11.0"
 OrdinaryDiffEq = "7.6.0"
+Printf = "1.11.0"
 SparseArrays = "1.11.0"
 SpecialFunctions = "2.8.3"
 StaticArrays = "1.9.18"

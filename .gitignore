@@ -8,3 +8,5 @@
 /scripts/*.mp4
 /scripts/*.gif
 /scripts/*.png
+# Benchmark output written by scripts/run_bp8.jl — regenerable, ~100 MB
+/output/

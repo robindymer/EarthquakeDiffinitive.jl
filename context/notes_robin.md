@@ -14,3 +14,7 @@ instantiate
 
 ## Run script
 julia --project=scripts scripts/elastic_wave_2d.jl
+
+## TODOs / thoughts
+- Order of FD used?
+- Theory of the iterative method?

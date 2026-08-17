@@ -14,4 +14,10 @@ using .ElasticitySplitNode
 include("RateStateFriction.jl")
 using .RateStateFriction
 
+include("FaultResponse.jl")
+using .FaultResponse
+
+include("BP8.jl")
+using .BP8
+
 end

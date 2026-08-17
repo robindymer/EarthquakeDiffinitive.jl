@@ -1,10 +1,17 @@
-# SEAS BP8-QD-GS progress
+# SEAS BP8-QD-GS/-PW progress
 
 Status of the `EarthquakeDiffinitive` implementation of the SEAS
-Benchmark Problem BP8-QD-GS (`context/SEAS_BP8_Benchmark_Description.pdf`):
-a quasi-dynamic 3D whole-space, rate-and-state fault, driven by a
-Gaussian-source fluid injection. Built on the `Diffinitive` SBP-FD library
-(dev-linked from `~/.julia/dev/Diffinitive`).
+Benchmark Problems BP8-QD-GS and BP8-QD-PW
+(`context/SEAS_BP8_Benchmark_Description.pdf`): a quasi-dynamic 3D
+whole-space, rate-and-state fault, driven by fluid injection modelled either
+as a Gaussian source or a Peaceman well. Built on the `Diffinitive` SBP-FD
+library (dev-linked from `~/.julia/dev/Diffinitive`).
+
+**Both injection models run end to end** and write the §4 output files; see
+"Results" below. The implementation is complete and validated, but the runs
+are **not resolution-converged** and are not submission-ready — the reason is
+a hard memory limit on the 3D elastic factorization, quantified under "Known
+limitations".
 
 ## Done
 
@@ -19,17 +26,25 @@ Gaussian-source fluid injection. Built on the `Diffinitive` SBP-FD library
   keeps needing.
 
 ### Pore pressure diffusion (`src/PorePressure.jl`)
-Gaussian-source variant of the fault's 2D pore-pressure diffusion equation
-(PDF §2.1.1, eq. 17/19-21), fully decoupled from elasticity.
+The fault's 2D pore-pressure diffusion equation (PDF §2.1, eq. 17-25). It
+feeds elasticity one way, through `σ̄ = σ - p`; nothing flows back.
 
 - `pore_pressure_operator`: assembles the constant (homogeneous-medium)
   Neumann-SAT Laplacian on the fault plane, reusing Diffinitive's built-in
-  `Laplace`/`NeumannCondition`/`sat_tensors` machinery directly.
+  `Laplace`/`NeumannCondition`/`sat_tensors` machinery directly. Also takes a
+  grid directly, so the coupled driver can build it on the elastic solver's
+  own `Ω_f` nodes and share one index between `p` and `s`.
 - `gaussian_source`, `injection_rate`: the eq. 19/20 forcing.
-- `solve_pore_pressure`: implicit (`OrdinaryDiffEq`) time integration; the
-  operator matrix is constant, so it's built once.
+- `well_index`, `well_cell_index`, `peaceman_cell_volume`: the Peaceman well
+  model's coefficients (§2.1.2), `WI = 2πkL_fwid/(η ln(r_e/r_well))` with
+  `r_e = 0.198Δz` for a centred five-point stencil.
+- `darcy_operators`: `q_j = -(k/η)∂p/∂x_j` (eq. 16), for the benchmark's
+  `darcy_vel_2`/`darcy_vel_3` output columns.
+- `solve_pore_pressure`: implicit (`OrdinaryDiffEq`) time integration of the
+  standalone problem; the operator matrix is constant, so it's built once.
 - Validated in `test/pore_pressure_test.jl` against the closed-form
-  analytic solution (PDF eq. 21) and via grid-refinement convergence.
+  analytic solution (PDF eq. 21) and via grid-refinement convergence, and
+  again inside the coupled model — see "Results".
 
 ### Elastic operator building blocks (`src/Elasticity.jl`)
 Homogeneous isotropic elasticity (PDF §1) relating fault slip to fault
@@ -243,40 +258,176 @@ kernel — not yet wired to the elastic solver's `Δτ` or pore pressure's
   above τ_ss = 12.93 MPa — the fault starts over-healed, as an
   injection-triggered benchmark requires.
 
-## Not started yet
+### Slip → traction map (`src/FaultResponse.jl`)
+Turns the split-node solver into the operator the friction law needs.
 
-Roughly in the order they'd naturally come next:
+- `boundary_selection`: fault node ↔ global DOF map. Deliberately *not*
+  `boundary_indices`, whose iteration order matches neither the boundary grid
+  nor `traction_blocks`' row order (checked: it doesn't). Read straight off
+  `boundary_restriction`, which is what the traction blocks are built from.
+- `FaultElasticity`: assembles, factorizes once (`factorize_reduced`), and
+  identifies the `Ω_f` nodes, ordered x2-fastest to match the pore-pressure
+  grid so slip, state and pressure share one index.
+- `fault_stiffness`: the dense `K : [s2;s3] ↦ [Δτ2;Δτ3]`, built with `2·N_Ωf`
+  back-substitutions. This is what makes the 30-day run tractable — an
+  adaptive integrator calls the RHS ~10⁴ times, and one sparse back-solve of a
+  3D system per call would dominate everything. Slip being confined to `Ω_f`
+  (eq. 13) is what keeps the column count affordable.
+- **Sign convention, verified numerically**: `Δτ_j = Δσ_j1` with no flip. A
+  positive slip patch gives `Δσ21 = -2.89` at its centre for unit slip, i.e.
+  slip relieves the stress driving it. `diag(K) < 0` is a regression test;
+  getting it backwards turns the coupled system into a runaway.
+- `K` comes out symmetric to 0.19%, which it should be by reciprocity — an
+  independent confirmation that the residual interface-SAT asymmetry is the
+  only thing left (see above).
 
-1. **Wire physical slip into the elastic solver**: `build_chi` currently
-   takes a manufactured test slip function; needs to instead take
-   `s2(x2,x3,t), s3(x2,x3,t)` from the friction ODE state (via
-   `RateStateFriction.solve_slip_velocity`, integrated over time), and the
-   friction law needs traction computed from `reconstruct_U`'s output, not
-   the raw solve variable. Also where eq. 13's `V=0` mask outside the
-   frictional domain `Ω_f` gets applied. Note the two fault-plane grids do
-   **not** coincide: pore pressure lives on `Ω_f = [-400,400]²` at
-   Δz = 10 m (81×81), while the elastic grids' fault plane has to extend
-   well beyond `Ω_f` for the far-field truncation to be harmless, so
-   `σ̄ = σ - p` needs `p` embedded into (zero-padded onto) the larger
-   elastic fault plane.
-2. **Factorize-once performance**: since λ,μ are constant, `split_node_system`
-   rebuilds `A` from scratch every call today. Production use should
-   factorize once (`reduced_solve`'s reduced, non-singular system is a
-   natural factorization target) and reuse across timesteps/RK stages,
-   updating only `χ(s)` (and hence the RHS) as slip evolves — the original
-   architectural motivation for going constant-coefficient in the first
-   place.
-3. **Full coupling**: pore pressure → effective normal stress → friction
-   law ⇄ elasticity (slip ⇄ traction), integrated together in time
-   (likely `OrdinaryDiffEq`, matching the stiff aging-law dynamics).
-4. **Peaceman well (PW) variant**: deferred from the pore-pressure
-   increment; only the Gaussian-source (GS) injection model exists so far.
-5. **Domain-size convergence** (PDF §6): how large `Lx,Ly,Lz` need to be
-   before results stop changing — meaningful only once real slip data
-   drives the solve, not with manufactured test solutions.
-6. **Physical parameters**: plug in Table 1's actual values (currently the
-   elasticity tests use simple O(1) λ,μ for clean MMS numerics, not the
-   benchmark's GPa-scale values) and run the full 30-day simulation.
-7. **Benchmark output files** (PDF §4): the time-series, `global.dat`, and
-   slip/stress/pressure evolution file formats required for the CRESCENT
-   DET uploader — not attempted yet.
+### Coupled benchmark driver (`src/BP8.jl`)
+The full BP8-QD-GS/-PW problem: `ds/dt = V`, `dθ/dt = 1 - Vθ/D_RS`,
+`dp/dt = α∇²p + source`, closed at each node by the algebraic force balance
+`τ⁰ + Δτ(s) - ηV = σ̄f(V,θ)V/V`.
+
+- `BP8Params`: Table 1 verbatim, with `λ`, `η`, `q0` derived. Checked in tests
+  that `ν=0.25 ⇒ λ=μ`, `√(μ/ρ)=c_s`, and `k/(φβη)=α=0.05 m²/s`.
+- State is integrated as **ϕ = ln θ**: θ spans ~1e8–1e12 s while slip is
+  ~1e-6 m, so no single scalar tolerance serves both. Turns the aging law into
+  `dϕ/dt = e^{-ϕ} - V/D_RS`. Per-block absolute tolerances on top of that.
+- Initial conditions (eq. 26-29) reproduce `V_init = 1e-12` and
+  `V_zero = 1e-20` to 8 digits, with `‖τ‖ = τ_init` exactly. The strength is
+  balanced against `τ_init - η‖V‖`, not `τ_init` — worth ~5e-6 Pa, but it
+  makes t=0 exactly self-consistent.
+- The outer ring of `Ω_f` is held at `V=0`. Eq. 13 locks everything outside
+  `Ω_f`, and a finite slip jump at that edge would be a stress singularity the
+  elastic solve cannot represent.
+- **Peaceman well** (eq. 22-23) alongside the Gaussian source, adding `p_well`
+  as one extra unknown. `well_index`, `well_cell_index` and
+  `peaceman_cell_volume` live in `PorePressure`.
+- `analytic_pressure_gaussian`/`analytic_pressure_point` (eq. 21/25) with a
+  hand-rolled `expint_e1` (series below x=1, Lentz continued fraction above),
+  checked against `SpecialFunctions.expint` to 1e-12. §6 asks specifically
+  that the well model be checked against the point-source solution.
+- Full §4 output: nine station time series, `global.dat`, ten profile files.
+  The profile layout comes from the worked example on p.13-14 — an
+  `(N_t+1)×(N_coord+2)` matrix whose first row is `0 0 <coords>`, with a
+  four-line field list and `author`/`code_version` header keys, all of which
+  differ from the time-series files' conventions.
+- `effective_stress_report` and `resolution_report` surface the two places
+  this model can quietly leave its range of validity (below).
+
+### Results
+
+`scripts/run_bp8.jl` (30-day runs, both injection models, two resolutions),
+`scripts/bp8_domain_convergence.jl` (§6), `scripts/bp8_validate_pressure.jl`.
+
+Pore pressure against the analytic solutions at t = 100 h, Δz = 50 m:
+
+| r (m) | GS numeric | eq. 21 | PW numeric | eq. 25 |
+|---|---|---|---|---|
+| 0 / r_e | 13.17 | 13.06 | 25.85 | 28.76 |
+| 100 | 7.356 | 7.357 | 7.378 | 7.310 |
+| 200 | 2.576 | 2.563 | 2.368 | 2.376 |
+| 300 | 0.842 | 0.795 | 0.725 | 0.699 |
+
+Away from source and no-flux edges both agree to well under a percent — a
+strong check on the diffusion solver. The GS near-source error is 0.84% at
+Δz = 50 m but 15% at Δz = 100 m, purely because `L_gauss = 50 m` is
+unresolved. Agreement degrades past r ≈ 300 m because the analytic solutions
+assume an unbounded fault while `Ω_f` has no-flux edges.
+
+Domain-size convergence (§6, Δz = 100 m, t = 100 h) is essentially already
+achieved at the smallest domain — over `L_fault` 800→1600 m and `L_normal`
+800→1200 m, centre slip moves 0.25%, `V_max` 0.55%, self-stiffness 0.03%.
+Pore pressure is bit-identical across those rows, as it must be.
+
+30-day runs, `L_fault = 800 m`:
+
+| variant | Δz | peak V (m/s) | at (days) | final slip (m) | peak p (MPa) |
+|---|---|---|---|---|---|
+| GS | 50 | 2.81e-6 | 2.26 | 0.0422 | 13.17 |
+| GS | 100 | 1.14e-3 | 0.62 | 0.0609 | 15.05 |
+| PW | 50 | 8.59e-6 | 0.14 | 0.0633 | 25.85 |
+| PW | 100 | 2.53e-3 | 0.39 | 0.0739 | 19.16 |
+
+All four wrote their 20 §4 files to `output/BP8-QD-<GS|PW>_dz…/` (gitignored,
+~120 MB total), with 9.6k-45k time-series rows — inside §4.1's requested
+10⁴-10⁵ — and 721 hourly profile rows, inside §4.3's ~10³. Everything is
+aseismic, as a velocity-strengthening fault (a-b = +0.006) should be: peak
+slip rates are ~10⁻⁶-10⁻³ m/s, not the ~1 m/s of a seismic rupture.
+
+### Figures (`scripts/plot_bp8.jl`)
+
+Reads only the `.dat` files, so it works on any run and doubles as a check
+that they parse. Writes `global.png`, `stations.png`, `slip_evolution.png`
+and `spacetime.png` beside them.
+
+Two things the figures make visible that the summary numbers did not:
+
+- **The slipping patch is elongated along strike** — at t = 30 d, slip at
+  r = 250 m is 0.0180 m along x2 against 0.0145 m along x3, a 24% difference.
+  This is real, not a bug. For slip in x2, variation along x2 is mode II and
+  variation along x3 is mode III, and mode II is stiffer by 1/(1-ν); measured
+  directly on `K`, the ratio is 1.22 at ν = 0.25, 1.33 at ν = 1/3 and exactly
+  1.00 at ν = 0, tracking 1/(1-ν) with the ~10% shortfall expected from a
+  truncated domain at this resolution. A patch elongated *along* x2 is
+  controlled by its narrow x3 dimension — mode III, the softer one — so
+  elongating along strike is the compliant direction. The station plot shows
+  the same thing: the (±200, 0) stations slip more than the (0, ±200) ones.
+- **The under-resolution is plainly visible.** `V_max(t)` is a sawtooth and
+  the space-time contours are a staircase, because the slip front advances
+  one grid node at a time across only ~15 active nodes. This is the same
+  limitation as item 1 below, seen directly rather than inferred.
+
+## Known limitations
+
+These are properties of the current approach, not loose ends to tidy.
+
+1. **The runs are not resolution-converged, and cannot be on this machine.**
+   The rate-and-state process zone is `L_b = μD_RS/(bσ̄) ≈ 64 m` at
+   σ̄ = 25 MPa. The benchmark's Δz = 10 m gives ~6 cells per `L_b`; the
+   Δz = 50 m used here gives 1.3, and Δz = 100 m gives 0.6. Because slip rate
+   depends *exponentially* on σ̄ (`V ~ exp(τ/(aσ̄))`), a sub-percent pressure
+   error becomes an order-of-magnitude error in peak `V` — which is exactly
+   what the table above shows between the two resolutions. Final slip, which
+   integrates over the whole run, is much better behaved (4.2 vs 6.1 cm).
+   `resolution_report` reports this; the runs show the right physics with
+   indicative, not quantitative, peak rates.
+   A second, smaller contribution: `Ω_f = (-l_f, l_f)²` is an *open* interval,
+   so the nodes exactly on `±l_f` are locked. That is the correct discrete
+   reading of eq. 13 and converges as Δz → 0, but at these spacings it means
+   the slipping patch is 600 m across at Δz = 100 m and 700 m at Δz = 50 m.
+2. **Why Δz = 50 m is the ceiling.** Fill-in in the sparse LU of the 3D
+   elastic system, not the grid itself. Measured on a cube: 20M nonzeros at
+   n=13, 93M at n=17, 297M (2.4 GB) at n=21, and OOM by n=25. The production
+   configuration (58,806 DOF) takes 92 s to factorize and 125 s to build the
+   578-column stiffness; the 30-day integration itself is then 3 s. At the
+   benchmark's Δz = 10 m over a domain several km across, the elastic system
+   is 10⁷–10⁸ DOF — out of reach of a direct factorization by orders of
+   magnitude, and the reason `L_normal = 400 m` had to be halved relative to
+   `L_fault` in the production runs.
+   Reaching spec resolution means changing the elastic solver, not tuning it:
+   either an iterative/multigrid solve of the same SBP-SAT system, or the
+   boundary-integral route most SEAS codes take for quasi-dynamic whole-space
+   problems, where the whole-space fault-to-fault kernel is a convolution and
+   costs O(N log N) per step with FFTs and no volume unknowns at all.
+3. **The Peaceman variant drives σ̄ negative at the well cell.** At Δz = 50 m
+   pressure there reaches 25.85 MPa against σ = 25 MPa, so `σ̄ = σ - p` goes
+   to −0.85 MPa and the `σ̄_min` floor binds. This is not a numerical
+   artefact: the point-source solution is logarithmically singular, so the
+   well-cell pressure *rises* as Δz shrinks (eq. 25 at `r_e = 0.198Δz` gives
+   ~29 MPa at Δz = 50 m and ~44 MPa at the specified Δz = 10 m). Physically
+   the fault fully unclamps and eq. 3's no-opening condition stops applying.
+   The solution stays bounded because slip relieves the shear stress as fast
+   as the strength drops (τ₂ → 600 Pa at that node), but those nodes are
+   outside the model's stated range of validity. `effective_stress_report`
+   flags it; the GS variant never gets there.
+4. **Peaceman well-cell pressure is ~10% below eq. 25** at the equivalent
+   radius, while matching to under 1% for r ≥ 50 m. The `r_e = 0.198Δz`
+   calibration is derived for steady radial flow; this is a transient. Worth
+   revisiting against the benchmark's suggested alternatives (implicit or
+   Gaussian-eliminated well pressure) if the well-cell value matters.
+
+## Not started
+
+- **CRESCENT DET upload** (§5): the output files are written in the §4
+  formats, but nothing has been uploaded or validated against the server's
+  parser. Given limitation 1, the current results are not submission-ready
+  anyway.
