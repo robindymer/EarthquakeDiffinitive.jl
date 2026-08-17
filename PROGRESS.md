@@ -5,7 +5,7 @@ Benchmark Problems BP8-QD-GS and BP8-QD-PW
 (`context/SEAS_BP8_Benchmark_Description.pdf`): a quasi-dynamic 3D
 whole-space, rate-and-state fault, driven by fluid injection modelled either
 as a Gaussian source or a Peaceman well. Built on the `Diffinitive` SBP-FD
-library (dev-linked from `~/.julia/dev/Diffinitive`).
+library (dev-linked from `~/Kod/Diffinitive`).
 
 **Both injection models run end to end** and write the §4 output files; see
 "Results" below. The implementation is complete and validated, but the runs
@@ -16,8 +16,16 @@ limitations".
 ## Done
 
 ### Environment
-- `EarthquakeDiffinitive` dev-depends on the local `Diffinitive` checkout;
-  `Pkg.instantiate()`/`Pkg.test()` work.
+- `EarthquakeDiffinitive` dev-depends on the local `Diffinitive` checkout at
+  `~/Kod/Diffinitive`; `Pkg.instantiate()`/`Pkg.test()` work.
+  **The dev-link lives only in `Manifest.toml`, which is gitignored** — there
+  is no `[sources]` entry in `Project.toml`. So a fresh clone, or any bare
+  `Pkg.instantiate()` after the Manifest is lost, resolves `Diffinitive` from
+  the registry instead, and precompilation then fails with
+  `invalid subtyping in definition of IsotropicElasticOperator` (the registry
+  v0.1.8 `LazyTensor` is not the dev checkout's). Fix:
+  `Pkg.develop(path="/home/robindymer/Kod/Diffinitive")`. Adding a `[sources]`
+  section to `Project.toml` would make this reproducible.
 - `Diffinitive`'s own docs now build against the dev checkout
   (`docs/Project.toml` `[sources]`), with two doctest bugs fixed. One
   remaining bug (`zero(::VolumeOperator)` missing method, breaks a docs
@@ -69,7 +77,7 @@ traction.
   elastic wave simulation validating the operator qualitatively — clean
   P/S wavefront separation at the right speed ratio, correct non-circular
   S-wave radiation pattern, stable reflections).
-- `traction_blocks`: extracts fault traction (σᵢ,dim, fixed `+dim`-axis
+- `traction_blocks`: extracts fault traction (σᵢ,dim, fixed `+dim`-axisz
   convention, not outward-normal) from a solved displacement field.
 - `inject_dirichlet!`, `dof_index`, `flatten`/`unflatten`: strong-injection
   and vector-grid-function utilities (no Diffinitive helper exists for
@@ -161,34 +169,127 @@ half-space shortcut.
   leaves *explicit* zeros stored in the sparsity pattern rather than
   removing them, silently breaking a `nzrange`-based "is this DOF free"
   check until `dropzeros!`ed.)
-- **The reduced system is still not quite symmetric/PSD as the reference
-  note assumes**, though much closer than it looked: most of the original
-  gap was the `+`-side SAT sign error above. At a small test grid the
-  numbers went from ~54% relative asymmetry and 195 negative eigenvalues
-  out of 2318, to **~19% and 3 out of 2205** once the sign, the `u1`
-  averaging and the fault-edge ring were fixed. CG still isn't usable, but
-  the residual is now a small structural gap rather than a broken operator.
-  Dug into why: the far-field/bulk part of the assembled system *is*
-  exactly symmetric (~1e-14) once far-field DOFs are projected out, so
-  `elastic_blocks` itself is fine — the gap is entirely in the fault SAT.
-  Literature (Almquist & Dunham, arXiv:2003.12811) confirms a symmetric
-  interface SAT needs *two* term types (`E'·traction` **and**
-  `T'·displacement-jump`), not just the one (`E'·traction`) implemented
-  here. Building the second term properly surfaced a deeper mismatch:
-  `traction_blocks` — accurate as a *physical* traction operator — is not
-  the operator that actually appears in `elastic_blocks`'s own discrete
-  SBP identity. Two confirmed discrepancies: (1) the narrow (μ) shear
-  pieces need `normal_derivative` (outward-signed), not the fixed-axis
-  `e∘∂/∂xₙ` `traction_blocks` uses — confirmed numerically these are
-  genuinely different operators, not just a sign flip; (2) the wide
-  (λ+μ) cross terms in `elastic_blocks` carry an extra μ contribution
-  (from expanding `(λ+μ)∇(∇·u)`) with no counterpart in the physical
-  traction formula at all. A provably symmetric SAT would need a second,
-  separately-derived "SBP-consistent flux operator" distinct from
-  `traction_blocks` — real work, and low-value right now since
-  `reduced_solve`'s direct solve already gives verified-correct results;
-  CG would only be a performance optimization. Deferred until it's
-  actually needed at production scale.
+- **The system is not symmetric, so CG is not usable** — the reference note
+  assumes otherwise. Quantified by `scripts/split_node_spd.jl`, which is the
+  standing diagnostic for this question; run it before revisiting any of the
+  below. Measured on cubes of side `n` (order 4):
+
+  | n | reduced DOF | `A` | bulk(`A`) | `E·A·S` | `SᵀAS` | CG |
+  |---|---|---|---|---|---|---|
+  | 9 | 2205 | 0.144 | 6.4e-17 | 0.189 | 0.198 | stalls, res 3.7e-2 |
+  | 13 | 8349 | 0.113 | 6.1e-17 | 0.150 | 0.158 | stalls, res 3.2e+0 |
+  | 17 | 20925 | 0.097 | 4.7e-17 | — | — | — |
+  | 21 | 42237 | 0.086 | 4.8e-17 | — | — | — |
+
+  Four things follow, in order of how much they change the plan.
+
+  1. **Definiteness is fine; symmetry is the whole problem.** The symmetric
+     part of `SᵀAS` has **0 negative eigenvalues** out of 2205 with κ ≈ 200,
+     and so does `SᵀAS` itself (no eigenvalue with `Re λ < 0`). An earlier
+     note here claimed "~19% asymmetry and 3 negative eigenvalues out of
+     2205"; the 3 do not reproduce and were probably measured before the
+     `u1`-averaging and fault-edge-ring fixes.
+  2. **The asymmetry decays under refinement**, 0.144 → 0.086 over n = 9 → 21,
+     roughly `h^0.56`. So the missing SAT term is a *consistency-order*
+     defect, not a structural error — the operator converges to a symmetric
+     one. That is reassuring for accuracy and useless for CG, which needs
+     symmetry at the resolution actually being run.
+  3. **`factorize_reduced`'s reduction is nonsymmetric by construction**, and
+     this is new. With `S` the prolongation from reduced unknowns to full
+     DOFs, it builds `E·A·S` — columns summed over merge pairs, rows merely
+     *selected*. That is not a congruence transform. Since `P` makes each
+     merged pair's two rows identical, a *perfectly symmetric* `A` would
+     still give an `E·A·S` with merged columns doubled and rows not, i.e.
+     asymmetric anyway. The congruence transform `SᵀAS` is the only reduction
+     that inherits symmetry from `A`. **So making the SAT symmetric would not
+     be enough on its own** — `reduced_solve` would need the Galerkin form
+     too. Two changes, not one. (The two reductions are otherwise equivalent:
+     they differ only by a factor of 2 on merged rows, and solving them
+     directly agrees to 2.6e-15 — an independent confirmation that
+     `reduced_solve` is correct.)
+  4. **CG would not pay off even if it converged**, for this access pattern.
+     LU costs one factorization then ~0.02 s per back-substitution; CG costs
+     ~0.3-0.8 s per right-hand side with no amortization, so the break-even
+     is **~2 right-hand sides** and `fault_stiffness` needs `2·N_Ωf` ≈ 578.
+     CG's real attraction is memory — it would lift the fill-in ceiling in
+     "Known limitations" 2 — but the `K` build then becomes the bottleneck.
+     Its columns are independent, so that build threads cleanly, which a
+     single sparse LU does not.
+
+  **ROOT CAUSE FOUND, AND A FIX PROTOTYPED — see `SYMMETRIC_SAT.md`.**
+  `scripts/symmetry_decomposition.jl` takes the operator apart factor by
+  factor. The defect reproduces on a *single grid with a plain free surface*
+  — no interface, no projection — so none of the split-node machinery is
+  implicated. Within the elastic operator, λ-only is exactly symmetric
+  (1.67e-16) while μ-only is not (3.12e-01).
+
+  The mechanism, isolated on the scalar Laplacian with one `H` throughout:
+  Diffinitive gives two different approximations of `∂u/∂n` at a boundary —
+  `e∘first_derivative` and `normal_derivative` — differing by
+  `‖D̂ - e·D₁‖ ≈ 160` at order 4. The **narrow** `second_derivative`'s SBP
+  identity expresses its boundary term in `normal_derivative`; the **wide**
+  sandwich's in `first_derivative`. `traction_blocks` uses `first_derivative`
+  for everything, so it cancels the wrong operator against the narrow μ
+  pieces, and the leftover is the asymmetry. λ uses only wide sandwiches,
+  which is why it was already exact.
+
+  **This project's own reference notebook already gets this right.**
+  `context/notebooks/elastic_clean.jl`'s `IsotropicTractionOperator` uses
+  `first_derivative` for the λ terms and **the boundary derivative
+  (`s·normal_derivative`) for μ's diagonal terms**, with comments saying
+  exactly why. `traction_blocks` uses `e∘first_derivative` for every term and
+  dropped the distinction — despite `src/Elasticity.jl` claiming to follow the
+  notebook "term-for-term" on the *volume* operator, which it does.
+  (`IsotropicTractionOperator` is not used anywhere in `src/`, `test/` or
+  `scripts/` — the package reimplemented it as `traction_blocks`.)
+
+  Literature agrees: Almquist & Dunham (arXiv:2003.12811) §4 call Mattsson's
+  operators — what `standard_diagonal.toml` implements — *compatible* but
+  **not fully compatible** (`e₀,NᵀD₁ ≠ e₀,NᵀD̂`); eq (147) gives the resulting
+  `T = n·C·(D + ΔD)` and they note that proving stability in that case
+  *remains an open problem*. Their remedy (eq 67) attacks it from the other
+  side — adapt `D₂` so its boundary term is expressed in `D₁`.
+
+  Prototyped both in the script (n=9, order 4), after verifying the rebuilt
+  operator matches `elastic_blocks` bit-for-bit:
+
+  | | current | notebook traction | eq (67) |
+  |---|---|---|---|
+  | what changes | — | `traction_blocks` | `second_derivative` |
+  | accuracy cost | — | **none** | one order at boundary point |
+  | single grid `H*(D+SAT)` | 2.49e-01 | **1.15e-16** | 1.07e-16 |
+  | `A = -HP(D+SAT)P` | 1.44e-01 | **7.60e-17** | 7.87e-17 |
+
+  **The notebook's fix is the one to take** — same symmetry, no accuracy given
+  up, and it makes `traction_blocks` agree with the reference implementation.
+  Eq (67) would degrade the operator at exactly one grid point per boundary,
+  and the fault *is* a boundary.
+
+  Downstream, once symmetric: Galerkin `SᵀAS` asymmetry 1.98e-01 → 8.90e-17,
+  **0/2205 negative eigenvalues**, κ 1.99e+02 → 1.18e+02, and **CG converges in
+  73 iterations** (true residual 9.0e-11) where it previously stalled at
+  3.7e-02 after 5000.
+
+  **Two gates before this goes in `src/`, neither done**: (1)
+  `test/elasticity_split_node_test.jl`'s interface conditions must still hold;
+  (2) `traction_blocks` is also what `FaultResponse` uses for physical `Δτ`, so
+  `K` and peak `V` will shift — the boundary derivative is typically *more*
+  accurate at the boundary (order q+1 vs q), so this may be an improvement, but
+  it needs measuring against the runs in `output/`.
+
+  Two earlier claims in this file were wrong and are retracted: that a
+  symmetric SAT needs *two* term types (that applies to Almquist & Dunham's
+  *displacement* conditions, §5.2 — not our case, where `P` handles continuity
+  and the SAT carries traction only), and that the wide cross-terms' extra μ
+  contribution is a separate defect needing its own fix.
+
+  **Trap for anyone re-testing this.** CG's internally-updated residual
+  `r ← r - αAp` is only valid for `A = Aᵀ`, so on this system it reports
+  convergence it has not achieved; always recompute `‖b-Ax‖/‖b‖` from
+  scratch. And CG run on `A[keep,keep]` — plain row *and* column selection,
+  which is neither reduction — converges happily in ~160 iterations to a
+  vector 4.5% away from the true solution. Both mistakes were made while
+  writing the script above, and both look like success.
 - Validated in `test/elasticity_split_node_test.jl` two ways.
   1. An algebraic self-consistency check (deliberately avoiding another
      continuum-PDE derivation after the half-space episode): pick an

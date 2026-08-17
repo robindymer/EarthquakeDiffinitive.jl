@@ -188,25 +188,52 @@ The `D × D` matrix of sparse operators `T[i,k]` such that the traction
 component `τᵢ = σᵢ,dim` (with respect to the fixed `+dim` axis direction,
 `dim = grid_id(bid)` — NOT the outward-normal sign convention) on boundary
 `bid` is `τᵢ = Σₖ T[i,k]*uₖ`.
+
+**The normal-direction μ derivatives use the boundary derivative, not
+`first_derivative`**, mirroring `context/notebooks/elastic_clean.jl`'s
+`IsotropicTractionOperator`. This is required for `T` to be the operator that
+appears in `elastic_blocks`' own discrete SBP identity, i.e. for
+
+    (v, Eu)_Ω - (Ev, u)_Ω = (v, Tu)_∂Ω - (Tv, u)_∂Ω
+
+to hold — see the `"SBP property: E and T are compatible"` test. The reason is
+that the two schemes' SBP identities carry *different* boundary operators:
+`H·D₂ = -D₁ᵀHD₁ - R + e'Hᵧ·D̂` for the narrow `second_derivative`, versus
+`H·D₁∘D₁ = -D₁ᵀHD₁ + e'Hᵧ·(e∘D₁)` for the wide sandwich. So λ terms and μ's
+*tangential* terms pair with `e∘first_derivative`, while μ's normal-direction
+terms — which come from the narrow operators (`laplace` and `second_derivative`
+in `elastic_blocks`) — pair with `D̂`. Using `first_derivative` throughout left
+`-HP(D+SAT)P` ~14% asymmetric and made CG unusable; see `SYMMETRIC_SAT.md` for
+the full diagnosis and `scripts/symmetry_decomposition.jl` to reproduce it.
+
+`D̂ = s·normal_derivative`, undoing Diffinitive's outward sign to get the
+fixed-`+dim`-axis convention used here. (`Grids._boundary_sign` is private
+Diffinitive API; the notebook uses it the same way.)
 """
 function traction_blocks(g, λ, μ, stencil_set, bid)
     D = ndims(g)
     dim = grid_id(bid)
     e = boundary_restriction(g, stencil_set, bid)
     Dk = ntuple(k -> first_derivative(g, stencil_set, k), D)
+    # Boundary derivative on the fixed +dim axis, i.e. `normal_derivative` with
+    # its outward sign removed.
+    s = Grids._boundary_sign(component_type(g), bid)
+    d̂ = s * sparse(normal_derivative(g, stencil_set, bid))
     Nb = prod(size(boundary_grid(g, bid)))
     N = length(g)
 
     T = [spzeros(Nb, N) for _ in 1:D, _ in 1:D]
-    T[dim, dim] = sparse((λ + 2μ) * (e ∘ Dk[dim]))
+    # σ_nn = λ·Σₖ∂ₖuₖ + 2μ·∂ₙuₙ: the λ part is wide, the 2μ part narrow.
+    T[dim, dim] = sparse(λ * (e ∘ Dk[dim])) + 2μ * d̂
     for k in 1:D
         k == dim && continue
         T[dim, k] = sparse(λ * (e ∘ Dk[k]))
     end
+    # σ_in = μ(∂ₙuᵢ + ∂ᵢuₙ): the ∂ₙ part is narrow, the tangential ∂ᵢ is not.
     for i in 1:D
         i == dim && continue
         T[i, dim] = sparse(μ * (e ∘ Dk[i]))
-        T[i, i] = sparse(μ * (e ∘ Dk[dim]))
+        T[i, i] = μ * d̂
     end
     return T
 end
