@@ -140,6 +140,46 @@ end
         @test maximum(abs, r.U) ≈ r.amp / 2 rtol = 1e-8
     end
 
+    # `factorize_reduced` defaults to a Cholesky of the Galerkin form `SᵀAS`,
+    # which is only legal if that matrix really is symmetric positive definite.
+    # It is SPD only because `traction_blocks` pairs each of `elastic_blocks`'
+    # two SBP schemes with its own boundary operator (`test/elasticity_test.jl`'s
+    # "SBP property" test) — Cholesky *fails* on the pre-fix operator. So this
+    # is the downstream half of that same check, and it is what would catch a
+    # silent regression into the LU fallback.
+    #
+    # The `:lu` comparison is the part that has teeth: LU assumes nothing about
+    # symmetry, so if the two agree, Cholesky's answer is not an artefact of
+    # `Symmetric` having discarded a real lower triangle.
+    @testset "Galerkin reduction is SPD and Cholesky agrees with LU" begin
+        set = split_node_stencil_set()
+        n = 11
+        g_minus = equidistant_grid((-1.0, -1.0, -1.0), (0.0, 1.0, 1.0), n, n, n)
+        g_plus = equidistant_grid((0.0, -1.0, -1.0), (1.0, 1.0, 1.0), n, n, n)
+        A, HP_DSAT, P = split_node_system(g_minus, g_plus, λ_sn, μ_sn, set)
+
+        rs_chol = factorize_reduced(A, P)                    # default
+        rs_lu = factorize_reduced(A, P; method=:lu)
+        # A silent PosDefException fallback would leave an LU here too.
+        @test rs_chol.fact isa SparseArrays.CHOLMOD.Factor
+
+        S = prolongation(rs_chol)
+        A_gal = S' * A * S
+        @test norm(A_gal - A_gal') / norm(A_gal) < 1e-12
+
+        χ = build_chi(g_minus, g_plus, (x2, x3) -> (exp(-(x2^2 + x3^2) / 0.125), 0.0))
+        rhs = HP_DSAT * χ
+        x_chol = reduced_solve(rs_chol, rhs)
+        x_lu = reduced_solve(rs_lu, rhs)
+        @test norm(x_chol - x_lu) / norm(x_lu) < 1e-10
+
+        # The Petrov form `E·A·S` the reduction used to build is nonsymmetric by
+        # construction even now that `A` is symmetric — asserted so that the
+        # Galerkin form is not quietly swapped back for it.
+        A_pet = (A*S)[rs_chol.keep, :]
+        @test norm(A_pet - A_pet') / norm(A_pet) > 1e-3
+    end
+
     @testset "fault-normal stress vanishes under refinement" begin
         coarse = solve_gaussian_slip(11)
         fine = solve_gaussian_slip(15)

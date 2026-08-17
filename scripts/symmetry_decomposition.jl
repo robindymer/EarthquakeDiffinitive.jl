@@ -397,14 +397,11 @@ function report(n; order=4)
     # ---------------- 6. IS IT NOW CG-SOLVABLE? ----------------
     # `A` is singular by construction (P's null space), so reduce first. The
     # Galerkin form SᵀAS is the congruence transform — the only reduction that
-    # inherits symmetry; `factorize_reduced`'s E·A·S does not (see PROGRESS.md).
+    # inherits symmetry; the `E·A·S` form `factorize_reduced` used to build does
+    # not (see PROGRESS.md). `factorize_reduced` now builds SᵀAS itself, so `S`
+    # comes straight off the ReducedSystem rather than being rebuilt here.
     rs = factorize_reduced(A_fc, P)
-    pos = Dict(k => c for (c, k) in enumerate(rs.keep))
-    rows = collect(rs.keep); cols = collect(1:length(rs.keep))
-    for (other, rep) in rs.merge_pairs
-        push!(rows, other); push!(cols, pos[rep])
-    end
-    S = sparse(rows, cols, 1.0, rs.Ntot, length(rs.keep))
+    S = prolongation(rs)
     Ar = S' * A_fc * S
     ev = eigvals(Symmetric(Matrix(0.5 * (Ar + Ar'))))
 

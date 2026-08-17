@@ -22,7 +22,7 @@ before the time loop starts — which is why setup costs minutes and the
 
 1. Build two SBP grids meeting at the fault plane; far field `u=0`.
 2. Assemble the split-node elastic system `-HP(D+SAT)Pu = HP(D+SAT)χ(s)`.
-3. Eliminate the redundant DOFs, factorize what's left.
+3. Eliminate the redundant DOFs (Galerkin reduction `SᵀAS`), Cholesky-factorize.
 4. Back-substitute `2·N_Ωf` times → dense fault stiffness `K : [s₂;s₃] ↦ [Δτ₂;Δτ₃]`.
 5. Assemble the fault-plane diffusion operator `A_p` and the injection source
    on the *same* nodes.
@@ -93,11 +93,14 @@ from the same files once they are uploaded.
 
 The implementation is complete and validated — pore pressure matches the
 analytic solutions to well under a percent away from the source, the elastic
-solver satisfies BP8's interface conditions to machine precision, and 30-day
-runs of both injection models produce physically sensible aseismic slip.
+solver satisfies BP8's interface conditions to machine precision, the discrete
+operator `-HP(D+SAT)P` is symmetric positive definite, and 30-day runs of both
+injection models produce physically sensible aseismic slip.
 
 **The runs are not resolution-converged**, and cannot be on a single
-workstation: fill-in in the sparse LU of the 3D elastic system caps the node
-spacing at ~50 m against the benchmark's specified 10 m. See the "Known
+workstation: fill-in in the sparse factorization of the 3D elastic system caps
+the node spacing at ~50 m against the benchmark's specified 10 m. Exploiting
+the symmetry (Cholesky rather than LU) cuts the factor by ~1.9×, but fill-in
+scales ≈ `n^5.6`, so that buys ~45 m rather than 10 m. See the "Known
 limitations" section of [PROGRESS.md](PROGRESS.md) for the measurements
 behind that and what reaching spec resolution would take.

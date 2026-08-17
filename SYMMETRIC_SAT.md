@@ -1,8 +1,9 @@
 # Making `-HP(D+SAT)P` symmetric
 
-Diagnosis and a working prototype. **Not yet in `src/`** — two verification gates
-remain, listed at the end. Reproduce everything here with
-`julia --project=. scripts/symmetry_decomposition.jl 9`.
+Diagnosis, fix, and verification. **The fix is in `src/Elasticity.jl`** and both
+verification gates have passed — see "Verification gates" at the end. Reproduce
+the diagnosis with `julia --project=. scripts/symmetry_decomposition.jl 9`, and
+the downstream consequences with `julia --project=. scripts/split_node_spd.jl`.
 
 ## The one-paragraph version
 
@@ -195,18 +196,26 @@ That is expected: the far-field faces carry no SAT — they are Dirichlet throug
 `P` — so their boundary terms stay uncancelled until `P` zeroes those rows. Only
 the fault boundary needs consistency, and after adaptation it has it.
 
-## Second, independent change: the reduction
+## Second, independent change: the reduction — DONE
 
-Even with symmetric `A`, `reduced_solve` cannot feed CG. `factorize_reduced`
-builds `E·A·S` — columns summed over merge pairs, rows merely *selected* — which
-is not a congruence transform and stays asymmetric even for symmetric `A`. The
-Galerkin form `SᵀAS` is required. Low-risk: the prolongation `S` is already
-written (`prolongation` in `scripts/split_node_spd.jl`), and solving `SᵀAS`
-directly agrees with the current LU path to 2.6e-15.
+Even with symmetric `A`, `reduced_solve` could not feed CG or Cholesky.
+`factorize_reduced` built `E·A·S` — columns summed over merge pairs, rows merely
+*selected* — which is not a congruence transform and stays asymmetric even for
+symmetric `A`. Measured after the traction fix: `asym(A) = 8.5e-17` while
+`asym(E·A·S) = 0.109` at n=9 and `0.087` at n=13. So this really was a second,
+independent defect, not a consequence of the first.
+
+`factorize_reduced` now builds the Galerkin form `SᵀAS` and Cholesky-factorizes
+it, with `prolongation(rs)` exported from `ElasticitySplitNode`. Solutions agree
+with the old LU path to 2.7e-15, and the factor is 1.77×/1.88× smaller at
+n=9/13. `test/elasticity_split_node_test.jl`'s `"Galerkin reduction is SPD and
+Cholesky agrees with LU"` pins all of this, including an assertion that `E·A·S`
+is *still* asymmetric — so the Galerkin form cannot be quietly swapped back.
 
 ## Verification gates
 
-Gate 1 **passed** — see below. Gate 2 not done.
+**Both gates passed.** Gate 1 was cleared before the fix landed; gate 2 was
+cleared afterwards by re-running the four production configurations.
 
 ### Gate 1: the interface physics — PASSED
 
@@ -238,21 +247,54 @@ reciprocity requires the *forcing* operator `χ` and the *extraction* operator
 symmetric — so changing `T` alone shifts that balance. Both values are also
 ~15× worse than the 0.19% PROGRESS.md records at production size, because
 `L=1, n=11..15` is a severely truncated domain, so truncation dominates here.
-The takeaway: **the payoff of this fix is `A`'s symmetry (hence CG), not better
-tractions.** Do not expect `K` to become symmetric.
-2. **`Δτ` changes, because `traction_blocks` is also what `FaultResponse` uses
-   to extract physical traction.** The notebook fix alters the μ-diagonal terms
-   of the traction operator, so `K` and hence peak `V` will shift. Both `d̂` and
-   `e∘∂ₙ` are consistent approximations of `∂ₙ`; the boundary derivative is
-   typically *more* accurate at the boundary (order q+1 vs q in Mattsson's
-   construction), so this may well be an improvement — but it needs measuring
-   against the runs already in `output/`, not assuming. Note this gate applies
-   to the notebook fix and *not* to eq (67), which leaves `traction_blocks`
-   alone; that is eq (67)'s one advantage.
+The takeaway: **the payoff of this fix is `A`'s symmetry (hence Cholesky and
+CG), not better tractions.** Do not expect `K` to become symmetric.
 
-Then: `diag(K) < 0` and `K` symmetric to far better than the current 0.19%
-(`test/fault_response_test.jl`, `test/bp8_test.jl`), and a production run whose
-peak `V` and final slip move less than the documented resolution spread.
+### Gate 2: the production numbers — PASSED
+
+`traction_blocks` is also what `FaultResponse` uses to extract physical
+traction, so `Δτ`, `K`, peak `V` and everything in `output/` shift. The gate was
+whether they shift by less than the documented resolution spread. All four
+30-day runs were repeated (`scripts/run_bp8.jl`, `L_fault = 800 m`):
+
+| variant | Δz | peak V before | peak V after | shift | final slip before → after | peak p |
+|---|---|---|---|---|---|---|
+| GS | 50 | 2.81e-6 | 1.10e-6 | 2.6× | 0.0422 → 0.0401 (−4.9%) | 13.17 (unchanged) |
+| GS | 100 | 1.14e-3 | 1.83e-4 | 6.2× | 0.0609 → 0.0550 (−9.7%) | 15.05 (unchanged) |
+| PW | 50 | 8.59e-6 | 3.44e-6 | 2.5× | 0.0633 → 0.0586 (−7.4%) | 25.85 (unchanged) |
+| PW | 100 | 2.53e-3 | 3.62e-4 | 7.0× | 0.0739 → 0.0660 (−10.7%) | 19.16 (unchanged) |
+
+The yardstick is the Δz = 50 → 100 m spread in peak `V`, which was 406× (GS) and
+295× (PW). The fix moves peak `V` by 2.5–7.0×, i.e. **1–2 orders of magnitude
+inside the resolution spread**. Final slip, which integrates over the whole run,
+moves 5–11%.
+
+Two results beyond "small enough":
+
+- **The fix narrows the resolution spread**, 406× → 167× (GS) and 295× → 105×
+  (PW). The two resolutions now disagree considerably less than before.
+- **The GS peak *time* becomes resolution-consistent.** It was 2.26 d at
+  Δz = 50 m against 0.62 d at Δz = 100 m — a 3.6× disagreement; it is now 2.22 d
+  against 2.18 d. Nothing was tuned to achieve this, which is the kind of
+  corroboration a more accurate boundary derivative should produce.
+
+Peak pressure is **bit-identical** in all four, and `scripts/bp8_validate_pressure.jl`
+reproduces its whole table to the digit — the intended control, since pore
+pressure never touches elasticity.
+
+`K` at *production* domain size, which is the number `PROGRESS.md` records as
+0.19%:
+
+| | Δz = 50, L=(800,400) | Δz = 100, L=(800,800) |
+|---|---|---|
+| `‖K-Kᵀ‖/‖K‖` | 0.2003% | 0.1827% |
+| `max diag(K)` | −4.38e8 | −2.19e8 |
+
+So `K`'s asymmetry is essentially where it was (0.19% → 0.20%) and `diag(K) < 0`
+holds. That is the predicted outcome, not a disappointment: reciprocity needs
+`χ` and `T` mutually adjoint, a different condition from `A = Aᵀ`. It also
+retires the worry raised by gate 1 — the 2.8–3.3% measured at `L=1, n=11..15`
+was truncation, not a regression, exactly as argued there.
 
 ## Note on the reference
 

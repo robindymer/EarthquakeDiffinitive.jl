@@ -5,14 +5,14 @@ using Diffinitive.Grids
 using Diffinitive.SbpOperators
 using Diffinitive.LazyTensors
 using SparseArrays
-using LinearAlgebra: I, lu
+using LinearAlgebra: I, lu, cholesky, Symmetric, PosDefException, norm
 using Tokens
 using StaticArrays
 using ..Elasticity: elastic_blocks, traction_blocks
 
 export split_node_system, dof_index_minus, dof_index_plus, build_chi,
        reconstruct_U, reduced_solve, fault_node_pairs, ReducedSystem,
-       factorize_reduced
+       factorize_reduced, prolongation
 
 # ==============================================================================
 # Two-sided (split-node) SBP-SAT elastic system, matching the formulation in
@@ -211,8 +211,9 @@ reconstruct_U(P, u, χ) = P * u + χ
 
 A factorized, non-redundant form of `A = -H*P*(D+SAT)*P`, produced by
 [`factorize_reduced`](@ref) and applied by [`reduced_solve`](@ref). Holds the
-LU factorization plus the bookkeeping needed to expand a reduced solution
-back onto the full DOF vector.
+factorization of the Galerkin reduction `SᵀAS` plus the bookkeeping — `S`
+itself, and the `keep`/`merge_pairs` it was derived from — needed to move
+between reduced unknowns and the full DOF vector.
 
 `λ` and `μ` are constant in this benchmark, so `A` never changes as slip
 evolves — only `χ(s)` and hence the right-hand side do. Factorizing once and
@@ -222,12 +223,27 @@ reason for going constant-coefficient.
 struct ReducedSystem{F}
     keep::Vector{Int}                   # DOFs retained as unknowns
     merge_pairs::Vector{Pair{Int,Int}}  # dropped DOF => the representative it equals
-    fact::F                             # LU of A restricted to `keep`
+    S::SparseMatrixCSC{Float64,Int}     # prolongation, reduced unknowns → full DOFs
+    fact::F                             # factorization of the Galerkin form SᵀAS
     Ntot::Int
 end
 
 """
-    factorize_reduced(A, P) -> ReducedSystem
+    prolongation(rs::ReducedSystem) -> S
+
+The `Ntot × length(rs.keep)` sparse map from reduced unknowns back onto the
+full DOF vector: identity on kept DOFs, plus a 1 setting each merged partner
+equal to its representative. Dropped (far-field) DOFs get an all-zero row,
+which is what zeroes them in [`reduced_solve`](@ref)'s output.
+
+`S` is also the congruence transform the reduction itself is built from — see
+[`factorize_reduced`](@ref). (Not to be confused with the module-private
+`_prolongation(g, stencil_set, bid)`, which is the SAT penalty `-H⁻¹∘e'∘Hᵧ`.)
+"""
+prolongation(rs::ReducedSystem) = rs.S
+
+"""
+    factorize_reduced(A, P; method=:cholesky) -> ReducedSystem
 
 `A = -H*P*(D+SAT)*P` is singular by construction — `P`'s null space
 (far-field DOFs, and the antisymmetric half of each fault pair) is a large
@@ -236,9 +252,32 @@ short of convergence. This reduces the system to the non-redundant DOFs
 implied by `P`'s own structure (derived directly from `P`, not re-derived
 from the grids) — regular DOFs kept as-is, far-field DOFs dropped, and each
 averaging pair merged into a single unknown — giving a genuinely non-singular
-system, which is then LU-factorized.
+system, which is then factorized.
+
+The reduction is the **Galerkin** (congruence) form `SᵀAS`, with `S` the
+[`prolongation`](@ref). This is load-bearing rather than cosmetic. The obvious
+alternative `E·A·S` — which this function used to build — sums columns over the
+merge pairs but only *selects* rows, so it is not a congruence transform and
+comes out nonsymmetric even when `A` is symmetric. `SᵀAS` is the only reduction
+that inherits `A`'s symmetry. The two are the same linear system up to a factor
+of 2 on merged rows (`P` makes each merged pair's two rows of `A` identical), so
+they have the same solution — measured agreement 2.7e-15 at n=13 — and `SᵀAS`
+is simply the form that can be Cholesky-factorized.
+
+`method` picks the factorization:
+
+  * `:cholesky` (default) exploits the symmetry for a factor ≈1.9× fewer
+    nonzeros than LU at these sizes (10.6M vs 19.9M at n=13), and fill-in is
+    the binding resource — see PROGRESS.md "Known limitations" 2.
+  * `:lu` is the previous behaviour, kept for comparison.
+
+Cholesky is admissible only because `traction_blocks` pairs each of
+`elastic_blocks`' two SBP schemes with its own boundary operator, which makes
+`A` symmetric and `SᵀAS` SPD. It *fails* on the pre-fix operator, so a
+`PosDefException` here is a genuine regression signal, not a tuning problem —
+hence the fallback below warns loudly rather than degrading silently.
 """
-function factorize_reduced(A, P)
+function factorize_reduced(A, P; method=:cholesky)
     P = dropzeros(P) # explicit zeros (from `P[r,:] .= 0.0`) would otherwise
     # remain stored in the sparsity pattern, breaking the emptiness check below.
     Ntot = size(P, 1)
@@ -267,12 +306,42 @@ function factorize_reduced(A, P)
         end
     end
 
-    Amerged = copy(A)
+    # S: identity on kept DOFs, and each merged partner reading its
+    # representative's value. Zero rows for the dropped far-field DOFs.
+    pos = Dict(k => c for (c, k) in enumerate(keep))
+    rows = collect(keep)
+    cols = collect(1:length(keep))
     for (other, rep) in merge_pairs
-        Amerged[:, rep] .+= Amerged[:, other]
+        push!(rows, other)
+        push!(cols, pos[rep])
     end
+    S = sparse(rows, cols, 1.0, Ntot, length(keep))
 
-    return ReducedSystem(keep, merge_pairs, lu(Amerged[keep, keep]), Ntot)
+    return ReducedSystem(keep, merge_pairs, S, _factorize_galerkin(S' * A * S, method), Ntot)
+end
+
+function _factorize_galerkin(M, method)
+    method === :lu && return lu(M)
+    method === :cholesky ||
+        throw(ArgumentError("unknown factorization method $method; use :cholesky or :lu"))
+    try
+        # `Symmetric` picks the upper triangle rather than averaging; legitimate
+        # here only because the two halves agree to round-off (measured
+        # ‖M-Mᵀ‖/‖M‖ ≈ 9e-17). The asymmetry is reported below if this fails.
+        return cholesky(Symmetric(M))
+    catch e
+        e isa PosDefException || rethrow()
+        @warn """
+              SᵀAS is not positive definite — falling back to LU, which costs \
+              ≈1.9× the factor nonzeros. This should not happen with the \
+              current operators: it is the signature of `traction_blocks` and \
+              `elastic_blocks` disagreeing about which boundary operator pairs \
+              with which SBP scheme, which is what made the pre-fix system \
+              non-SPD. See SYMMETRIC_SAT.md and \
+              `test/elasticity_test.jl`'s "SBP property" test.\
+              """ asymmetry = norm(M - M') / norm(M)
+        return lu(M)
+    end
 end
 
 """
@@ -284,17 +353,13 @@ returned `u` are set to `0` (their value is irrelevant — `P` discards them
 regardless). The three-argument form factorizes on every call; prefer
 [`factorize_reduced`](@ref) plus this two-argument form when solving
 repeatedly with the same operator.
-"""
-function reduced_solve(rs::ReducedSystem, rhs)
-    w = rs.fact \ rhs[rs.keep]
-    u = zeros(rs.Ntot)
-    u[rs.keep] .= w
-    for (other, rep) in rs.merge_pairs
-        u[other] = u[rep]
-    end
-    return u
-end
 
-reduced_solve(A, rhs, P) = reduced_solve(factorize_reduced(A, P), rhs)
+Restriction and expansion are both `S` (see [`prolongation`](@ref)): the
+Galerkin system is `SᵀAS w = Sᵀrhs`, and `u = S w` both scatters `w` back to
+the kept DOFs and copies each representative onto its merged partner.
+"""
+reduced_solve(rs::ReducedSystem, rhs) = rs.S * (rs.fact \ (rs.S' * rhs))
+
+reduced_solve(A, rhs, P; kwargs...) = reduced_solve(factorize_reduced(A, P; kwargs...), rhs)
 
 end # module ElasticitySplitNode

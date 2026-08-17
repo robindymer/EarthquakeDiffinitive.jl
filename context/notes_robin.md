@@ -18,3 +18,5 @@ julia --project=scripts scripts/elastic_wave_2d.jl
 ## TODOs / thoughts
 - Order of FD used?
 - Theory of the iterative method?
+- CG indirect method, used to solve large Ax=b systems
+- Cholesky is a direct method, probably not viable for full scale problem

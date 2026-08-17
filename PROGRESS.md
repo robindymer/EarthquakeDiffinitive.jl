@@ -5,7 +5,7 @@ Benchmark Problems BP8-QD-GS and BP8-QD-PW
 (`context/SEAS_BP8_Benchmark_Description.pdf`): a quasi-dynamic 3D
 whole-space, rate-and-state fault, driven by fluid injection modelled either
 as a Gaussian source or a Peaceman well. Built on the `Diffinitive` SBP-FD
-library (dev-linked from `~/Kod/Diffinitive`).
+library, pinned in `Project.toml`'s `[sources]`.
 
 **Both injection models run end to end** and write the §4 output files; see
 "Results" below. The implementation is complete and validated, but the runs
@@ -13,19 +13,30 @@ are **not resolution-converged** and are not submission-ready — the reason is
 a hard memory limit on the 3D elastic factorization, quantified under "Known
 limitations".
 
+The discrete operator `A = -HP(D+SAT)P` is now **symmetric positive definite**
+(it was ~14% asymmetric), the reduction is the Galerkin form `SᵀAS`, and the
+solve is a Cholesky factorization. Full suite green at 176/176. That closed the
+project's main correctness question; it did **not** move the resolution ceiling
+in any material way, which remains the one open blocker.
+
 ## Done
 
 ### Environment
-- `EarthquakeDiffinitive` dev-depends on the local `Diffinitive` checkout at
-  `~/Kod/Diffinitive`; `Pkg.instantiate()`/`Pkg.test()` work.
-  **The dev-link lives only in `Manifest.toml`, which is gitignored** — there
-  is no `[sources]` entry in `Project.toml`. So a fresh clone, or any bare
-  `Pkg.instantiate()` after the Manifest is lost, resolves `Diffinitive` from
-  the registry instead, and precompilation then fails with
+- **`Diffinitive` is now pinned in `Project.toml`'s `[sources]`**, to upstream
+  `Diffinitive/Diffinitive` at `92d842cf`. Previously the dev-link lived only in
+  the gitignored `Manifest.toml`, so a fresh clone — or any bare
+  `Pkg.instantiate()` after the Manifest was lost — resolved `Diffinitive` from
+  the registry instead and failed to precompile with
   `invalid subtyping in definition of IsotropicElasticOperator` (the registry
-  v0.1.8 `LazyTensor` is not the dev checkout's). Fix:
-  `Pkg.develop(path="/home/robindymer/Kod/Diffinitive")`. Adding a `[sources]`
-  section to `Project.toml` would make this reproducible.
+  v0.1.8 `LazyTensor` is not the dev checkout's). Verified by instantiating a
+  copy of `Project.toml` + `src/` with no Manifest: it resolves the pinned
+  commit, precompiles, and assembles a symmetric operator (7.6e-17).
+  `92d842cf` is exactly what the working checkout at `~/.julia/dev/Diffinitive`
+  has (its `src/` is clean against that commit); note this is *not* the fork at
+  `~/Kod/Diffinitive`, which is a different repo and is not what was in use.
+  An explicit `Pkg.develop(path=...)` still overrides `[sources]`, so the local
+  dev workflow is unaffected — the existing Manifest still points at the dev
+  path.
 - `Diffinitive`'s own docs now build against the dev checkout
   (`docs/Project.toml` `[sources]`), with two doctest bugs fixed. One
   remaining bug (`zero(::VolumeOperator)` missing method, breaks a docs
@@ -77,13 +88,21 @@ traction.
   elastic wave simulation validating the operator qualitatively — clean
   P/S wavefront separation at the right speed ratio, correct non-circular
   S-wave radiation pattern, stable reflections).
-- `traction_blocks`: extracts fault traction (σᵢ,dim, fixed `+dim`-axisz
-  convention, not outward-normal) from a solved displacement field.
+- `traction_blocks`: extracts fault traction (σᵢ,dim, fixed `+dim`-axis
+  convention, not outward-normal) from a solved displacement field. **The
+  normal-direction μ terms use the boundary derivative `s·normal_derivative`,
+  not `e∘first_derivative`** — they come from the *narrow* `second_derivative`,
+  whose SBP identity carries a different boundary operator than the wide
+  sandwiches λ and μ's tangential terms come from. Getting this wrong is what
+  made `-HP(D+SAT)P` ~14% asymmetric; see `SYMMETRIC_SAT.md`. The
+  `"SBP property: E and T are compatible"` test is what pins it, and is the
+  test that would have caught the bug immediately had it existed.
 - `inject_dirichlet!`, `dof_index`, `flatten`/`unflatten`: strong-injection
   and vector-grid-function utilities (no Diffinitive helper exists for
   strong Dirichlet row-injection).
-- Validated in `test/elasticity_test.jl` (polynomial exactness, sparse vs.
-  `LazyTensor` consistency, traction accuracy against a manufactured field).
+- Validated in `test/elasticity_test.jl` (the SBP compatibility identity above,
+  polynomial exactness, sparse vs. `LazyTensor` consistency, traction accuracy
+  against a manufactured field).
 
 **This module used to also provide `halfspace_system`**, a single-grid
 reduction of the fault problem to x1≥0, derived from an (apparently)
@@ -169,54 +188,69 @@ half-space shortcut.
   leaves *explicit* zeros stored in the sparsity pattern rather than
   removing them, silently breaking a `nzrange`-based "is this DOF free"
   check until `dropzeros!`ed.)
-- **The system is not symmetric, so CG is not usable** — the reference note
-  assumes otherwise. Quantified by `scripts/split_node_spd.jl`, which is the
-  standing diagnostic for this question; run it before revisiting any of the
-  below. Measured on cubes of side `n` (order 4):
+  The reduction is the **Galerkin form `SᵀAS`** — the congruence transform,
+  built with the exported `prolongation(rs)` — and it is **Cholesky**-
+  factorized. Both of those depend on the traction fix below; see "Symmetry:
+  root cause found and fixed".
+- **Symmetry: root cause found and fixed.** `A` used to be ~14% asymmetric, so
+  the reference note's assertion that it is SPD did not hold and CG was
+  unusable. `scripts/split_node_spd.jl` remains the standing diagnostic; run it
+  before revisiting any of this. Measured on cubes of side `n` (order 4), before
+  and after the traction fix:
 
-  | n | reduced DOF | `A` | bulk(`A`) | `E·A·S` | `SᵀAS` | CG |
-  |---|---|---|---|---|---|---|
-  | 9 | 2205 | 0.144 | 6.4e-17 | 0.189 | 0.198 | stalls, res 3.7e-2 |
-  | 13 | 8349 | 0.113 | 6.1e-17 | 0.150 | 0.158 | stalls, res 3.2e+0 |
-  | 17 | 20925 | 0.097 | 4.7e-17 | — | — | — |
-  | 21 | 42237 | 0.086 | 4.8e-17 | — | — | — |
+  | n | reduced DOF | `A` before | `A` after | `E·A·S` after | `SᵀAS` after | CG before | CG after |
+  |---|---|---|---|---|---|---|---|
+  | 9 | 2205 | 0.144 | **8.5e-17** | 0.109 | **8.5e-17** | stalls, res 3.7e-2 | **73 its, 9.1e-11** |
+  | 13 | 8349 | 0.113 | **9.8e-17** | 0.087 | **9.8e-17** | stalls, res 3.2e+0 | **108 its, 8.7e-11** |
+  | 17 | 20925 | 0.097 | — | — | — | — | — |
+  | 21 | 42237 | 0.086 | — | — | — | — | — |
 
-  Four things follow, in order of how much they change the plan.
+  `bulk(A)` was always at round-off (6.4e-17 at n=9, 4.8e-17 at n=21), which is
+  what localized the defect to the boundary rather than to `elastic_blocks`.
 
-  1. **Definiteness is fine; symmetry is the whole problem.** The symmetric
-     part of `SᵀAS` has **0 negative eigenvalues** out of 2205 with κ ≈ 200,
-     and so does `SᵀAS` itself (no eigenvalue with `Re λ < 0`). An earlier
-     note here claimed "~19% asymmetry and 3 negative eigenvalues out of
-     2205"; the 3 do not reproduce and were probably measured before the
-     `u1`-averaging and fault-edge-ring fixes.
-  2. **The asymmetry decays under refinement**, 0.144 → 0.086 over n = 9 → 21,
-     roughly `h^0.56`. So the missing SAT term is a *consistency-order*
-     defect, not a structural error — the operator converges to a symmetric
-     one. That is reassuring for accuracy and useless for CG, which needs
-     symmetry at the resolution actually being run.
-  3. **`factorize_reduced`'s reduction is nonsymmetric by construction**, and
-     this is new. With `S` the prolongation from reduced unknowns to full
-     DOFs, it builds `E·A·S` — columns summed over merge pairs, rows merely
-     *selected*. That is not a congruence transform. Since `P` makes each
-     merged pair's two rows identical, a *perfectly symmetric* `A` would
-     still give an `E·A·S` with merged columns doubled and rows not, i.e.
-     asymmetric anyway. The congruence transform `SᵀAS` is the only reduction
-     that inherits symmetry from `A`. **So making the SAT symmetric would not
-     be enough on its own** — `reduced_solve` would need the Galerkin form
-     too. Two changes, not one. (The two reductions are otherwise equivalent:
-     they differ only by a factor of 2 on merged rows, and solving them
-     directly agrees to 2.6e-15 — an independent confirmation that
-     `reduced_solve` is correct.)
-  4. **CG would not pay off even if it converged**, for this access pattern.
-     LU costs one factorization then ~0.02 s per back-substitution; CG costs
-     ~0.3-0.8 s per right-hand side with no amortization, so the break-even
-     is **~2 right-hand sides** and `fault_stiffness` needs `2·N_Ωf` ≈ 578.
-     CG's real attraction is memory — it would lift the fill-in ceiling in
-     "Known limitations" 2 — but the `K` build then becomes the bottleneck.
-     Its columns are independent, so that build threads cleanly, which a
-     single sparse LU does not.
+  Five things follow, in order of how much they changed the plan.
 
-  **ROOT CAUSE FOUND, AND A FIX PROTOTYPED — see `SYMMETRIC_SAT.md`.**
+  1. **Definiteness was always fine; symmetry was the whole problem.** The
+     symmetric part of `SᵀAS` has **0 negative eigenvalues** out of 2205, κ ≈ 200
+     before the fix and **118** after. An earlier note here claimed "~19%
+     asymmetry and 3 negative eigenvalues out of 2205"; the 3 do not reproduce
+     and were probably measured before the `u1`-averaging and fault-edge-ring
+     fixes.
+  2. **The asymmetry decayed under refinement**, 0.144 → 0.086 over n = 9 → 21,
+     roughly `h^0.56` — so it was a *consistency-order* defect, not a structural
+     error. That was reassuring for accuracy and useless for CG, which needs
+     symmetry at the resolution actually being run. It is now at round-off at
+     every `n`, which is a stronger statement than convergence.
+  3. **`factorize_reduced`'s reduction was nonsymmetric by construction**, and
+     this was the second, independent defect. It built `E·A·S` — columns summed
+     over merge pairs, rows merely *selected*. That is not a congruence
+     transform. Since `P` makes each merged pair's two rows identical, a
+     *perfectly symmetric* `A` still gives an `E·A·S` with merged columns
+     doubled and rows not. The measurement above is the proof: after the
+     traction fix `asym(A) = 8.5e-17` while `asym(E·A·S) = 0.109`. **So making
+     the SAT symmetric was not enough on its own — two changes were needed, not
+     one.** `factorize_reduced` now builds the congruence transform `SᵀAS`; the
+     two reductions differ only by a factor of 2 on merged rows and their
+     solutions agree to 2.7e-15, an independent confirmation that the old path
+     was correct all along.
+  4. **Cholesky replaces LU, for free.** `SᵀAS` is SPD once symmetric, and its
+     Cholesky factor has **1.77×/1.88× fewer nonzeros** than the LU factor at
+     n = 9/13 (10.6M vs 19.9M at n=13). Fill-in is the binding resource
+     ("Known limitations" 2), so this is the cheapest memory available. Cholesky
+     *fails* on the pre-fix system, which is an independent confirmation it was
+     not SPD — and is why `factorize_reduced`'s fallback to LU warns loudly
+     rather than degrading silently.
+  5. **CG still would not pay off**, even though it now converges (73 iterations
+     at n=9, true residual 9.0e-11, agreeing with the direct solve to 7.6e-11).
+     The factorization costs one setup then ~0.008-0.099 s per
+     back-substitution; CG costs ~0.024-0.19 s per right-hand side with no
+     amortization, so break-even is **6-15 right-hand sides** and
+     `fault_stiffness` needs `2·N_Ωf` ≈ 578. CG's real attraction is memory —
+     it would lift the fill-in ceiling entirely — but the `K` build then becomes
+     the bottleneck. Its columns are independent, so that build threads cleanly,
+     which a single sparse factorization does not.
+
+  **ROOT CAUSE — see `SYMMETRIC_SAT.md` for the full diagnosis.**
   `scripts/symmetry_decomposition.jl` takes the operator apart factor by
   factor. The defect reproduces on a *single grid with a plain free surface*
   — no interface, no projection — so none of the split-node machinery is
@@ -250,32 +284,34 @@ half-space shortcut.
   *remains an open problem*. Their remedy (eq 67) attacks it from the other
   side — adapt `D₂` so its boundary term is expressed in `D₁`.
 
-  Prototyped both in the script (n=9, order 4), after verifying the rebuilt
-  operator matches `elastic_blocks` bit-for-bit:
+  Both were prototyped in the script (n=9, order 4), after verifying the
+  rebuilt operator matches `elastic_blocks` bit-for-bit:
 
-  | | current | notebook traction | eq (67) |
+  | | before | notebook traction | eq (67) |
   |---|---|---|---|
   | what changes | — | `traction_blocks` | `second_derivative` |
   | accuracy cost | — | **none** | one order at boundary point |
   | single grid `H*(D+SAT)` | 2.49e-01 | **1.15e-16** | 1.07e-16 |
   | `A = -HP(D+SAT)P` | 1.44e-01 | **7.60e-17** | 7.87e-17 |
 
-  **The notebook's fix is the one to take** — same symmetry, no accuracy given
+  **The notebook's fix is the one taken** — same symmetry, no accuracy given
   up, and it makes `traction_blocks` agree with the reference implementation.
   Eq (67) would degrade the operator at exactly one grid point per boundary,
-  and the fault *is* a boundary.
+  and the fault *is* a boundary. It is in `src/Elasticity.jl`.
 
-  Downstream, once symmetric: Galerkin `SᵀAS` asymmetry 1.98e-01 → 8.90e-17,
-  **0/2205 negative eigenvalues**, κ 1.99e+02 → 1.18e+02, and **CG converges in
-  73 iterations** (true residual 9.0e-11) where it previously stalled at
-  3.7e-02 after 5000.
+  Downstream, once symmetric: Galerkin `SᵀAS` asymmetry 1.98e-01 → 8.5e-17,
+  **0/2205 negative eigenvalues**, κ 1.99e+02 → 1.18e+02, Cholesky admissible
+  (1.9× less fill-in than LU), and **CG converges in 73 iterations** (true
+  residual 9.0e-11) where it previously stalled at 3.7e-02 after 5000.
 
-  **Two gates before this goes in `src/`, neither done**: (1)
-  `test/elasticity_split_node_test.jl`'s interface conditions must still hold;
+  **Both gates have passed.** (1) `test/elasticity_split_node_test.jl`'s
+  interface conditions still hold — jumps and traction continuity at machine
+  precision, σ₁₁ → 0 preserved — and the full suite is green (176/176).
   (2) `traction_blocks` is also what `FaultResponse` uses for physical `Δτ`, so
-  `K` and peak `V` will shift — the boundary derivative is typically *more*
-  accurate at the boundary (order q+1 vs q), so this may be an improvement, but
-  it needs measuring against the runs in `output/`.
+  `K` and peak `V` shifted; all four production runs were repeated and the shift
+  is 1-2 orders of magnitude *inside* the resolution spread, while making the
+  two resolutions agree better than before. Numbers in "Results" below and in
+  `SYMMETRIC_SAT.md` "Gate 2".
 
   Two earlier claims in this file were wrong and are retracted: that a
   symmetric SAT needs *two* term types (that applies to Almquist & Dunham's
@@ -378,9 +414,15 @@ Turns the split-node solver into the operator the friction law needs.
   positive slip patch gives `Δσ21 = -2.89` at its centre for unit slip, i.e.
   slip relieves the stress driving it. `diag(K) < 0` is a regression test;
   getting it backwards turns the coupled system into a runaway.
-- `K` comes out symmetric to 0.19%, which it should be by reciprocity — an
-  independent confirmation that the residual interface-SAT asymmetry is the
-  only thing left (see above).
+- `K` comes out symmetric to **0.20%** at production size (0.2003% at Δz = 50,
+  L = (800, 400); 0.1827% at Δz = 100, L = (800, 800)), which it should be by
+  reciprocity. This is essentially unchanged by the traction fix — it was 0.19%
+  before — and that is the expected outcome, not a loose end: reciprocity
+  requires the *forcing* operator `χ` and the *extraction* operator `T` to be
+  mutually adjoint, which is a **separate condition** from `A = Aᵀ`. Changing
+  `T` alone shifts that balance rather than closing it. What remains of the
+  0.20% is dominated by domain truncation, which is why it tracks domain size
+  (2.8-3.3% at the deliberately tiny `L=1, n=11..15` test domain).
 
 ### Coupled benchmark driver (`src/BP8.jl`)
 The full BP8-QD-GS/-PW problem: `ds/dt = V`, `dθ/dt = 1 - Vθ/D_RS`,
@@ -438,21 +480,70 @@ Domain-size convergence (§6, Δz = 100 m, t = 100 h) is essentially already
 achieved at the smallest domain — over `L_fault` 800→1600 m and `L_normal`
 800→1200 m, centre slip moves 0.25%, `V_max` 0.55%, self-stiffness 0.03%.
 Pore pressure is bit-identical across those rows, as it must be.
+**That sweep did not cover the production configuration**, which uses
+`L_normal = 400` (halved for memory), so the nearest truncation boundary sat
+outside the validated range. It could not: the sweep runs at Δz = 100 m, where
+`L_normal = 400` gives only 5 points across the fault-normal direction against
+SBP order 4's minimum of 9. `L_normal = 400` is legal **only at Δz = 50 m** —
+which is also the production resolution.
+`scripts/bp8_domain_convergence.jl` therefore now runs a second sweep at
+Δz = 50 m over `L_normal ∈ {400, 600, 800}` with `L_fault` fixed at 800 m,
+isolating the fault-normal truncation at the resolution that ships. All three
+fit — `L_normal = 800` is 111k elastic DOF, ~2× production, and its factorization
+completing at all is partly the Cholesky change paying for itself.
 
-30-day runs, `L_fault = 800 m`:
+| `L_normal` | elastic DOF | `K_self` | slip(0,0) | `V_max` |
+|---|---|---|---|---|
+| 400 (production) | 58,806 | −4.38404e8 | 3.99595e-2 | 1.66456e-7 |
+| 600 | 84,942 | −4.38324e8 | 4.05356e-2 | 2.54541e-7 |
+| 800 | 111,078 | −4.38307e8 | 4.06708e-2 | 2.87795e-7 |
 
-| variant | Δz | peak V (m/s) | at (days) | final slip (m) | peak p (MPa) |
-|---|---|---|---|---|---|
-| GS | 50 | 2.81e-6 | 2.26 | 0.0422 | 13.17 |
-| GS | 100 | 1.14e-3 | 0.62 | 0.0609 | 15.05 |
-| PW | 50 | 8.59e-6 | 0.14 | 0.0633 | 25.85 |
-| PW | 100 | 2.53e-3 | 0.39 | 0.0739 | 19.16 |
+Relative to `L_normal = 800`, the production row is off by **0.02% in `K_self`,
+1.75% in slip, and 42% in `V_max`** — and the signs are exactly the predicted
+ones: `u=0` stiffens the medium, so slip comes out too small and `|K_self|` too
+large. Pressure is identical to 5 decimals across the three, as it must be.
+
+**This is a real gap, and it is bigger than the existing `L_fault` sweep
+implied.** That sweep reported `V_max` moving 0.55% over `L_fault` 800→1600 m,
+which invited the conclusion that domain size was settled; it was varying the
+*far* boundary while the near one sat at 400 m. It is also **not converged at
+800 m** — 600→800 still moves `V_max` 11.6%.
+
+Proportion, though: `V_max` moves 167× between Δz = 50 and 100 m, so this 1.42×
+is a second-order error sitting underneath the dominant resolution one, and it
+does not disturb the quantities that are well behaved (slip, `K_self`). The
+practical reading is that **peak `V` in the shipped Δz = 50 m runs is biased
+low**, on top of already being flagged as indicative-only. Slip and stiffness
+are unaffected at the percent level. The traction-fix comparison in "Results" is
+unaffected either way, since both sides of it used `L_normal = 400`.
+
+30-day runs, `L_fault = 800 m`. These are **post-traction-fix**; the
+pre-fix column is kept because it is the evidence for `SYMMETRIC_SAT.md`'s
+gate 2, and because the size of the shift is the honest measure of how much
+the boundary operator matters here.
+
+| variant | Δz | peak V (m/s) | at (days) | final slip (m) | peak p (MPa) | peak V pre-fix | slip pre-fix |
+|---|---|---|---|---|---|---|---|
+| GS | 50 | 1.10e-6 | 2.22 | 0.0401 | 13.17 | 2.81e-6 | 0.0422 |
+| GS | 100 | 1.83e-4 | 2.18 | 0.0550 | 15.05 | 1.14e-3 | 0.0609 |
+| PW | 50 | 3.44e-6 | 0.14 | 0.0586 | 25.85 | 8.59e-6 | 0.0633 |
+| PW | 100 | 3.62e-4 | 0.40 | 0.0660 | 19.16 | 2.53e-3 | 0.0739 |
+
+Reading the shift: peak `V` moves 2.5-7.0×, against a Δz = 50 → 100 m
+resolution spread of 105-406× — so it is 1-2 orders of magnitude inside the
+spread that limitation 1 already documents. Final slip, which integrates over
+the run, moves 5-11%. Peak pressure is **bit-identical**, the intended control.
+
+Two things the fix improved that were not asked of it. The resolution spread in
+peak `V` narrows (GS 406× → 167×, PW 295× → 105×), and the GS peak *time*
+becomes resolution-consistent — it was 2.26 d at Δz = 50 m against 0.62 d at
+Δz = 100 m, and is now 2.22 d against 2.18 d. Nothing was tuned for either.
 
 All four wrote their 20 §4 files to `output/BP8-QD-<GS|PW>_dz…/` (gitignored,
-~120 MB total), with 9.6k-45k time-series rows — inside §4.1's requested
+~120 MB total), with 9.3k-41k time-series rows — inside §4.1's requested
 10⁴-10⁵ — and 721 hourly profile rows, inside §4.3's ~10³. Everything is
 aseismic, as a velocity-strengthening fault (a-b = +0.006) should be: peak
-slip rates are ~10⁻⁶-10⁻³ m/s, not the ~1 m/s of a seismic rupture.
+slip rates are ~10⁻⁶-10⁻⁴ m/s, not the ~1 m/s of a seismic rupture.
 
 ### Figures (`scripts/plot_bp8.jl`)
 
@@ -488,27 +579,37 @@ These are properties of the current approach, not loose ends to tidy.
    depends *exponentially* on σ̄ (`V ~ exp(τ/(aσ̄))`), a sub-percent pressure
    error becomes an order-of-magnitude error in peak `V` — which is exactly
    what the table above shows between the two resolutions. Final slip, which
-   integrates over the whole run, is much better behaved (4.2 vs 6.1 cm).
+   integrates over the whole run, is much better behaved (4.0 vs 5.5 cm).
    `resolution_report` reports this; the runs show the right physics with
-   indicative, not quantitative, peak rates.
+   indicative, not quantitative, peak rates. The traction fix narrowed this
+   spread (406× → 167× for GS) but nowhere near closed it — it is a resolution
+   problem, not a discretization-quality one.
    A second, smaller contribution: `Ω_f = (-l_f, l_f)²` is an *open* interval,
    so the nodes exactly on `±l_f` are locked. That is the correct discrete
    reading of eq. 13 and converges as Δz → 0, but at these spacings it means
    the slipping patch is 600 m across at Δz = 100 m and 700 m at Δz = 50 m.
-2. **Why Δz = 50 m is the ceiling.** Fill-in in the sparse LU of the 3D
-   elastic system, not the grid itself. Measured on a cube: 20M nonzeros at
-   n=13, 93M at n=17, 297M (2.4 GB) at n=21, and OOM by n=25. The production
-   configuration (58,806 DOF) takes 92 s to factorize and 125 s to build the
-   578-column stiffness; the 30-day integration itself is then 3 s. At the
-   benchmark's Δz = 10 m over a domain several km across, the elastic system
-   is 10⁷–10⁸ DOF — out of reach of a direct factorization by orders of
+2. **Why Δz = 50 m is the ceiling.** Fill-in in the sparse factorization of the
+   3D elastic system, not the grid itself. Measured on a cube with LU: 20M
+   nonzeros at n=13, 93M at n=17, 297M (2.4 GB) at n=21, and OOM by n=25. The
+   production configuration (58,806 DOF) takes 92 s to factorize and 125 s to
+   build the 578-column stiffness; the 30-day integration itself is then 3 s.
+   At the benchmark's Δz = 10 m over a domain several km across, the elastic
+   system is 10⁷–10⁸ DOF — out of reach of a direct factorization by orders of
    magnitude, and the reason `L_normal = 400 m` had to be halved relative to
    `L_fault` in the production runs.
+   **Cholesky (now the default) buys ≈1.9× on this, and that is nearly
+   nothing.** Fill-in scales ≈ `n^5.6` on the measured points, so 1.9× less
+   memory supports only a ≈1.12× finer grid — Δz 50 m → ~45 m. Free and worth
+   taking; not a path to 10 m. CG would lift the ceiling entirely (it converges
+   now, 73 iterations) but is *slower* here: break-even is 6-15 right-hand
+   sides and `fault_stiffness` needs 578.
    Reaching spec resolution means changing the elastic solver, not tuning it:
    either an iterative/multigrid solve of the same SBP-SAT system, or the
    boundary-integral route most SEAS codes take for quasi-dynamic whole-space
    problems, where the whole-space fault-to-fault kernel is a convolution and
-   costs O(N log N) per step with FFTs and no volume unknowns at all.
+   costs O(N log N) per step with FFTs and no volume unknowns at all. **This is
+   the one open blocker**; everything else in this file is now either done or a
+   documented, bounded caveat.
 3. **The Peaceman variant drives σ̄ negative at the well cell.** At Δz = 50 m
    pressure there reaches 25.85 MPa against σ = 25 MPa, so `σ̄ = σ - p` goes
    to −0.85 MPa and the `σ̄_min` floor binds. This is not a numerical
@@ -525,6 +626,19 @@ These are properties of the current approach, not loose ends to tidy.
    calibration is derived for steady radial flow; this is a transient. Worth
    revisiting against the benchmark's suggested alternatives (implicit or
    Gaussian-eliminated well pressure) if the well-cell value matters.
+5. **Order 6 is unusable, and the cause is upstream.** `standard_diagonal.toml`
+   provides, per stencil set: orders 2 and 4 have `H`, `e`, `d1`, `D1`, `D2`,
+   `D2variable`; **order 6 has only `H`, `e`, `d1` and `D2.positivity`** — no
+   `D1` at all, and `D2` carries the positivity constants but no inner or
+   closure stencils. So `first_derivative` throws `KeyError: "D1"` and
+   `second_derivative` is missing too; this is broader than a single absent key.
+   Nothing in this package can fix it — it needs Mattsson's order-6
+   coefficients added to Diffinitive's operator file. Blocks any higher-order
+   convergence study.
+6. **Constant coefficients only.** The reference notebook's operators take λ, μ
+   as grid functions; `isotropic_lambda_mu` takes scalars. Fine for BP8's
+   homogeneous whole space — and it is what makes factorizing once and reusing
+   across all ~10⁴ RHS evaluations possible — but a foreclosed capability.
 
 ## Not started
 

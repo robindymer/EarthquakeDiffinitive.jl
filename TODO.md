@@ -1,9 +1,11 @@
 # TODO
 
-Open work, in dependency order. Context for items 1-4 is in
+Open work, in dependency order. Background for the symmetry items is in
 `SYMMETRIC_SAT.md`; the rest is from `PROGRESS.md`'s "Known limitations".
 
-## Done (this session)
+## Done
+
+### Earlier session
 
 - [x] **Diagnose the `-HP(D+SAT)P` asymmetry.** Root cause: `traction_blocks`
       used `first_derivative` for every term, but μ's normal-direction terms
@@ -19,124 +21,123 @@ Open work, in dependency order. Context for items 1-4 is in
       `"SBP property: E and T are compatible"`) — the notebook had it, this
       package did not, and it is what would have caught the bug immediately.
 
-## 0. Run the test suite — the `src/` edit is UNVERIFIED
+### This session
 
-`Pkg.test()` was started and cancelled before producing output, so the edited
-`traction_blocks` and the new SBP test have **not** been exercised.
+- [x] **Run the test suite.** 172/172 before the solver change, **176/176**
+      after, ~2m45s. The `src/` edit and the new SBP test are exercised. Both
+      of the risks flagged for this step held up: the 5% manufactured-traction
+      tolerance passes, and `Grids._boundary_sign` still exists.
+- [x] **Verify the traction fix against production runs** (was BLOCKING).
+      All four configurations re-run and diffed against `PROGRESS.md`'s table;
+      numbers in "Results" there and in `SYMMETRIC_SAT.md` "Gate 2". Peak `V`
+      shifts 2.5-7.0× against a 105-406× resolution spread, final slip 5-11%,
+      peak pressure bit-identical. The fix also *narrows* the resolution spread
+      and makes the GS peak time resolution-consistent (2.26/0.62 d → 2.22/2.18
+      d), neither of which was tuned for.
+- [x] **Re-check `K`'s symmetry at production size.** 0.2003% at Δz = 50 and
+      0.1827% at Δz = 100, against 0.19% before — unchanged, as predicted, and
+      `diag(K) < 0` holds. Confirms the 2.8-3.3% seen at `L=1, n=11..15` was
+      domain truncation, not a regression.
+- [x] **Re-run `scripts/bp8_validate_pressure.jl`** as a control. Reproduces
+      its entire table to the digit, as it must — pore pressure never touches
+      elasticity.
+- [x] **Galerkin reduction `SᵀAS` + Cholesky** in `factorize_reduced`, with
+      `prolongation(rs)` exported. Solutions agree with the old LU path to
+      2.7e-15; factor is 1.77×/1.88× smaller at n = 9/13. Falls back to LU with
+      a loud warning on `PosDefException`, since that would mean a real
+      regression. Pinned by `test/elasticity_split_node_test.jl`'s
+      `"Galerkin reduction is SPD and Cholesky agrees with LU"`, which also
+      asserts `E·A·S` is *still* asymmetric so the Galerkin form cannot be
+      quietly swapped back.
+- [x] **Reproducible environment.** `Project.toml` now has a `[sources]` entry
+      pinning `Diffinitive` to upstream `92d842cf`. Verified by instantiating
+      `Project.toml` + `src/` with no Manifest: it resolves, precompiles, and
+      builds a symmetric operator. An explicit `Pkg.develop` still overrides it,
+      so the local dev workflow is untouched.
+- [x] **Domain-size validation gap.** The obvious fix — adding a
+      `(L_fault=800, L_normal=400)` row to the existing sweep — is impossible:
+      that sweep runs at Δz = 100 m, where `L_normal = 400` is only 5 points
+      across the fault-normal direction against SBP order 4's minimum of 9.
+      `L_normal = 400` is legal *only* at Δz = 50 m, which is also the
+      production resolution. `scripts/bp8_domain_convergence.jl` therefore now
+      runs a **second sweep** at Δz = 50 m over `L_normal ∈ {400, 600, 800}`
+      with `L_fault` fixed at 800 m, isolating the fault-normal truncation at
+      the resolution that actually ships. The loop and reporting were factored
+      into `sweep`/`report` so both studies share them.
+- [x] **Run both sweeps.** All 8 rows completed. The Δz = 100 m `L_fault` study
+      reproduces its published numbers and pressure is identical across its
+      rows. The new Δz = 50 m study found a real bias — see item 1 below, which
+      is the one thing this session opened rather than closed.
+- [x] **Diagnose "order 6 is unusable".** Broader than recorded: order 6 in
+      `standard_diagonal.toml` has only `H`, `e`, `d1` and `D2.positivity` —
+      no `D1` at all and no `D2` stencils. Upstream Diffinitive data gap, not
+      fixable here. Recorded as `PROGRESS.md` limitation 5.
 
-- [ ] `julia --project=. -e 'using Pkg; Pkg.test()'` — expect it to be slow;
-      `elasticity_split_node_test.jl` and `bp8_test.jl` build and factorize 3D
-      systems.
-- [ ] Quicker gate if you want a signal first — just the two files that matter:
-      `julia --project=. -e 'using Pkg; Pkg.activate("."); include("test/elasticity_test.jl")'`
-      for the new SBP property test, then `test/elasticity_split_node_test.jl`
-      for the interface conditions.
+## 1. Act on the domain-convergence result — `L_normal = 400` is not innocent
 
-The supporting evidence that *should* make these pass, from before the edit:
-`scripts/verify_notebook_traction.jl` showed every interface condition holding
-at machine precision with this traction operator (n = 11 and 15), and
-`scripts/symmetry_decomposition.jl` showed `-HP(D+SAT)P` going from 1.44e-01 to
-7.60e-17. Both assembled the operator inside the script, though — not via the
-edited `src/`.
+The sweep has been run; all three fault-normal rows fit (`L_normal = 800` is
+111k DOF, and its factorization completing is partly Cholesky paying off).
+Against `L_normal = 800`, the shipped `L_normal = 400` is off by 0.02% in
+`K_self`, 1.75% in slip and **42% in `V_max`**, with exactly the predicted
+signs. It is also not converged at 800 m — 600→800 still moves `V_max` 11.6%.
+Full table in `PROGRESS.md` "Results".
 
-Two things that could plausibly break and are worth looking at first if the
-suite fails:
+So the answer to the original question is *no*: the halving was not free for
+peak `V`. It is free for slip and stiffness.
 
-- `test/elasticity_test.jl`'s `"traction_blocks matches manufactured traction"`
-  compares against the analytic `σ_i,dim` with a 5% tolerance. The boundary
-  derivative is a different (probably more accurate) approximation of `∂ₙ`, but
-  the tolerance is loose and the check is at order 4, so this should hold.
-- `Grids._boundary_sign` is private Diffinitive API. It exists in the current
-  dev checkout (`src/Grids/tensor_grid.jl:162`) and the notebook uses it the
-  same way, but it is not covered by any compat guarantee.
+- [ ] **Decide whether to re-run production at a larger `L_normal`.** Now known
+      to be affordable: `(Δz=50, L_fault=800, L_normal=800)` builds in 385 s,
+      so a full 30-day run is ~10 min per injection model. That would make peak
+      `V` less biased — but peak `V` is *already* documented as indicative-only
+      because of resolution (item 2), which dominates this by ~100×, and
+      re-running changes every number in `output/`. Worth doing if the runs are
+      going to be regenerated anyway; not worth it on its own.
+- [ ] **Push the fault-normal sweep past 800 m** to find where `V_max` settles,
+      if peak `V` is ever going to be quoted quantitatively. `L_normal = 1000`
+      at Δz = 50 m is ~137k DOF and may not fit.
+- [ ] Note for anyone reading the older `L_fault` sweep: its 0.55% `V_max`
+      spread does **not** mean domain size is settled. It varied the far
+      boundary while the near one sat at 400 m.
 
-## 1. Verify the traction fix against production runs — BLOCKING
-
-`traction_blocks` also feeds `FaultResponse`, so `Δτ`, `K`, peak `V` and every
-number in `output/` shift. Nothing downstream should be trusted until this is
-checked.
-
-- [ ] Re-run `scripts/run_bp8.jl` for both injection models at Δz = 50 and
-      100 m and diff against the table in `PROGRESS.md` "Results".
-- [ ] Confirm the shift is within the documented resolution spread (peak `V`
-      already moves an order of magnitude between Δz = 50 and 100 m, so that is
-      the yardstick).
-- [ ] Re-check `K`'s symmetry at *production* domain size. Measured 2.8-3.3% at
-      `L=1, n=11..15`, slightly worse than before the fix — but that domain is
-      severely truncated, and `PROGRESS.md` records 0.19% at production size.
-      Expect the fix not to improve it: `K`'s reciprocity needs `χ` and `T` to
-      be mutually adjoint, which is a separate condition from `A`'s symmetry.
-- [ ] Re-run `scripts/bp8_validate_pressure.jl` (should be unaffected — pore
-      pressure does not touch elasticity — so it doubles as a control).
-
-## 2. Galerkin reduction + Cholesky — free 2×
-
-`A` is now symmetric, and `SᵀAS` is SPD (0/2205 negative eigenvalues, κ = 118).
-
-- [ ] Add the Galerkin reduction `SᵀAS` to `ElasticitySplitNode`. Required:
-      `factorize_reduced`'s current `E·A·S` sums columns but only *selects*
-      rows, so it is not a congruence transform and stays asymmetric even for
-      symmetric `A`. The prolongation `S` is already written as
-      `prolongation(rs)` in `scripts/split_node_spd.jl`. Solving `SᵀAS`
-      directly agrees with the current LU path to 2.6e-15.
-- [ ] Switch `factorize_reduced` from `lu` to `cholesky`. Measured factor
-      nonzeros, notebook traction: 1.88-1.93× smaller than LU at n = 13/17/21
-      (297M → 155M at n=21, i.e. ~2.4 GB → ~1.24 GB). Cholesky *fails* on the
-      pre-fix system, which is an independent confirmation it was not SPD.
-- [ ] Temper expectations: fill-in scales ≈ `n^5.6` on the measured points, so
-      1.9× memory buys only ≈ 1.12× finer grid — Δz 50 m → ~45 m. Free, but
-      not a path to the benchmark's 10 m.
-
-## 3. CG — optional, only if Cholesky will not fit
-
-- [ ] CG converges in 73 iterations (true residual 9.0e-11) on `SᵀAS` after the
-      fix, versus stalling at 3.7e-02 after 5000 before it.
-- [ ] Note the economics: break-even against the amortized direct solve is
-      ~2 right-hand sides and `fault_stiffness` needs `2·N_Ωf` ≈ 578, so CG is
-      *slower* at current sizes. Its only advantage is memory.
-- [ ] `K`'s columns are embarrassingly parallel, so if CG is adopted the `K`
-      build should be threaded — that is what a sparse LU cannot do.
-- [ ] Keep the guardrails in `scripts/split_node_spd.jl`: CG's internal
-      recursive residual is only valid for symmetric `A`, and CG run on
-      `A[keep,keep]` (neither reduction) converges happily to the wrong answer.
-
-## 4. Resolution — the actual blocker
+## 2. Resolution — the actual blocker
 
 `PROGRESS.md` "Known limitations" 1 and 2. Δz = 50 m gives 1.3 cells per
 process zone `L_b ≈ 64 m` against the benchmark's 10 m / ~6 cells.
 
+Everything cheap has now been taken and the accounting is not close:
+
+| | effect on Δz |
+|---|---|
+| Cholesky (done) | 50 m → ~45 m |
+| CG (converges, 73 its) | lifts the memory ceiling, but *slower* here — break-even 6-15 RHS, `fault_stiffness` needs 578 |
+| needed | 50 m → 10 m |
+
 - [ ] Decide between an iterative/multigrid solve of the same SBP-SAT system
       and the boundary-integral route most SEAS codes take (whole-space
       fault-to-fault kernel is a convolution, `O(N log N)` with FFTs, no volume
-      unknowns). Item 2 buys ~10%, item 3 somewhat more; neither reaches 10 m.
+      unknowns). This is a design decision, not an increment.
+- [ ] If CG is ever adopted: thread the `K` build — its columns are
+      embarrassingly parallel, which is precisely what a sparse direct solve
+      cannot exploit. And keep `scripts/split_node_spd.jl`'s guardrails: CG's
+      internal recursive residual is only valid for symmetric `A`, and CG run
+      on `A[keep,keep]` (neither reduction) converges happily to the wrong
+      answer.
 
-## 5. Domain-size validation gap
+## 3. Smaller items
 
-- [ ] `scripts/bp8_domain_convergence.jl` sweeps `L_normal ∈ {800, 1200}` but
-      the production runs use **`L_normal = 400`** (halved for memory), so the
-      closest truncation boundary in the setup sits *outside* the validated
-      range. Add `(L_fault=800, L_normal=400)` and `(800, 800)` rows and
-      compare. `u=0` makes the medium artificially stiff, so the bias is known:
-      slip too small, `|K_self|` too large.
-
-## 6. Smaller items
-
-- [ ] **Reproducible environment.** The `Diffinitive` dev-link lives only in
-      the gitignored `Manifest.toml`; a fresh clone resolves the registry
-      version and fails to precompile
-      (`invalid subtyping in definition of IsotropicElasticOperator`). Add a
-      `[sources]` entry to `Project.toml`.
-- [ ] **Order 6 is unusable.** `first_derivative` throws `KeyError: "D1"` for
-      `order=6` in `standard_diagonal.toml` — only orders 2 and 4 have the key.
-      Blocks any higher-order convergence study.
+- [ ] **Order 6.** Needs Mattsson's order-6 `D1`/`D2` coefficients added to
+      Diffinitive's `standard_diagonal.toml` — an upstream contribution, and a
+      nontrivial derivation to get right. Blocks any higher-order convergence
+      study.
 - [ ] **Variable coefficients.** The notebook's operators take λ, μ as grid
       functions; this package is constant-coefficient only. Fine for BP8's
-      homogeneous whole space, but a foreclosed capability.
+      homogeneous whole space, and it is what lets the factorization be reused
+      across every RHS evaluation — but a foreclosed capability.
 - [ ] **Peaceman σ̄ < 0** (`PROGRESS.md` limitation 3): pressure at the well
       cell exceeds σ, the `σ̄_min` floor binds, and eq 3's no-opening condition
       stops applying there. Not a numerical artefact — worsens as Δz shrinks.
 - [ ] **Peaceman well-cell pressure ~10% below eq 25** (limitation 4). The
       `r_e = 0.198Δz` calibration is for steady radial flow; this is transient.
 - [ ] **CRESCENT DET upload** (§5): files are written in the §4 formats but
-      nothing has been validated against the server's parser. Gated on item 4
+      nothing has been validated against the server's parser. Gated on item 2
       anyway — the current runs are not submission-ready.
