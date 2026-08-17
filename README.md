@@ -12,6 +12,34 @@ difference library: a quasi-dynamic 3D whole-space with a planar
 rate-and-state fault, driven to slip by fluid injection and along-fault pore
 pressure diffusion.
 
+## Solution procedure
+
+Elasticity is quasi-static, so it collapses into a constant matrix computed
+before the time loop starts — which is why setup costs minutes and the
+30-day integration costs seconds.
+
+**Setup (once, ~4 min)**
+
+1. Build two SBP grids meeting at the fault plane; far field `u=0`.
+2. Assemble the split-node elastic system `-HP(D+SAT)Pu = HP(D+SAT)χ(s)`.
+3. Eliminate the redundant DOFs, factorize what's left.
+4. Back-substitute `2·N_Ωf` times → dense fault stiffness `K : [s₂;s₃] ↦ [Δτ₂;Δτ₃]`.
+5. Assemble the fault-plane diffusion operator `A_p` and the injection source
+   on the *same* nodes.
+
+**Time loop** (ODE state `[s₂; s₃; lnθ; p]`, 30 days, ~3 s)
+
+6. `Δτ = K·s` — one dense mat-vec, no PDE solve.
+7. `σ̄ = σ₀ - p` per node.
+8. Solve `‖τ⁰+Δτ‖ - η|V| = σ̄f(|V|,θ)` for `|V|` (Newton in `ln V`); direction
+   inherited from `τ⁰+Δτ`.
+9. RHS: `ṡ = V`, `ϕ̇ = e^{-ϕ} - |V|/D_RS`, `ṗ = A_p p + source(t)`.
+10. Advance with `Tsit5`, per-block tolerances. Repeat from 6.
+
+**Output**
+
+11. Write the §4 files (nine stations, `global.dat`, ten profiles).
+
 ## Running
 
 ```julia
