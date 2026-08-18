@@ -68,6 +68,26 @@ Open work, in dependency order. Background for the symmetry items is in
       reproduces its published numbers and pressure is identical across its
       rows. The new Δz = 50 m study found a real bias — see item 1 below, which
       is the one thing this session opened rather than closed.
+- [x] **Iterative solver.** `build_model(...; solver=:cg)` runs CG (Krylov.jl)
+      on the singular `A` directly — no reduction, no factorization, no
+      null-space handling, because `b ⊥ null(A)` exactly and CG from `x₀ = 0`
+      never leaves `range(A)`. Same `K` as the direct path to 1.6e-11. At
+      production size it costs ~2× the wall-clock and **~6× less of the memory
+      that actually binds** (0.38 GB of solver footprint against 2.45 GB, and
+      no 168M-nonzero factor).
+- [x] **Thread the `K` build.** Its `2·N_Ωf` columns are independent and now
+      run in parallel under CG, bit-identical to serial. That brings threaded
+      CG to 156 s against the direct path's 128 s at production size — a 22%
+      time penalty for 2.3× less peak memory. Scaling is sublinear (5.1× on 8
+      threads at n=13, 2.13× on 16 at production) because the sparse mat-vec is
+      memory-bandwidth bound; more threads is not the remaining lever, fewer
+      iterations is. Impossible for the direct path (CHOLMOD's solve is not
+      thread-safe), so `duplicate` throws there and `fault_stiffness` falls
+      back to serial.
+      Caught a genuine data race doing this: `if`/`else` and `begin` do not
+      open a scope in Julia, so the per-task buffers were shared and `K` came
+      out 2.35 relative off. Now a regression test demanding bit-identity, and
+      CI runs with `JULIA_NUM_THREADS: 4` — one thread cannot detect it.
 - [x] **Diagnose "order 6 is unusable".** Broader than recorded: order 6 in
       `standard_diagonal.toml` has only `H`, `e`, `d1` and `D2.positivity` —
       no `D1` at all and no `D2` stencils. Upstream Diffinitive data gap, not
@@ -104,24 +124,32 @@ peak `V`. It is free for slip and stiffness.
 `PROGRESS.md` "Known limitations" 1 and 2. Δz = 50 m gives 1.3 cells per
 process zone `L_b ≈ 64 m` against the benchmark's 10 m / ~6 cells.
 
-Everything cheap has now been taken and the accounting is not close:
+| | effect on Δz | cost |
+|---|---|---|
+| Cholesky (done) | 50 m → ~45 m | free |
+| CG (done) | removes the fill-in ceiling; ~3× on memory alone | ~2× slower serially, recovered by threading |
+| needed | 50 m → 10 m | |
 
-| | effect on Δz |
-|---|---|
-| Cholesky (done) | 50 m → ~45 m |
-| CG (converges, 73 its) | lifts the memory ceiling, but *slower* here — break-even 6-15 RHS, `fault_stiffness` needs 578 |
-| needed | 50 m → 10 m |
+CG turns the memory wall into a compute problem. What remains is that CG's cost
+grows on two fronts under refinement at once: iterations per solve (≈ `O(1/h)`
+unpreconditioned) *and* the number of right-hand sides (`2·N_Ωf`, growing as
+`h⁻²`). Threading covers a constant factor, not the scaling.
 
-- [ ] Decide between an iterative/multigrid solve of the same SBP-SAT system
-      and the boundary-integral route most SEAS codes take (whole-space
+- [ ] **Preconditioner.** The obvious next lever, and it attacks the iteration
+      count directly. Deliberately not shipped unvalidated: a diagonal
+      preconditioner preserves the `range(A)` invariant CG relies on here only
+      if it commutes with `P`, i.e. if its entries agree within each merged
+      fault pair. Check that before assuming it is safe — `CGSolver`'s
+      docstring has the argument.
+- [ ] **Decide between preconditioned/multigrid CG on this discretization and
+      the boundary-integral route** most SEAS codes take (whole-space
       fault-to-fault kernel is a convolution, `O(N log N)` with FFTs, no volume
-      unknowns). This is a design decision, not an increment.
-- [ ] If CG is ever adopted: thread the `K` build — its columns are
-      embarrassingly parallel, which is precisely what a sparse direct solve
-      cannot exploit. And keep `scripts/split_node_spd.jl`'s guardrails: CG's
-      internal recursive residual is only valid for symmetric `A`, and CG run
-      on `A[keep,keep]` (neither reduction) converges happily to the wrong
-      answer.
+      unknowns — and no `K` build, which is the part that scales worst here).
+      This is a design decision, not an increment.
+- [ ] Keep `scripts/split_node_spd.jl`'s guardrails in mind when touching any
+      of this: CG's internal recursive residual is only valid for symmetric
+      `A`, and CG run on `A[keep,keep]` (neither reduction) converges happily
+      to the wrong answer.
 
 ## 3. Smaller items
 

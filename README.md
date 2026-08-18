@@ -22,8 +22,10 @@ before the time loop starts — which is why setup costs minutes and the
 
 1. Build two SBP grids meeting at the fault plane; far field `u=0`.
 2. Assemble the split-node elastic system `-HP(D+SAT)Pu = HP(D+SAT)χ(s)`.
-3. Eliminate the redundant DOFs (Galerkin reduction `SᵀAS`), Cholesky-factorize.
-4. Back-substitute `2·N_Ωf` times → dense fault stiffness `K : [s₂;s₃] ↦ [Δτ₂;Δτ₃]`.
+3. Solve `A u = HP(D+SAT)χ(s)` — either directly (eliminate the redundant DOFs
+   via the Galerkin reduction `SᵀAS`, then Cholesky) or iteratively (CG straight
+   onto the singular `A`). See "Choosing a solver".
+4. Repeat `2·N_Ωf` times → dense fault stiffness `K : [s₂;s₃] ↦ [Δτ₂;Δτ₃]`.
 5. Assemble the fault-plane diffusion operator `A_p` and the injection source
    on the *same* nodes.
 
@@ -58,6 +60,40 @@ Two supporting studies:
 julia --project=. scripts/bp8_domain_convergence.jl  # §6 domain-size study
 julia --project=. scripts/bp8_validate_pressure.jl   # against eq. 21 and 25
 ```
+
+## Choosing a solver
+
+`build_model(...; solver=:cholesky | :lu | :cg)` picks how the elastic system is
+solved. All three give the same `K` (agreeing to ~1e-11); the choice is about
+resources, not correctness.
+
+|  | `:cholesky` (default) | `:cg` |
+|---|---|---|
+| method | Galerkin reduction `SᵀAS`, sparse Cholesky | CG on the singular `A`, no reduction |
+| total time, production | **128 s** | 265 s serial, **156 s** on 16 threads |
+| peak RSS | 3.48 GB | **1.41 GB** |
+| solver's own footprint | 2.45 GB (a 168M-nonzero factor) | **0.38 GB**, no factor |
+| memory scaling | fill-in, ≈ `n^5.6` | ≈ linear in DOF |
+| `K` build threads? | no — CHOLMOD's solve is not thread-safe | **yes** |
+
+Direct is still faster at the current size because one factorization is
+amortized over `2·N_Ωf ≈ 578` back-substitutions — threaded CG closes that to
+~22%. **CG is the one that survives refinement**: it has no factor, so the
+fill-in ceiling that caps Δz at ~50 m does not apply. Run threaded with
+
+```julia
+julia -t auto --project=. scripts/run_bp8.jl gs 50 800 400
+```
+
+Threading scales sublinearly — 5.1× on 8 threads on a small case, but only 2.1×
+on 16 at production size, because the sparse mat-vec is memory-bandwidth bound
+once the working set leaves cache. Expect the memory system, not the core count,
+to be the limit.
+
+CG's singularity handling needs no special machinery — `b ⊥ null(A)` exactly and
+CG started from `x₀ = 0` never leaves `range(A)`, so the reduction is simply not
+needed. `ElasticitySplitNode.CGSolver`'s docstring gives the argument and the
+measurements behind it.
 
 ## Plotting
 

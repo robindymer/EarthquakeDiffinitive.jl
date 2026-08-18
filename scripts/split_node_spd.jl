@@ -241,6 +241,11 @@ Reading this:
   `LU/chol` is how many times bigger an LU factor would be than the Cholesky
   factor now used — the memory saved by exploiting symmetry. Fill-in scales
   ≈ n^5.6 here, so this buys grid spacing only as its 1/5.6 power.
-  `fact s` vs `CG s`: CG's advantage is MEMORY, not time. The factorization is
-  paid once and then serves 2·N_Ωf back-substitutions nearly free — exactly the
-  access pattern `fault_stiffness` has.""")
+  `fact s` vs `CG s`: per right-hand side, CG is slower — the factorization is
+  paid once and then serves 2·N_Ωf back-substitutions nearly free, which is
+  exactly the access pattern `fault_stiffness` has. CG's advantages are MEMORY
+  (no factor at all: 0.38 GB vs 2.45 GB of solver footprint at production size)
+  and PARALLELISM (`fault_stiffness`'s columns are independent and thread,
+  measured 5.1x on 8 threads; a sparse factorization cannot be shared across
+  threads at all). Both are chosen with `solver=:cg` — see
+  `ElasticitySplitNode.CGSolver`, which runs CG on the singular `A` directly.""")

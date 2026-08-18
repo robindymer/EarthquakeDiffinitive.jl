@@ -6,6 +6,7 @@ version = "1.0.0-DEV"
 [deps]
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 Diffinitive = "5a373a26-915f-4769-bcab-bf03835de17b"
+Krylov = "ba0b0d4f-ebba-5204-a429-3ac8c609bfb7"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
@@ -13,10 +14,14 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Tokens = "040c2ec2-8d69-4aca-bf03-7d3a7092f2f6"
 
+[sources]
+Diffinitive = {rev = "92d842cf1b9a137aa4952b59ad959abf588ba855", url = "https://github.com/Diffinitive/Diffinitive"}
+
 [compat]
 Dates = "1.11.0"
 Diffinitive = "0.1.8"
 ForwardDiff = "1.4.5"
+Krylov = "0.10.9"
 LinearAlgebra = "1.11.0"
 OrdinaryDiffEq = "7.6.0"
 Printf = "1.11.0"
@@ -25,15 +30,6 @@ SpecialFunctions = "2.8.3"
 StaticArrays = "1.9.18"
 Tokens = "0.1.1"
 julia = "1.10"
-
-# Diffinitive is pinned to an upstream commit rather than resolved from the
-# registry. The registry's v0.1.8 has a different `LazyTensor`, against which
-# `IsotropicElasticOperator` fails to precompile with "invalid subtyping". This
-# used to live only in the gitignored Manifest.toml as a `Pkg.develop` path, so
-# a fresh clone silently resolved the registry version and broke.
-# To hack on Diffinitive locally, `Pkg.develop(path=...)` still overrides this.
-[sources]
-Diffinitive = {url = "https://github.com/Diffinitive/Diffinitive", rev = "92d842cf1b9a137aa4952b59ad959abf588ba855"}
 
 [extras]
 ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"

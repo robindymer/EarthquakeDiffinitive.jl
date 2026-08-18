@@ -5,14 +5,17 @@ using Diffinitive.Grids
 using Diffinitive.SbpOperators
 using Diffinitive.LazyTensors
 using SparseArrays
-using LinearAlgebra: I, lu, cholesky, Symmetric, PosDefException, norm
+using LinearAlgebra: I, lu, cholesky, Symmetric, PosDefException, norm, dot
+using Krylov: CgWorkspace, cg!
 using Tokens
 using StaticArrays
 using ..Elasticity: elastic_blocks, traction_blocks
 
 export split_node_system, dof_index_minus, dof_index_plus, build_chi,
        reconstruct_U, reduced_solve, fault_node_pairs, ReducedSystem,
-       factorize_reduced, prolongation
+       factorize_reduced, prolongation,
+       SplitNodeSolver, CGSolver, split_node_solver, split_node_solve,
+       solver_report, duplicate, threadsafe, merge_stats!
 
 # ==============================================================================
 # Two-sided (split-node) SBP-SAT elastic system, matching the formulation in
@@ -207,6 +210,25 @@ The true displacement field `U = P*u + χ`; tractions must be computed from
 reconstruct_U(P, u, χ) = P * u + χ
 
 """
+    SplitNodeSolver
+
+Something that can solve `A u = rhs` for the split-node system, applied with
+[`split_node_solve`](@ref). Two implementations, chosen by
+[`split_node_solver`](@ref):
+
+  * [`ReducedSystem`](@ref) — direct. Eliminates `P`'s null space, then
+    Cholesky- (or LU-) factorizes. One factorization amortized over many
+    right-hand sides.
+  * [`CGSolver`](@ref) — iterative. Runs CG on the singular `A` itself, with no
+    reduction and no factorization at all.
+
+They are interchangeable from `FaultResponse`'s point of view: both return a
+full-length `u` whose only guaranteed meaning is `P*u`, which is all the
+`U = P*u + χ` reconstruction uses.
+"""
+abstract type SplitNodeSolver end
+
+"""
     ReducedSystem
 
 A factorized, non-redundant form of `A = -H*P*(D+SAT)*P`, produced by
@@ -220,7 +242,7 @@ evolves — only `χ(s)` and hence the right-hand side do. Factorizing once and
 reusing the factorization across every time step / RK stage is the whole
 reason for going constant-coefficient.
 """
-struct ReducedSystem{F}
+struct ReducedSystem{F} <: SplitNodeSolver
     keep::Vector{Int}                   # DOFs retained as unknowns
     merge_pairs::Vector{Pair{Int,Int}}  # dropped DOF => the representative it equals
     S::SparseMatrixCSC{Float64,Int}     # prolongation, reduced unknowns → full DOFs
@@ -361,5 +383,189 @@ the kept DOFs and copies each representative onto its merged partner.
 reduced_solve(rs::ReducedSystem, rhs) = rs.S * (rs.fact \ (rs.S' * rhs))
 
 reduced_solve(A, rhs, P; kwargs...) = reduced_solve(factorize_reduced(A, P; kwargs...), rhs)
+
+# ==============================================================================
+# Iterative solver: CG straight onto the singular A.
+# ==============================================================================
+
+"""
+    CGStats
+
+Running totals across every solve a [`CGSolver`](@ref) has performed. Iteration
+count is the thing to watch: it grows with problem size, and it is what decides
+whether the iterative path stays cheaper than a factorization.
+"""
+mutable struct CGStats
+    solves::Int
+    iterations::Int
+    max_iterations::Int
+    unconverged::Int
+end
+CGStats() = CGStats(0, 0, 0, 0)
+
+"""
+    CGSolver(A; rtol=1e-10, atol=0.0, itmax=0)
+
+Conjugate gradients on `A = -H*P*(D+SAT)*P` **directly**, with no reduction and
+no factorization. Memory is a handful of vectors rather than a sparse factor,
+which is the entire point: fill-in is what caps resolution (PROGRESS.md "Known
+limitations" 2), and this has none.
+
+## Why the singularity needs no special handling
+
+`A` is singular by construction — it annihilates `P`'s null space (far-field
+DOFs, and the antisymmetric half of every fault pair, together ~40% of the
+system). That would normally rule out CG. It does not here, for three reasons
+that hold *exactly* rather than approximately:
+
+ 1. **The system is consistent**, `b ⊥ null(A)`. Since `null(P) ⊆ null(A)`, take
+    any `v ∈ null(P)`: `vᵀb = vᵀHP(D+SAT)χ = (HPv)ᵀ(D+SAT)χ = 0`, using
+    `HP = PH` (measured exact) and `P = Pᵀ`. Measured directly:
+    `‖(I-P)b‖/‖b‖ = 0.0`, i.e. `b ∈ range(P)` to the last bit.
+ 2. **The iterates never leave `range(A)`.** Started from `x₀ = 0`, every Krylov
+    vector lies in `span{b, Ab, A²b, …} ⊆ range(A)`. Measured null-space content
+    of the returned `u` after ~100 iterations: `0.0` exactly.
+ 3. **Anything that did leak would be projected away.** The only use of `u` is
+    `U = P*u + χ`, and `P` annihilates `null(P)`. So null-space content is not
+    merely small, it is irrelevant.
+
+`A` restricted to `range(A)` is positive definite (`λ ∈ [0.101, 11.9]`, κ = 118
+at n=9), so CG converges there at the normal rate — 71 iterations at n=9 and 108
+at n=13, agreeing with the direct solve's tractions to 1.4e-11.
+
+This all depends on `A` being **symmetric**, which it only became once
+`traction_blocks` was fixed; before that CG stalled at residual 3.7e-2 after
+5000 iterations. See SYMMETRIC_SAT.md.
+
+## Caveats
+
+`itmax=0` lets Krylov pick its own default cap. A solve that hits the cap is
+counted in [`solver_report`](@ref)'s `unconverged` and warned about once —
+silently returning an unconverged `u` would corrupt `K` in a way nothing
+downstream would notice.
+
+No preconditioner. A diagonal one is tempting but not obviously safe here: it
+preserves the `range(A)` invariant above only if it commutes with `P`, i.e. if
+its entries agree within each merged fault pair. Left unimplemented rather than
+shipped unverified.
+"""
+struct CGSolver{TA} <: SplitNodeSolver
+    A::TA
+    workspace::CgWorkspace{Float64,Float64,Vector{Float64}}
+    rtol::Float64
+    atol::Float64
+    itmax::Int
+    stats::CGStats
+end
+
+function CGSolver(A; rtol=1e-10, atol=0.0, itmax=0)
+    n = size(A, 2)
+    return CGSolver(A, CgWorkspace(n, n, Vector{Float64}), rtol, atol, itmax, CGStats())
+end
+
+"""
+    split_node_solve(solver, rhs) -> u
+
+Solves `A u = rhs`. Only `P*u` is meaningful: the direct path returns zeros on
+the dropped DOFs, the iterative path returns whatever CG's iterates happen to
+carry there. Both are correct inputs to `U = P*u + χ`.
+"""
+split_node_solve(rs::ReducedSystem, rhs) = reduced_solve(rs, rhs)
+
+function split_node_solve(s::CGSolver, rhs)
+    cg!(s.workspace, s.A, rhs; rtol=s.rtol, atol=s.atol, itmax=s.itmax)
+    st = s.workspace.stats
+    t = s.stats
+    t.solves += 1
+    t.iterations += st.niter
+    t.max_iterations = max(t.max_iterations, st.niter)
+    if !st.solved
+        t.unconverged += 1
+        t.unconverged == 1 && @warn """
+            CG did not converge on a split-node solve (status "$(st.status)") \
+            after $(st.niter) iterations. The returned displacement is not a \
+            solution, and `fault_stiffness` would fold it into `K` silently. \
+            Raise `itmax`, loosen `rtol`, or use a direct solver \
+            (`solver=:cholesky`).""" rtol = s.rtol itmax = s.itmax
+    end
+    # The workspace buffer is reused by the next solve, so hand back a copy.
+    return copy(s.workspace.x)
+end
+
+"""
+    duplicate(solver) -> solver
+
+An independent solver sharing the same operator, for use on another thread.
+Only the iterative path supports this: `CGSolver`'s per-solve state is its
+`CgWorkspace`, which is cheap to duplicate (a few vectors), while `A` is read
+concurrently. A `ReducedSystem` cannot — CHOLMOD's `\\` writes into workspace
+owned by the factor, so sharing one across threads is a data race.
+
+This is what makes the `K` build parallel under CG and not under a direct
+solve: `fault_stiffness`'s `2·N_Ωf` columns are independent, and a sparse
+factorization cannot exploit that.
+"""
+duplicate(s::CGSolver) = CGSolver(s.A; rtol=s.rtol, atol=s.atol, itmax=s.itmax)
+duplicate(::ReducedSystem) =
+    error("a direct ReducedSystem cannot be duplicated for threading (CHOLMOD's " *
+          "solve is not thread-safe); use `solver=:cg` for a threaded K build")
+
+"""
+    threadsafe(solver) -> Bool
+
+Whether [`duplicate`](@ref) works, i.e. whether the `K` build can be threaded.
+"""
+threadsafe(::CGSolver) = true
+threadsafe(::ReducedSystem) = false
+
+"""
+    merge_stats!(into, from)
+
+Folds a duplicated solver's counters back into the original, so
+[`solver_report`](@ref) totals the whole threaded build.
+"""
+function merge_stats!(into::CGSolver, from::CGSolver)
+    a, b = into.stats, from.stats
+    a.solves += b.solves
+    a.iterations += b.iterations
+    a.max_iterations = max(a.max_iterations, b.max_iterations)
+    a.unconverged += b.unconverged
+    return into
+end
+merge_stats!(into::SplitNodeSolver, ::SplitNodeSolver) = into
+
+"""
+    solver_report(solver) -> NamedTuple
+
+What the solve cost. For the direct path this is static; for [`CGSolver`](@ref)
+it accumulates, so a build of `K` reports the total and worst-case iteration
+counts over all `2·N_Ωf` right-hand sides.
+"""
+solver_report(rs::ReducedSystem) = (; kind=:direct, factorization=nameof(typeof(rs.fact)),
+                                    reduced_dofs=length(rs.keep))
+function solver_report(s::CGSolver)
+    t = s.stats
+    return (; kind=:cg, t.solves, t.iterations,
+            mean_iterations=t.solves == 0 ? 0.0 : t.iterations / t.solves,
+            t.max_iterations, t.unconverged)
+end
+
+"""
+    split_node_solver(A, P; method=:cholesky, kwargs...) -> SplitNodeSolver
+
+Builds the solver for `A`. `method` is `:cholesky` (default) or `:lu` for the
+direct reduction — see [`factorize_reduced`](@ref) — or `:cg` for
+[`CGSolver`](@ref), which ignores `P` entirely. Remaining `kwargs` go to the
+chosen constructor (`rtol`, `atol`, `itmax` for `:cg`).
+
+Which to pick is an access-pattern question, not a correctness one. The direct
+path pays one factorization and then serves right-hand sides nearly free, which
+suits `fault_stiffness`'s `2·N_Ωf` of them; CG pays per right-hand side but
+needs no factor, so it is the one that survives grid refinement.
+"""
+function split_node_solver(A, P; method=:cholesky, kwargs...)
+    method === :cg && return CGSolver(A; kwargs...)
+    return factorize_reduced(A, P; method, kwargs...)
+end
 
 end # module ElasticitySplitNode

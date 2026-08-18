@@ -8,11 +8,12 @@ using SparseArrays
 using Tokens
 using StaticArrays
 using ..Elasticity: traction_blocks
-using ..ElasticitySplitNode: split_node_system, factorize_reduced, reduced_solve,
-                             ReducedSystem
+using ..ElasticitySplitNode: split_node_system, split_node_solver,
+                             split_node_solve, SplitNodeSolver, solver_report,
+                             duplicate, threadsafe, merge_stats!
 
 export FaultElasticity, fault_grid_axes, frictional_node_count,
-       shear_traction, shear_traction!, fault_stiffness
+       shear_traction, shear_traction!, fault_stiffness, elastic_solver_report
 
 # ==============================================================================
 # The slip → shear-traction map on the fault.
@@ -75,7 +76,7 @@ Slip and traction vectors are indexed over the `Ω_f` nodes only, in
 column-major order (x2 fastest) over an `(n2f, n3f)` grid — the same ordering
 `PorePressure`'s grid uses, so the two couple entry-wise.
 """
-struct FaultElasticity{RS<:ReducedSystem}
+struct FaultElasticity{RS<:SplitNodeSolver}
     P::SparseMatrixCSC{Float64,Int}
     HP_DSAT::SparseMatrixCSC{Float64,Int}
     rs::RS
@@ -89,7 +90,7 @@ struct FaultElasticity{RS<:ReducedSystem}
     Ntot::Int
 end
 
-function FaultElasticity(g_minus, g_plus, λ, μ, stencil_set; l_f)
+function FaultElasticity(g_minus, g_plus, λ, μ, stencil_set; l_f, solver=:cholesky, solver_kwargs...)
     bid_minus = CartesianBoundary{1,UpperBoundary}()
     bid_plus = CartesianBoundary{1,LowerBoundary}()
     Nm, Np = length(g_minus), length(g_plus)
@@ -135,10 +136,19 @@ function FaultElasticity(g_minus, g_plus, λ, μ, stencil_set; l_f)
         chi_rows_plus[k, ci] = 3Nm + (comp - 1) * Np + sel_plus[b]
     end
 
-    return FaultElasticity(P, HP_DSAT, factorize_reduced(A, P), extract(2), extract(3),
+    return FaultElasticity(P, HP_DSAT, split_node_solver(A, P; method=solver, solver_kwargs...),
+                           extract(2), extract(3),
                            chi_rows, chi_rows_plus, omega,
                            collect(x2_all[i2]), collect(x3_all[i3]), Ntot)
 end
+
+"""
+    elastic_solver_report(fe) -> NamedTuple
+
+How the elastic system is being solved, and — for the iterative solver — what
+it has cost so far. See `ElasticitySplitNode.solver_report`.
+"""
+elastic_solver_report(fe::FaultElasticity) = solver_report(fe.rs)
 
 """
     fault_grid_axes(fe) -> (x2, x3)
@@ -185,9 +195,9 @@ function shear_traction(fe::FaultElasticity, s2, s3)
     return Δτ2, Δτ3
 end
 
-function shear_traction!(Δτ2, Δτ3, fe::FaultElasticity, s2, s3, χ)
+function shear_traction!(Δτ2, Δτ3, fe::FaultElasticity, s2, s3, χ, solver=fe.rs)
     build_chi!(χ, fe, s2, s3)
-    U = fe.P * reduced_solve(fe.rs, fe.HP_DSAT * χ) .+ χ
+    U = fe.P * split_node_solve(solver, fe.HP_DSAT * χ) .+ χ
     τ2 = fe.T2 * U
     τ3 = fe.T3 * U
     @inbounds for (k, b) in enumerate(fe.omega)
@@ -208,28 +218,64 @@ time loop is a single dense mat-vec.
 
 `K` is negative-definite in the physically meaningful sense that slip relieves
 the stress driving it — `K[i,i] < 0`.
+
+The columns are independent, so with an iterative solver this build is
+**embarrassingly parallel** and threads across `Threads.nthreads()` (start Julia
+with `-t auto`). That parallelism is the structural advantage of the iterative
+path: a single sparse factorization cannot be shared across threads, so
+`threaded` is silently ignored for a direct solver. Pass `threaded=false` to
+force the serial path.
 """
-function fault_stiffness(fe::FaultElasticity; verbose=false)
+function fault_stiffness(fe::FaultElasticity; verbose=false,
+                         threaded=threadsafe(fe.rs) && Threads.nthreads() > 1)
     nf = frictional_node_count(fe)
     K = Matrix{Float64}(undef, 2nf, 2nf)
-    s2 = zeros(nf)
-    s3 = zeros(nf)
-    Δτ2 = zeros(nf)
-    Δτ3 = zeros(nf)
-    χ = zeros(fe.Ntot)
+    ncols = 2nf
     t0 = time()
-    for col in 1:2nf
-        fill!(s2, 0.0)
-        fill!(s3, 0.0)
-        col <= nf ? (s2[col] = 1.0) : (s3[col-nf] = 1.0)
-        shear_traction!(Δτ2, Δτ3, fe, s2, s3, χ)
-        K[1:nf, col] .= Δτ2
-        K[nf+1:2nf, col] .= Δτ3
-        if verbose && (col % 50 == 0 || col == 2nf)
-            el = time() - t0
-            @info "fault_stiffness: column $col/$(2nf)" elapsed = round(el, digits=1) eta = round(el * (2nf - col) / col, digits=1)
+
+    # Fills `cols` of K using `solver`, with buffers private to this call.
+    #
+    # This MUST be a function rather than a `begin` block inside the spawn:
+    # `if`/`else` and `begin` do not introduce scope in Julia, so buffers
+    # assigned there would be locals of `fault_stiffness` and every task would
+    # share the same `χ`/`s2`/`Δτ` arrays. A function body is a real scope, so
+    # each invocation gets its own. (Learned the hard way — the threaded `K`
+    # came out 2.35 relative off before this was a function.)
+    function run_columns!(cols, solver; progress=false)
+        s2, s3 = zeros(nf), zeros(nf)
+        Δτ2, Δτ3 = zeros(nf), zeros(nf)
+        χ = zeros(fe.Ntot)
+        done = 0
+        for col in cols
+            fill!(s2, 0.0)
+            fill!(s3, 0.0)
+            col <= nf ? (s2[col] = 1.0) : (s3[col-nf] = 1.0)
+            shear_traction!(Δτ2, Δτ3, fe, s2, s3, χ, solver)
+            K[1:nf, col] .= Δτ2
+            K[nf+1:2nf, col] .= Δτ3
+            done += 1
+            if progress && (done % 50 == 0 || done == length(cols))
+                el = time() - t0
+                @info "fault_stiffness: column $done/$(length(cols))" elapsed = round(el, digits=1) eta = round(el * (length(cols) - done) / done, digits=1)
+            end
         end
+        return solver
     end
+
+    if threaded && threadsafe(fe.rs)
+        nt = min(Threads.nthreads(), ncols)
+        verbose && @info "fault_stiffness: threaded build" columns = ncols threads = nt
+        # Strided partition: iteration counts vary a little between columns, so
+        # interleaving balances the chunks better than contiguous blocks.
+        tasks = [Threads.@spawn run_columns!(t:nt:ncols, duplicate(fe.rs)) for t in 1:nt]
+        # Fold each worker's counters back so `solver_report` totals the build.
+        for task in tasks
+            merge_stats!(fe.rs, fetch(task))
+        end
+    else
+        run_columns!(1:ncols, fe.rs; progress=verbose)
+    end
+    verbose && @info "fault_stiffness: done" seconds = round(time() - t0, digits=1)
     return K
 end
 

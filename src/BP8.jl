@@ -158,7 +158,8 @@ of the factorized 3D elastic system.
 """
 function build_model(; par::BP8Params=benchmark_parameters(),
                      Δz=par.Δz, L_fault=3par.l_f, L_normal=2par.l_f,
-                     injection=:gaussian, order=4, verbose=false)
+                     injection=:gaussian, order=4, verbose=false,
+                     solver=:cholesky, solver_kwargs...)
     injection ∈ (:gaussian, :peaceman) ||
         error("injection must be :gaussian or :peaceman, got $injection")
     isapprox(par.l_f / Δz, round(par.l_f / Δz); atol=1e-9) ||
@@ -180,12 +181,13 @@ function build_model(; par::BP8Params=benchmark_parameters(),
     verbose && @info "elastic grids" points_per_side = n1 * n23^2 dofs = 6 * n1 * n23^2
 
     t0 = time()
-    fe = FaultElasticity(g_minus, g_plus, lame_lambda(par), par.μ, set; l_f=par.l_f)
-    verbose && @info "split-node system factorized" seconds = round(time() - t0, digits=1)
+    fe = FaultElasticity(g_minus, g_plus, lame_lambda(par), par.μ, set;
+                         l_f=par.l_f, solver, solver_kwargs...)
+    verbose && @info "split-node system ready" seconds = round(time() - t0, digits=1) solver
 
     t0 = time()
     K = fault_stiffness(fe; verbose)
-    verbose && @info "fault stiffness built" seconds = round(time() - t0, digits=1) size = size(K)
+    verbose && @info "fault stiffness built" seconds = round(time() - t0, digits=1) size = size(K) elastic_solver_report(fe)...
 
     x2, x3 = fault_grid_axes(fe)
     nf = frictional_node_count(fe)

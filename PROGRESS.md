@@ -192,6 +192,10 @@ half-space shortcut.
   built with the exported `prolongation(rs)` — and it is **Cholesky**-
   factorized. Both of those depend on the traction fix below; see "Symmetry:
   root cause found and fixed".
+- **There is now a second, iterative solver**, selected with
+  `build_model(...; solver=:cg)`. It runs CG on the singular `A` **directly** —
+  no reduction, no factorization, no special handling of the null space. See
+  "Iterative solver" below for why the singularity is benign and what it costs.
 - **Symmetry: root cause found and fixed.** `A` used to be ~14% asymmetric, so
   the reference note's assertion that it is SPD did not hold and CG was
   unusable. `scripts/split_node_spd.jl` remains the standing diagnostic; run it
@@ -326,6 +330,72 @@ half-space shortcut.
   which is neither reduction — converges happily in ~160 iterations to a
   vector 4.5% away from the true solution. Both mistakes were made while
   writing the script above, and both look like success.
+
+### Iterative solver (`solver=:cg`)
+
+`ElasticitySplitNode.CGSolver` runs CG (Krylov.jl's `cg!`, with a reused
+workspace) on `A` itself. **The reduction machinery is not involved at all** —
+no `S`, no factor, no elimination of `P`'s null space.
+
+**Why the singularity needs no handling.** `A` annihilates `null(P)`, ~40% of
+the system, which would normally disqualify CG. Three things make it a
+non-issue, and each holds *exactly* rather than to a tolerance:
+
+1. The system is **consistent**, `b ⊥ null(A)`. For `v ∈ null(P) ⊆ null(A)`,
+   `vᵀb = vᵀHP(D+SAT)χ = (HPv)ᵀ(D+SAT)χ = 0`, using `HP = PH` (measured exact)
+   and `P = Pᵀ`. Measured: `‖(I-P)b‖/‖b‖ = 0.0`.
+2. From `x₀ = 0` every Krylov vector is in `span{b, Ab, …} ⊆ range(A)`, so the
+   null space is never excited. Measured null content of `u` after ~150
+   iterations: `0.0`.
+3. Even if it were, the only consumer is `U = P*u + χ`, and `P` annihilates
+   `null(P)`. Null content is not merely small, it is irrelevant.
+
+On `range(A)` the operator is positive definite (`λ ∈ [0.101, 11.9]`, κ = 118),
+so CG converges normally: 71 iterations at n=9, 108 at n=13, 147 mean at
+production size. All of this depends on `A` being symmetric, which it only
+became after the traction fix — before it, CG stalled at 3.7e-02 after 5000.
+
+**Cost, at production size** (Δz = 50, `L_fault` 800, `L_normal` 400; 58,806
+elastic DOF, 578 right-hand sides). Same `K` to 1.6e-11, 0 unconverged:
+
+| | `:cholesky` | `:cg` serial | `:cg` ×16 threads |
+|---|---|---|---|
+| setup | 69.6 s | 63.6 s | 61.6 s |
+| `K` build (578 RHS) | 58.2 s | 201.7 s | 94.5 s |
+| total | **127.8 s** | 265.3 s | 156.2 s |
+| peak RSS | 3.48 GB | **1.41 GB** | 1.53 GB |
+| solver's own footprint | 2.45 GB | **0.38 GB** | 0.35 GB |
+| sparse factor | 168.4M nonzeros (1.88 GB) | **none** | **none** |
+
+So direct is ~2× faster serially — narrowing to ~22% once the `K` build is
+threaded — and CG uses ~6× less of the memory that actually binds. Direct wins
+on time because one factorization amortizes over 578 back-substitutions; that is
+the whole reason it was chosen originally, and it remains the default.
+
+**The `K` build threads under CG, and only under CG.** Its `2·N_Ωf` columns are
+independent; `fault_stiffness(fe; threaded=true)` (default when
+`Threads.nthreads() > 1` and the solver supports it) is bit-identical to the
+serial result, with identical iteration counts. A `ReducedSystem` cannot be
+threaded at all — CHOLMOD's `\` writes into workspace owned by the factor — so
+`duplicate` throws for it and `fault_stiffness` falls back to serial. This is
+the structural advantage: the direct solve's amortization is inherently
+sequential.
+
+**Threading scales sublinearly, and it is worth knowing why**: 5.1× on 8 threads
+at n=13, but only 2.13× on 16 threads at production size. The kernel is a sparse
+mat-vec, which is memory-bandwidth bound once the working set leaves cache, so
+adding cores stops helping well before they run out. Fewer, faster iterations —
+i.e. a preconditioner — is the lever that still has room, not more threads.
+
+**A real bug found here, worth recording.** The first threaded version shared
+its `χ`/slip buffers across all tasks and produced a `K` that was 2.35 relative
+off — because **`if`/`else` and `begin` do not open a scope in Julia**, so
+buffers assigned inside the `else` branch were locals of `fault_stiffness` and
+the `@spawn` closure wrote to those same arrays. The fix is that the per-task
+body is a *function*, whose body is a real scope. `test/fault_response_test.jl`'s
+`"threaded K build matches serial"` now demands bit-identical results, and CI
+sets `JULIA_NUM_THREADS: 4` — with one thread the test cannot detect a race.
+
 - Validated in `test/elasticity_split_node_test.jl` two ways.
   1. An algebraic self-consistency check (deliberately avoiding another
      continuum-PDE derivation after the half-space episode): pick an
@@ -597,19 +667,29 @@ These are properties of the current approach, not loose ends to tidy.
    system is 10⁷–10⁸ DOF — out of reach of a direct factorization by orders of
    magnitude, and the reason `L_normal = 400 m` had to be halved relative to
    `L_fault` in the production runs.
-   **Cholesky (now the default) buys ≈1.9× on this, and that is nearly
-   nothing.** Fill-in scales ≈ `n^5.6` on the measured points, so 1.9× less
-   memory supports only a ≈1.12× finer grid — Δz 50 m → ~45 m. Free and worth
-   taking; not a path to 10 m. CG would lift the ceiling entirely (it converges
-   now, 73 iterations) but is *slower* here: break-even is 6-15 right-hand
-   sides and `fault_stiffness` needs 578.
-   Reaching spec resolution means changing the elastic solver, not tuning it:
-   either an iterative/multigrid solve of the same SBP-SAT system, or the
-   boundary-integral route most SEAS codes take for quasi-dynamic whole-space
-   problems, where the whole-space fault-to-fault kernel is a convolution and
-   costs O(N log N) per step with FFTs and no volume unknowns at all. **This is
-   the one open blocker**; everything else in this file is now either done or a
-   documented, bounded caveat.
+   **Cholesky buys ≈1.9× on this, and that is nearly nothing.** Fill-in scales
+   ≈ `n^5.6` on the measured points, so 1.9× less memory supports only a ≈1.12×
+   finer grid — Δz 50 m → ~45 m. Free and worth taking; not a path to 10 m.
+   **`solver=:cg` removes the fill-in ceiling outright**, because it builds no
+   factor: measured solver footprint 0.38 GB against the direct path's 2.45 GB
+   at production size, and it scales roughly linearly in DOF rather than as
+   `n^5.6`. On memory alone that is worth ~3× in Δz (roughly 50 m → high teens)
+   instead of Cholesky's 1.12×, which is a change of kind rather than degree.
+   It is not free: CG is ~2× slower in wall-clock at the current size, and its
+   cost grows on two fronts at once under refinement — more CG iterations per
+   solve (unpreconditioned, so ≈ `O(1/h)`) *and* more right-hand sides, since
+   `2·N_Ωf` grows as `h⁻²`. Threading the `K` build (5.1× on 8 threads) offsets
+   part of that; a preconditioner would offset the rest and is the obvious next
+   lever, deliberately not shipped unvalidated (see `CGSolver`'s docstring on
+   why a diagonal one is not automatically safe here).
+   So the honest position: CG makes the memory wall a compute problem, and
+   compute problems have more exits. Reaching spec resolution still likely means
+   the boundary-integral route most SEAS codes take for quasi-dynamic
+   whole-space problems, where the fault-to-fault kernel is a convolution and
+   costs O(N log N) per step with FFTs and no volume unknowns at all — with
+   preconditioned, threaded CG the fallback if the volume discretization is
+   kept. **This is the one open blocker**; everything else in this file is now
+   either done or a documented, bounded caveat.
 3. **The Peaceman variant drives σ̄ negative at the well cell.** At Δz = 50 m
    pressure there reaches 25.85 MPa against σ = 25 MPa, so `σ̄ = σ - p` goes
    to −0.85 MPa and the `σ̄_min` floor binds. This is not a numerical

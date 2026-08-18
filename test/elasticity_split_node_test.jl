@@ -180,6 +180,48 @@ end
         @test norm(A_pet - A_pet') / norm(A_pet) > 1e-3
     end
 
+    # `CGSolver` runs CG on the SINGULAR `A` with no reduction. That is only
+    # legitimate because of three properties, so each is asserted directly
+    # rather than inferred from the answer coming out right — an unconverged or
+    # null-space-polluted solve can still look plausible.
+    @testset "CG on the singular system" begin
+        set = split_node_stencil_set()
+        n = 11
+        g_minus = equidistant_grid((-1.0, -1.0, -1.0), (0.0, 1.0, 1.0), n, n, n)
+        g_plus = equidistant_grid((0.0, -1.0, -1.0), (1.0, 1.0, 1.0), n, n, n)
+        A, HP_DSAT, P = split_node_system(g_minus, g_plus, λ_sn, μ_sn, set)
+        χ = build_chi(g_minus, g_plus, (x2, x3) -> (exp(-(x2^2 + x3^2) / 0.125), 0.0))
+        b = HP_DSAT * χ
+
+        # 1. Consistency: b ⊥ null(A). null(P) ⊆ null(A) and (I-P) projects
+        #    onto null(P), so this is `b ∈ range(P)`. Holds exactly, because
+        #    `HP = PH` and `P = Pᵀ` — not to a tolerance.
+        @test norm(b - P * b) / norm(b) < 1e-14
+
+        # 2. A really is symmetric — CG is meaningless otherwise, and this is
+        #    what `traction_blocks` had to be fixed to achieve.
+        @test norm(A - A') / norm(A) < 1e-12
+
+        cg = split_node_solver(A, P; method=:cg)
+        u_cg = split_node_solve(cg, b)
+        direct = split_node_solver(A, P)
+        u_dir = split_node_solve(direct, b)
+
+        @test solver_report(cg).unconverged == 0
+        @test norm(b - A * u_cg) / norm(b) < 1e-8
+
+        # 3. The iterates stay in range(A), so `u` carries no null-space
+        #    component — and even if it did, `P` in the reconstruction removes
+        #    it. Both halves are checked.
+        @test norm(u_cg - P * u_cg) / norm(u_cg) < 1e-12
+        @test norm(P * u_cg - P * u_dir) / norm(P * u_dir) < 1e-8
+
+        # The reconstruction is what everything downstream consumes.
+        U_cg = reconstruct_U(P, u_cg, χ)
+        U_dir = reconstruct_U(P, u_dir, χ)
+        @test norm(U_cg - U_dir) / norm(U_dir) < 1e-8
+    end
+
     @testset "fault-normal stress vanishes under refinement" begin
         coarse = solve_gaussian_slip(11)
         fine = solve_gaussian_slip(15)
