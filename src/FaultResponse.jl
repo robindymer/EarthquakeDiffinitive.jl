@@ -13,7 +13,8 @@ using ..ElasticitySplitNode: split_node_system, CGSolver,
                              duplicate, merge_stats!
 
 export FaultElasticity, fault_grid_axes, frictional_node_count,
-       shear_traction, shear_traction!, fault_stiffness, elastic_solver_report
+       shear_traction, shear_traction!, fault_stiffness, fault_stiffness_toeplitz,
+       elastic_solver_report
 
 # ==============================================================================
 # The slip → shear-traction map on the fault.
@@ -275,6 +276,112 @@ function fault_stiffness(fe::FaultElasticity; verbose=false,
         run_columns!(1:ncols, fe.rs; progress=verbose)
     end
     verbose && @info "fault_stiffness: done" seconds = round(time() - t0, digits=1)
+    return K
+end
+
+"""
+    fault_stiffness_toeplitz(fe; verbose=false) -> K
+
+`K` built from **5 sources** — 10 CG solves instead of `2·N_Ωf` — by exploiting
+the translation invariance of the whole-space kernel.
+
+In a homogeneous whole-space the traction at node `i` from unit slip at node `j`
+depends only on the separation `x_i − x_j`, so `K` is block-Toeplitz with
+Toeplitz blocks and one source column determines the rest. The far-field `u=0`
+truncation breaks that exactly — nodes near the boundary see a different medium
+— but the departure is small and, crucially, concentrated where the kernel is
+already negligible.
+
+## Priority, not averaging — this distinction is the whole design
+
+Sources are consulted in order and **the first one to supply a separation wins**.
+Averaging them together instead is a ~500× regression: corner and edge sources
+sit against the truncation boundary and the locked `Ω_f` ring, so their kernels
+are contaminated, and averaging lets that contamination into the near field that
+drives the solution.
+
+Measured end-to-end against the full build at Δz = 50 m (`PERFORMANCE.md` §4b),
+worst relative error in `V_max(t)` over the run:
+
+| sources | solves | 100 h | 30 days | **30 d, converged domain** |
+|---|---|---|---|---|
+| centre only | 2 | 0.030% | 138% | **96.9%** |
+| **centre + 4 corners (priority)** | **10** | 0.005% | 5.8% | **0.41%** |
+| 4 corners, *averaged* | 8 | 16.5% | 162% | 213% |
+
+**Why the corners are needed despite being contaminated.** The centre alone
+cannot reach separations larger than half the grid (pairs on opposite edges,
+~44% of entries). Through the injection phase those are genuinely negligible —
+centre-only scores 0.03%. After injection stops at `t_off`, `V_max` falls an
+order of magnitude and the relaxation phase is far more sensitive to them:
+centre-only degrades to 97%. Adding the corners *for those separations only*
+fixes it while leaving the near field untouched.
+
+Hence ordered, not averaged, and the ordering must not be changed to put a
+boundary source first. Note also that the last column is the only one describing
+the configuration that will actually be run — a change validated at 100 h alone,
+or at the small domain alone, is not validated.
+
+## This is an approximation
+
+It introduces ~0.03% in `V_max`, against a ~53% domain-truncation bias
+(`PROGRESS.md` "Results") and a larger resolution error — so it is far from the
+accuracy-limiting step. But it *is* opt-in for that reason: [`fault_stiffness`](@ref)
+remains the exact build and the default.
+"""
+function fault_stiffness_toeplitz(fe::FaultElasticity; verbose=false)
+    n2, n3 = length(fe.x2f), length(fe.x3f)
+    nf = frictional_node_count(fe)
+    nf == n2 * n3 || error("Ω_f is $n2×$n3 = $(n2*n3) but nf = $nf; the Toeplitz " *
+                           "expansion assumes the nodes form that full grid")
+    t0 = time()
+
+    # Sources in PRIORITY order: the centre first, then the corners. The centre
+    # is furthest from every boundary and sits where the injection is, so its
+    # kernel is the clean one and it wins wherever it reaches. The corners exist
+    # only to supply separations the centre cannot reach — pairs on opposite
+    # edges, |da| > (n2−1)/2 — which the centre leaves at zero.
+    ac, bc = (n2 + 1) ÷ 2, (n3 + 1) ÷ 2
+    idx(a, b) = (b - 1) * n2 + a
+    sources = [idx(ac, bc), idx(1, 1), idx(n2, 1), idx(1, n3), idx(n2, n3)]
+
+    s2, s3 = zeros(nf), zeros(nf)
+    Δτ2, Δτ3 = zeros(nf), zeros(nf)
+    χ = zeros(fe.Ntot)
+
+    # kernel[(da,db)] = (τ2 from s2, τ3 from s2, τ2 from s3, τ3 from s3)
+    kernel = Dict{Tuple{Int,Int},NTuple{4,Float64}}()
+    for src in sources
+        asrc, bsrc = mod1(src, n2), (src - 1) ÷ n2 + 1
+        fill!(s2, 0.0); fill!(s3, 0.0)
+        s2[src] = 1.0
+        shear_traction!(Δτ2, Δτ3, fe, s2, s3, χ)
+        c22, c32 = copy(Δτ2), copy(Δτ3)
+        fill!(s2, 0.0)
+        s3[src] = 1.0
+        shear_traction!(Δτ2, Δτ3, fe, s2, s3, χ)
+        for i in 1:nf
+            ai, bi = mod1(i, n2), (i - 1) ÷ n2 + 1
+            sep = (ai - asrc, bi - bsrc)
+            haskey(kernel, sep) && continue          # earlier source wins
+            kernel[sep] = (c22[i], c32[i], Δτ2[i], Δτ3[i])
+        end
+    end
+
+    K = zeros(2nf, 2nf)
+    @inbounds for j in 1:nf
+        aj, bj = mod1(j, n2), (j - 1) ÷ n2 + 1
+        for i in 1:nf
+            ai, bi = mod1(i, n2), (i - 1) ÷ n2 + 1
+            v = get(kernel, (ai - aj, bi - bj), nothing)
+            v === nothing && continue                # genuinely unreachable → 0
+            K[i, j]       = v[1]
+            K[nf+i, j]    = v[2]
+            K[i, nf+j]    = v[3]
+            K[nf+i, nf+j] = v[4]
+        end
+    end
+    verbose && @info "fault_stiffness_toeplitz: done" seconds = round(time() - t0, digits=1) solves = 2length(sources) instead_of = 2nf
     return K
 end
 

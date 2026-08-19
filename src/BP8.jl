@@ -155,10 +155,18 @@ have to be comfortably larger than `l_f`; see the §6 domain-size study.
 
 The expensive part is `fault_stiffness`, which does `2·N_Ωf` CG solves of the
 assembled 3D elastic system.
+
+`stiffness` selects how `K` is built. `:exact` (default) does all `2·N_Ωf`
+solves. `:toeplitz` does **10**, expanding 5 sources by the whole-space kernel's
+translation invariance — 0.41% worst-case in `V_max(t)` over 30 days at the
+converged domain, for a cost that no longer grows with resolution at all. That
+removes the term which dominates runtime and scales as Δz⁻². See
+[`fault_stiffness_toeplitz`](@ref) and `PERFORMANCE.md` §4b.
 """
 function build_model(; par::BP8Params=benchmark_parameters(),
                      Δz=par.Δz, L_fault=3par.l_f, L_normal=2par.l_f,
                      injection=:gaussian, order=4, verbose=false,
+                     stiffness=:exact,
                      solver_kwargs...)
     injection ∈ (:gaussian, :peaceman) ||
         error("injection must be :gaussian or :peaceman, got $injection")
@@ -186,8 +194,11 @@ function build_model(; par::BP8Params=benchmark_parameters(),
     verbose && @info "split-node system ready" seconds = round(time() - t0, digits=1)
 
     t0 = time()
-    K = fault_stiffness(fe; verbose)
-    verbose && @info "fault stiffness built" seconds = round(time() - t0, digits=1) size = size(K) elastic_solver_report(fe)...
+    stiffness ∈ (:exact, :toeplitz) ||
+        error("stiffness must be :exact or :toeplitz, got $stiffness")
+    K = stiffness === :toeplitz ? fault_stiffness_toeplitz(fe; verbose) :
+                                  fault_stiffness(fe; verbose)
+    verbose && @info "fault stiffness built" seconds = round(time() - t0, digits=1) stiffness size = size(K) elastic_solver_report(fe)...
 
     x2, x3 = fault_grid_axes(fe)
     nf = frictional_node_count(fe)

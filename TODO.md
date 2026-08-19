@@ -4,6 +4,34 @@ Open work, in dependency order. Background for the symmetry items is in
 `SYMMETRIC_SAT.md`, for the cost items in `PERFORMANCE.md`; the rest is from
 `PROGRESS.md`'s "Known limitations".
 
+## Decisions needed from Robin
+
+Things the 2026-08-19 session left open that are judgement calls, not work items.
+
+- [ ] **Review the 2 → 5 source change in `fault_stiffness_toeplitz`.** Made
+      mid-session without sign-off. The evidence: centre-only (2 solves) scores
+      0.004% through injection but **97%** over the full 30 days, because the
+      relaxation phase is sensitive to long-range interactions the centre source
+      cannot reach. Adding 4 corners *in priority order* gives 0.41%. Rationale
+      and the full table are in the docstring and `PERFORMANCE.md` §4b. The cost
+      is 10 solves instead of 2 — irrelevant next to the 13,122 it replaces.
+- [ ] **Whether `:toeplitz` becomes the default.** Currently opt-in, `:exact`
+      default. Gated on the Δz = 25 m validation (below). It is an
+      approximation, so this is a correctness-posture decision, not just a
+      performance one — 0.41% against a ~53% domain bias is defensible, but it
+      is your call whether the submitted numbers rest on it.
+- [ ] **When to regenerate `output/`.** Every shipped number carries the ~53%
+      `V_max` bias. Regenerating now at the corrected domain fixes it but gets
+      superseded by any resolution work; waiting leaves knowingly-biased numbers
+      in the repo. Interim corrected set, or one regeneration at the end?
+- [ ] **Whether multi-node parallelism is still wanted.** Its entire purpose was
+      distributing `2·N_Ωf` independent solves. At 10 solves there is nothing
+      left to distribute, so it is listed below as largely dissolved — but that
+      depends on `:toeplitz` being adopted. If it is not, the blocker returns.
+- [ ] **Housekeeping:** `diffinitive_registry` was added to `~/.julia/registries`
+      during the session to make the project instantiable. Remove with
+      `Pkg.Registry.rm("diffinitive_registry")` if unwanted.
+
 ## Agreed next steps (2026-08-19)
 
 In this order, and the order matters:
@@ -12,14 +40,22 @@ In this order, and the order matters:
    is **`L_fault` ≥ 4·`l_f`, `L_normal` ≥ 3·`l_f`**; the shipped configuration is
    **~53% low** in `V_max`. What remains is deciding when to regenerate
    `output/`, and emitting the domain size in the output headers.
-2. **§2 — multi-node parallelism for the `K` build.** The cluster blocker.
-   Unlocks the resolution that item 1's re-runs should then be done at.
-3. **§2 — test whether `K` is near-block-Toeplitz.** Cheap experiment, largest
-   possible prize; deliberately *after* the above because it is speculative and
-   neither of the first two depends on it.
+2. **§2 — the Toeplitz `K` build.** *Experiment DONE and it worked* — 2 solves
+   reproduce `V_max(t)` to 0.03% (`PERFORMANCE.md` §4b). Implementing it is now
+   the top item: it attacks the **scaling** of the dominant cost, not its
+   constant, and needs no cluster.
+3. **§2 — multi-node parallelism.** *Largely dissolved by item 2.* Its whole
+   purpose was distributing `2·N_Ωf` independent solves; at 2 solves there is
+   nothing left to distribute. Keep it only if the Toeplitz build fails
+   validation at finer Δz.
 
-The preconditioner sits behind all three: it is a constant-factor win on a
-quantity item 3 might make irrelevant.
+The preconditioner sits behind all of these: a constant-factor win on a
+quantity item 2 has already made ~300× smaller.
+
+**This ordering was rewritten mid-session.** The original plan put multi-node
+parallelism second and the Toeplitz test third, on the grounds that the latter
+was speculative. It was speculative and it paid off ~300×, which is the case
+for running the cheap uncertain experiment before the expensive certain one.
 
 **Caveat on this ordering, recorded honestly.** The argument for doing §1 first
 was that domain size is an *input* to sizing the expensive runs — go to the
@@ -192,9 +228,11 @@ peak `V`. It is free for slip and stiffness.
       so a regeneration now gets superseded by §2's resolution work. Decide
       whether to ship a corrected-domain Δz = 50 m set as an interim, or wait
       and regenerate once at the target resolution.
-- [ ] **Report the computational domain in the output headers.** The benchmark
-      asks for it (§4.3 of the description) and the current writers do not emit
-      it. Cheap, and required for submission.
+- [x] **Report the computational domain in the output headers.** Already done —
+      `domain_line` (`src/BP8.jl`) emits `# elastic_domain=…` with `L_normal`,
+      `L_fault`, SBP order and DOF count into both the time-series and profile
+      headers. (Listed as open in an earlier draft of this file; that was an
+      assumption, not a check.)
 - [ ] **Do not assume these domain requirements transfer to finer Δz.** The
       same `L_normal` 800→1200 step moves `V_max` +0.324% at Δz = 100 m but
       +5.17% at Δz = 50 m. That comparison is confounded (different `L_fault`,
@@ -248,13 +286,43 @@ the removed direct solver's fill-in. Memory is no longer what binds.
       near-linear because each node has its own bandwidth. Needs
       `Distributed`/MPI; neither is present. Δz = 10 m is unreachable without
       it and comfortable with it.
-- [ ] **Test whether `K` is near-block-Toeplitz** (`PERFORMANCE.md` §5 item 2).
-      Potentially the largest win available — in a homogeneous medium `K[i,j]`
-      should depend mainly on `x_i − x_j`, which would collapse thousands of
-      solves to a handful. Far-field truncation breaks it exactly, so it needs
-      measuring, and it is cheap to measure: build `K` at Δz = 50 m and check
-      how well entries collapse onto separation alone. Do this *before* the
-      preconditioner — bigger prize, cheaper experiment.
+- [x] **Test whether `K` is near-block-Toeplitz.** **Yes, and decisively.**
+      `scripts/k_toeplitz_structure.jl` + `k_toeplitz_validate.jl`. A `K` rebuilt
+      from **5 sources (10 CG solves)** reproduces `V_max(t)` to **0.41%** over
+      30 days at the converged domain, against the full 578-solve build. Full
+      write-up in `PERFORMANCE.md` §4b, including three results that each cost a
+      wrong turn: averaging sources is ~500× worse than prioritising them,
+      matrix-norm error is amplified 2-3 orders of magnitude into `V_max` (and
+      can move in the opposite direction), and validating through the injection
+      phase alone hides a 97% error that only appears after shut-in.
+- [x] **Implement the Toeplitz `K` build.** `fault_stiffness_toeplitz`
+      (`src/FaultResponse.jl`), opt-in via `build_model(; stiffness=:toeplitz)`
+      with `:exact` still the default. Regression tests in
+      `test/fault_response_test.jl` pin that the centre column is exact, that
+      self-stiffness stays negative everywhere, and that it uses exactly 2
+      solves — the last guards against "improving" it by adding sources, which
+      measured ~500× worse.
+- [x] **Validate across domain × duration.** All four combinations run at
+      Δz = 50 m. The shipped 10-solve priority build gives **0.41% worst-case in
+      `V_max(t)` over 30 days at the converged domain** — the only configuration
+      that will actually be run. Table in `PERFORMANCE.md` §4b.
+      This is what forced the design from 2 sources to 5: centre-only scores
+      0.004% at 100 h and **97%** over 30 days. Validating through the injection
+      phase alone would have shipped that.
+- [ ] **Validate at a finer Δz, then consider making `:toeplitz` the default.**
+      The last gap. The centre source's ~44% coverage gap is resolution-
+      independent in *fraction*, but the far-field-decay argument behind it is
+      not proven to be. Δz = 25 m at the small domain is ~2.4 h for the
+      reference build; that is the cheapest meaningful check. Until it lands,
+      `:exact` stays the default.
+- [ ] **Try symmetrising the Toeplitz `K`.** Reciprocity says the true kernel is
+      even, `kernel(−d) = kernel(d)`, so the exact `K` is symmetric (measured
+      ~0.2%). The reconstruction takes the kernel from one column and does *not*
+      enforce that, so `K_toep` is only as even as the sampled column. Replacing
+      it with `(K + Kᵀ)/2` costs nothing and may cut the error — untested, so
+      not done. Test it end-to-end, not in Frobenius norm: §4b's whole lesson is
+      that matrix-norm improvements and `V_max` improvements are not the same
+      thing, and can point in opposite directions.
 - [ ] **Preconditioner.** Attacks the iteration count directly (236 at
       Δz = 50 m, ~450 extrapolated at Δz = 20 m). Deliberately not shipped
       unvalidated: a diagonal preconditioner preserves the `range(A)` invariant

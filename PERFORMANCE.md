@@ -154,14 +154,93 @@ is memory-bandwidth bound. Cores within a node are nearly free of benefit past a
 point; independent **nodes**, each with its own memory bandwidth, are what
 scales. That is exactly why §5 item 1 is the blocker.
 
+## 4b. `K` is block-Toeplitz, and that changes the scaling
+
+**Measured, not conjectured** (`scripts/k_toeplitz_structure.jl`,
+`scripts/k_toeplitz_validate.jl`). In a homogeneous whole-space the
+slip→traction kernel is translation invariant, so `K[i,j]` should depend only on
+the separation `x_i − x_j`. It very nearly does, even at the *small* production
+domain where truncation is worst:
+
+| block | best BTTB approximation error |
+|---|---|
+| K22, K33 | **0.010%** |
+| K23 | 0.353% |
+
+So a few source columns determine almost the whole matrix. Measured end-to-end —
+running the full coupled benchmark with each `K` and comparing to the 578-solve
+build — across all four combinations of domain and duration. The figure is the
+**worst** relative error in `V_max(t)` over the run, which is the quantity the
+benchmark actually asks for (§4.2):
+
+| sources | solves | 100 h small | 100 h converged | 30 d small | **30 d converged** |
+|---|---|---|---|---|---|
+| centre only | 2 | 0.030% | 0.004% | 138% | **96.9%** |
+| **centre + 4 corners (priority)** | **10** | 0.005% | 0.005% | 5.8% | **0.41%** |
+| centre + 3×3 ring (priority) | 18 | 0.004% | — | 5.4% | 0.49% |
+| 4 corners, *averaged* | 8 | 16.5% | 6.4% | 162% | 213% |
+| 6×6 grid, *averaged* | 72 | 14.1% | 0.69% | 68.6% | 9.9% |
+
+**Read the last column.** It is the only one describing the configuration that
+will actually be run — converged domain, full 30 days — and it is what the
+shipped default is chosen against. Centre-only looks superb in three of the four
+regimes and is catastrophic in the one that matters.
+
+Two effects are visible. Accuracy **improves at the converged domain** (less
+truncation, better translation invariance), which also confirms the
+contamination mechanism: the averaged-corner penalty falls from 16.5% to 6.4% at
+100 h once corners sit further from the boundary. And accuracy **degrades over
+30 days**, because injection stops at `t_off` = 100 h, `V_max` drops an order of
+magnitude, and the relaxation phase is far more sensitive to the long-range
+kernel than the driven phase is.
+
+**Three results worth not forgetting, each of which cost a wrong turn.**
+
+1. **Averaging sources is catastrophic; prioritising them is not.** The 6×6 grid
+   has the *best* matrix-norm error (0.0005%) and 24× the physics error of the
+   10-solve priority build. Corner and edge sources sit against the truncation
+   boundary and the locked ring, so their kernels are contaminated; averaging
+   lets that into the near field. Consulting them in order — centre first, and
+   only for separations it cannot reach — keeps the clean near field and still
+   closes the coverage gap.
+2. **Matrix error is amplified ~2-3 orders of magnitude into `V_max`**, because
+   `V ~ exp(τ/aσ̄)`. Slip and moment rate are not amplified (slip error stays
+   ≤0.02% everywhere above). Frobenius norm is therefore the wrong acceptance
+   metric, and it can point in the *opposite* direction to the truth — only an
+   end-to-end run settles it.
+3. **Validating through the injection phase alone is not validation.** At 100 h
+   the centre source's ~44% coverage gap looks irrelevant (0.004%); over 30 days
+   the same gap gives 97%. After shut-in, `V_max` falls an order of magnitude
+   and the long-range kernel starts to matter. Any future change here must be
+   re-checked at 30 days, not 100 h.
+
+**Consequence.** The `K` build is ~98% of the run cost and scales as
+`2·N_Ωf ∝ Δz⁻²` — 13,122 solves at Δz = 10 m. A Toeplitz build makes it **2**,
+independent of resolution. That removes the dominant term from §4 entirely: the
+Δz = 10 m estimate of ~934 node-days becomes a handful of hours plus assembly,
+on one node. It also makes §5 item 1 (multi-node) largely moot, since the
+parallel work it was meant to distribute no longer exists.
+
+**Caveats before relying on it.** Validated at Δz = 50 m, at both the small and
+the converged domain. **Not** yet validated at a finer Δz — the centre source
+covers ~56% of separations (the rest far-field, set to zero) and that fraction
+is resolution-independent, but the decay argument behind it is not proven to be.
+And it is an approximation — a controlled ~0.004% against a ~53% domain bias and
+a much larger resolution error, so it is nowhere near the accuracy-limiting
+step, but `:exact` stays the default until the finer-Δz check lands.
+
 ## 5. Where the time goes, and what to attack
 
 At any converged resolution, `fault_stiffness` is ~98% of the cost. Assembly is
 minutes since §2.2; the time integration is a dense `K` mat-vec per RHS
 evaluation and is comparatively cheap.
 
-Ranked by expected payoff:
+Ranked by expected payoff. **§4b reorders this list**: the Toeplitz result
+attacks the `K` build's *scaling*, so it dominates everything below, and it
+largely dissolves item 1 rather than competing with it.
 
+0. **Implement the Toeplitz `K` build** (§4b). Turns `2·N_Ωf` solves into 2, at
+   ~0.03% cost in `V_max`. Purely local work, no cluster needed.
 1. **Multi-node parallelism (the cluster blocker).** `fault_stiffness` uses
    `Threads.@spawn` only — single node. Worse, PROGRESS records threading
    scaling as sublinear (2.13× on 16 threads at production) because sparse
