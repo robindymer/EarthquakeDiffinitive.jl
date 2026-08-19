@@ -115,6 +115,8 @@ Solves `dp/dt = A*p + (injection_rate(t; q0, t_off) / (β*φ)) * source_grid`
 over `tspan`, returning the `ODESolution`. `A` is treated as a constant
 (pre-factorizable) linear operator.
 """
+# SBP finite-difference spatial discretization + a stiff Rosenbrock 
+# ODE solver (Rodas5P) for time integration
 function solve_pore_pressure(g, A, source_grid; q0, t_off, β, φ, tspan, alg=Rodas5P())
     p0 = zeros(length(source_grid))
 
