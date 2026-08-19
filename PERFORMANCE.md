@@ -113,29 +113,46 @@ That exponent is the whole story: halving Δz costs ~100× more.
 
 ## 4. Tractability
 
-Extrapolated from §3. The extrapolation reaches 15× beyond the largest measured
-point, so treat the Δz ≤ 20 m rows as ±2×.
+**Sizing requires the domain, and the domain is much larger than the code's
+defaults.** The convergence study (`PROGRESS.md` "Results") measured what the
+truncation boundaries actually have to be: **`L_fault` ≥ 4·`l_f` = 1600 m and
+`L_normal` ≥ 3·`l_f` = 1200 m** for ~1% in `V_max`. `build_model` defaults to
+3·`l_f` and 2·`l_f`; production shipped 2·`l_f` and 1·`l_f`. Every earlier cost
+estimate in this file used the defaults and was therefore **~4.5× optimistic in
+compute and ~2.6× in memory**. The table below uses the measured domain.
 
-| Δz | DOF | `A`+`HP_DSAT` | `K` build (core-hours) | cells per `L_b` |
-|---|---|---|---|---|
-| 50 m | 245 k | 0.34 GB | 0.5 | 1.3 ✗ |
-| 25 m | 1.86 M | ~2.9 GB | 42 | 2.6 ✗ |
-| **20 m** | **3.6 M** | **~5.5 GB** | **182** | **3.2 ✓** |
-| 10 m (spec) | 28.2 M | **~42 GB** | **~17,700** | 6.4 |
+Baseline is measured, not fitted: at Δz = 50 m with that domain (633,750 DOF)
+a full `FaultElasticity` + 578-column `K` build takes **4058.6 s on 12 threads**,
+i.e. 7.02 s per column. Wall-clock per column scales as **DOF^1.42** across the
+three measured domain rows.
+
+| Δz | grid/side | DOF | `A`+`HP_DSAT` | `K` cols | 12-core wall | cells per `L_b` |
+|---|---|---|---|---|---|---|
+| 50 m | 25×65×65 | 634 k | ~0.5 GB | 578 | **1.1 h** (measured) | 1.3 ✗ |
+| 25 m | 49×129×129 | 4.9 M | ~7 GB | 2,178 | ~77 h | 2.6 ✗ |
+| **20 m** | 61×161×161 | **9.5 M** | **~15 GB** | 3,362 | **~306 h** | **3.2 ✓** |
+| 10 m (spec) | 121×321×321 | **74.8 M** | **~116 GB** | 13,122 | **~934 days** | 6.4 |
 
 `L_b ≈ 64 m`; `resolution_report` calls Δz converged at `L_b/Δz ≥ 3`, i.e.
-**Δz ≤ 21 m** — so Δz = 20 m is the coarsest converged grid, and the
-benchmark's nominal 10 m is 6.7× more expensive than convergence requires.
+**Δz ≤ 21 m**, so Δz = 20 m is the coarsest converged grid and the nominal 10 m
+is 6.7× more expensive than convergence requires.
 
 This supersedes `PROGRESS.md` "Known limitations" 2, whose Δz = 50 m ceiling was
 a property of the removed direct solver's fill-in.
 
-**On a workstation** (15 GB): Δz = 20 m is an overnight run; Δz = 10 m is out of
-reach on memory alone.
+**On a workstation** (15 GB): only Δz = 50 m fits, and that is not converged.
+Δz = 20 m now needs ~15 GB. The workstation is out of the production picture.
 
-**On a cluster**: memory stops being the constraint (Δz = 10 m needs ~42 GB, so
-nodes with ≥64 GB). The constraint becomes parallel efficiency, and there is a
-structural gap — see §5.
+**On a cluster**: Δz = 20 m is one high-memory node for ~2 weeks, or a handful
+of nodes for days. Δz = 10 m needs ~120 GB **per node** (each node holds its own
+copy of `A`) and ~934 node-days of 12-core work — so ~100 nodes for ~10 days,
+or ~500 for ~2 days.
+
+**Do not convert these to core-hours.** Threading efficiency is ~15% (7.02 s per
+column on 12 cores against ~13 s serial-equivalent), because the sparse mat-vec
+is memory-bandwidth bound. Cores within a node are nearly free of benefit past a
+point; independent **nodes**, each with its own memory bandwidth, are what
+scales. That is exactly why §5 item 1 is the blocker.
 
 ## 5. Where the time goes, and what to attack
 

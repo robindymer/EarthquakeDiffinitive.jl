@@ -14,10 +14,10 @@ using Printf
 const Δz = 100.0                      # coarse: this study varies domain, not resolution
 const T_END = 100 * 3600.0            # through the injection period
 
-# Sorted by cost. The sparse factorization's fill-in — not the grid itself — is
-# what binds: it grows far faster than the DOF count, and an over-large
-# configuration gets the process OOM-killed rather than throwing, which is why
-# each row is printed as soon as it finishes.
+# Sorted by cost. Each row is printed as soon as it finishes so a long sweep
+# reports incrementally. (This used to warn about the factorization's fill-in
+# OOM-killing the process; under CG there is no factor, and what binds now is
+# the `K` build's compute — see `PERFORMANCE.md` §3.)
 configs = [(L_fault=800.0, L_normal=800.0),
            (L_fault=1200.0, L_normal=800.0),
            (L_fault=1200.0, L_normal=1200.0),
@@ -34,12 +34,21 @@ configs = [(L_fault=800.0, L_normal=800.0),
 # `L_fault` held at 800 m. That is the comparison that actually bears on the
 # shipped runs: `u=0` at |x1| = L_normal makes the medium artificially stiff, so
 # the expected bias is slip too small and |K_self| too large, and this varies
-# exactly the distance responsible while changing nothing else. Sorted by cost,
-# and the large rows may simply not fit — an OOM here is a result, not a bug.
+# exactly the distance responsible while changing nothing else.
+#
+# Extended past 800 m because the first pass did NOT settle: 600 → 800 still
+# moved `V_max` 11.6%, so 800 m could not be used as a converged reference and
+# the shipped `L_normal = 400`'s 42% `V_max` error was a lower bound. The rows
+# beyond 800 m were previously thought not to fit; that was the removed direct
+# solver's fill-in. Under CG the largest row here is 216k DOF and ~0.2 GB —
+# memory is no longer the constraint (`PERFORMANCE.md` §4).
 const NORMAL_STUDY_Δz = 50.0
 normal_configs = [(L_fault=800.0, L_normal=400.0),   # production
                   (L_fault=800.0, L_normal=600.0),
-                  (L_fault=800.0, L_normal=800.0)]
+                  (L_fault=800.0, L_normal=800.0),
+                  (L_fault=800.0, L_normal=1000.0),
+                  (L_fault=800.0, L_normal=1200.0),
+                  (L_fault=800.0, L_normal=1600.0)]
 
 """
     sweep(configs, Δz) -> Vector{NamedTuple}
@@ -114,19 +123,57 @@ function report(results, title, Δz; ref_label="the largest domain run")
     end
 end
 
-results = sweep(configs, Δz)
-report(results, "BP8-QD-GS domain-size convergence", Δz)
+# Third study: the MIRROR of the fault-normal one. That sweep pinned
+# `L_fault = 800 m`, so once `L_normal` passed 800 m the fault-PARALLEL walls
+# became the nearest boundary — meaning its converged `V_max` (3.048e-7) is
+# converged in `L_normal` but not proven to be the whole-space value. This
+# varies `L_fault` with `L_normal` held at 1200 m (0.55% from converged there,
+# and constant across these rows, so differences isolate `L_fault`).
+#
+# If `V_max` is flat across these rows, the plateau IS the whole-space value and
+# `L_fault = 800 m` was never the binding constraint. If it keeps climbing, the
+# fault-normal study's limit was an artefact of the pinned `L_fault` and the
+# real domain requirement is larger than either sweep alone shows.
+const FAULT_STUDY_Δz = 50.0
+fault_configs = [(L_fault=800.0, L_normal=1200.0),
+                 (L_fault=1200.0, L_normal=1200.0),
+                 (L_fault=1600.0, L_normal=1200.0)]
 
-normal_results = sweep(normal_configs, NORMAL_STUDY_Δz)
-report(normal_results, "BP8-QD-GS fault-normal truncation at PRODUCTION resolution",
-       NORMAL_STUDY_Δz; ref_label="the largest L_normal that fitted")
-println("""
-The first row of that second table is what `run_bp8.jl` ships. If d(slip) and
-d(K_self) against the largest L_normal are small, `L_normal = 400` is vindicated
-and the halving done for memory costs nothing. `u=0` makes the medium
-artificially stiff, so the expected sign is slip too small, |K_self| too large.
-If the largest rows are missing they did not fit in memory — which is itself the
-reason `L_normal` was halved.""")
+# Which studies to run: "lfault", "lnormal", "mirror", or "all" (default).
+# The first two take ~40 min combined and are already published in PROGRESS.md,
+# so the usual invocation while iterating on the third is `... mirror`.
+const WHICH = isempty(ARGS) ? "all" : lowercase(ARGS[1])
+runs(name) = WHICH == "all" || WHICH == name
+
+if runs("lfault")
+    results = sweep(configs, Δz)
+    report(results, "BP8-QD-GS domain-size convergence", Δz)
+end
+
+if runs("lnormal")
+    normal_results = sweep(normal_configs, NORMAL_STUDY_Δz)
+    report(normal_results, "BP8-QD-GS fault-normal truncation at PRODUCTION resolution",
+           NORMAL_STUDY_Δz; ref_label="the largest L_normal that fitted")
+    println("""
+    The first row of that table is what `run_bp8.jl` ships. `u=0` makes the
+    medium artificially stiff, so the expected sign is slip too small, |K_self|
+    too large — confirmed, at 45.3% in `V_max` against the converged 1600 m row.
+    `V_max` does settle: successive steps shrink and Richardson on the last pair
+    lands 0.13% beyond it. Slow convergence is physical — the elastostatic
+    kernel decays as 1/r³ — not a numerical defect.""")
+end
+
+if runs("mirror")
+    fault_results = sweep(fault_configs, FAULT_STUDY_Δz)
+    report(fault_results, "BP8-QD-GS fault-PARALLEL truncation at fixed L_normal = 1200 m",
+           FAULT_STUDY_Δz; ref_label="the largest L_fault that ran")
+    println("""
+    This is the mirror test. Flat `V_max` down these rows means the fault-normal
+    study's 3.048e-7 is the whole-space value. Rising `V_max` means that limit
+    was set by the pinned `L_fault = 800 m`, and the true domain requirement is
+    larger than either sweep shows on its own.""")
+end
+
 println("\nPore pressure is independent of the elastic domain (it lives on Ω_f only),")
 println("so p(0,0) should be identical WITHIN each table — a check that nothing else")
 println("drifted. It differs BETWEEN the tables only because they use different Δz.")

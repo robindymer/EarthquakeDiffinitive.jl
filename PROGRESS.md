@@ -562,24 +562,88 @@ isolating the fault-normal truncation at the resolution that ships. All three
 fit — `L_normal = 800` is 111k elastic DOF, ~2× production, and its factorization
 completing at all is partly the Cholesky change paying for itself.
 
-| `L_normal` | elastic DOF | `K_self` | slip(0,0) | `V_max` |
-|---|---|---|---|---|
-| 400 (production) | 58,806 | −4.38404e8 | 3.99595e-2 | 1.66456e-7 |
-| 600 | 84,942 | −4.38324e8 | 4.05356e-2 | 2.54541e-7 |
-| 800 | 111,078 | −4.38307e8 | 4.06708e-2 | 2.87795e-7 |
+**Extended to convergence (2026-08-19).** The sweep now runs to
+`L_normal = 1600 m`; the rows past 800 m were previously thought not to fit,
+which was the removed direct solver's fill-in. The three original rows
+reproduce **to every published digit** under CG plus the `PERFORMANCE.md` §2
+assembly changes — an end-to-end confirmation that those changes are
+physics-neutral on full coupled runs.
 
-Relative to `L_normal = 800`, the production row is off by **0.02% in `K_self`,
-1.75% in slip, and 42% in `V_max`** — and the signs are exactly the predicted
-ones: `u=0` stiffens the medium, so slip comes out too small and `|K_self|` too
-large. Pressure is identical to 5 decimals across the three, as it must be.
+| `L_normal` | elastic DOF | `K_self` | slip(0,0) | `V_max` | d(`V_max`) |
+|---|---|---|---|---|---|
+| 400 (production) | 58,806 | −4.38404e8 | 3.99595e-2 | 1.66456e-7 | **45.31%** |
+| 600 | 84,942 | −4.38324e8 | 4.05356e-2 | 2.54541e-7 | 16.37% |
+| 800 | 111,078 | −4.38307e8 | 4.06708e-2 | 2.87795e-7 | 5.44% |
+| 1000 | 137,214 | −4.38303e8 | 4.07098e-2 | 2.98933e-7 | 1.78% |
+| 1200 | 163,350 | −4.38301e8 | 4.07223e-2 | 3.02676e-7 | 0.55% |
+| 1600 | 215,622 | −4.38301e8 | 4.07278e-2 | 3.04360e-7 | — |
 
-**This is a real gap, and it is bigger than the existing `L_fault` sweep
-implied.** That sweep reported `V_max` moving 0.55% over `L_fault` 800→1600 m,
-which invited the conclusion that domain size was settled; it was varying the
-*far* boundary while the near one sat at 400 m. It is also **not converged at
-800 m** — 600→800 still moves `V_max` 11.6%.
+`p(0,0)` = 13.16528 MPa on all six rows, bit-identical.
 
-Proportion, though: `V_max` moves 167× between Δz = 50 and 100 m, so this 1.42×
+**`V_max` converges in `L_normal`, and the shipped 400 m is 45.3% low against
+the 1600 m row** — but see the mirror sweep below: with `L_fault` also taken to
+convergence the true shortfall is ~53%. The effective exponent rises through
+the sweep (p ≈ 3.2 → 4.2 → 5.7), the signature of approaching an asymptote
+rather than a pure power law; Richardson on the last pair puts the limit at
+3.048e-7, only 0.13% past the 1600 m row, so 1600 m is converged in `L_normal`.
+
+The **slow** convergence is physical, not numerical: the elastostatic stress
+kernel decays as 1/r³, so doubling the domain cuts truncation error only ~8×.
+Slip and `V_max` converge at the *same* rate — `V_max` merely carries a much
+larger constant, because `V ~ exp(τ/aσ̄)` magnifies the same absolute stress
+error. The friction Newton solve (`tol=1e-12`, errors rather than returning a
+bad root) and CG (`rtol=1e-10`) are not contributors.
+
+Required `L_normal` differs sharply by quantity: `K_self` converged by 600 m,
+slip to 0.14% by 800 m, **`V_max` needs ≥ 1200 m**.
+
+**That sweep alone was still not the answer.** It pinned `L_fault` = 800 m, so
+once `L_normal` passed 800 m the fault-*parallel* walls became the nearest
+boundary and further `L_normal` could not help. The mirror sweep — vary
+`L_fault` at `L_normal` fixed at 1200 m — settles it:
+
+| `L_fault` | in `l_f` | elastic DOF | `K_self` | slip(0,0) | `V_max` | d(`V_max`) |
+|---|---|---|---|---|---|---|
+| 800 | 2·`l_f` | 163,350 | −4.38301e8 | 4.07223e-2 | 3.02676e-7 | 13.35% |
+| 1200 | 3·`l_f` | 360,150 | −4.38291e8 | 4.08231e-2 | 3.41538e-7 | 2.23% |
+| 1600 | 4·`l_f` | 633,750 | −4.38289e8 | 4.08416e-2 | 3.49322e-7 | — |
+
+`V_max` converges in `L_fault` too (steps decay ~5.6×, fitted p ≈ 3.9;
+Richardson limit **≈ 3.53e-7**, ~1% past the 4·`l_f` row) — but much further out
+than assumed.
+
+**Combined result. The shipped configuration is ~53% low in `V_max`**, not 45.3%
+and not 42%. Each revision grew as the reference improved, which is the
+signature of measuring against something itself unconverged; this estimate is
+the first bounded in *both* directions.
+
+**Required domain: `L_fault` ≥ 4·`l_f`, `L_normal` ≥ 3·`l_f`** for ~1% in
+`V_max`. Note both of `build_model`'s own defaults (3·`l_f`, 2·`l_f`) are short,
+so this is not only a production-override problem. `K_self` and slip were
+converged throughout both sweeps (≤0.3%) — this is entirely a peak-slip-rate
+issue, and `V_max(t)` is one of the two global source parameters the benchmark
+asks for (§4.2), so the bias contaminates a required output, not a diagnostic.
+
+The benchmark description specifies **no** domain size — it states a whole-space
+with fields vanishing at infinity, and asks modelers to *report* their
+computational domain in the output header (§4.3). Domain adequacy is therefore
+each code's own burden. The 3D SEAS code-comparison exercise reports the same
+qualitative finding: "agreement between models is only achieved with
+sufficiently large domain sizes."
+
+**Caveat.** The same `L_normal` 800→1200 step moves `V_max` +0.324% at
+Δz = 100 m but +5.17% at Δz = 50 m. That comparison is confounded (different
+`L_fault`, and Δz = 100 m is badly under-resolved), so it does not establish
+resolution-dependence — but it does **not** support assuming these domain
+requirements transfer to finer Δz. See `PERFORMANCE.md` §4 for what the measured
+domain does to the cost of every resolution.
+
+**This gap is bigger than the older `L_fault` sweep implied.** That sweep
+reported `V_max` moving 0.55% over `L_fault` 800→1600 m, which invited the
+conclusion that domain size was settled; it was varying the *far* boundary while
+the near one sat at 400 m.
+
+Proportion, though: `V_max` moves 167× between Δz = 50 and 100 m, so this 2.1×
 is a second-order error sitting underneath the dominant resolution one, and it
 does not disturb the quantities that are well behaved (slip, `K_self`). The
 practical reading is that **peak `V` in the shipped Δz = 50 m runs is biased

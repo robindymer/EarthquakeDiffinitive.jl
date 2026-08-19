@@ -8,10 +8,10 @@ Open work, in dependency order. Background for the symmetry items is in
 
 In this order, and the order matters:
 
-1. **§1 — the `L_normal = 400` domain bias.** A **42% error in `V_max`**, and
-   still unconverged at 800 m. Correctness before speed: this is a wrong number
-   in a reported quantity, and no amount of resolution fixes it. Doing it first
-   also means the re-runs it forces happen once, not twice.
+1. **§1 — the domain bias.** *Diagnostic DONE, both directions.* Required domain
+   is **`L_fault` ≥ 4·`l_f`, `L_normal` ≥ 3·`l_f`**; the shipped configuration is
+   **~53% low** in `V_max`. What remains is deciding when to regenerate
+   `output/`, and emitting the domain size in the output headers.
 2. **§2 — multi-node parallelism for the `K` build.** The cluster blocker.
    Unlocks the resolution that item 1's re-runs should then be done at.
 3. **§2 — test whether `K` is near-block-Toeplitz.** Cheap experiment, largest
@@ -20,6 +20,13 @@ In this order, and the order matters:
 
 The preconditioner sits behind all three: it is a constant-factor win on a
 quantity item 3 might make irrelevant.
+
+**Caveat on this ordering, recorded honestly.** The argument for doing §1 first
+was that domain size is an *input* to sizing the expensive runs — go to the
+cluster without it and you burn the budget on a well-resolved but biased result.
+That still holds. But the supporting assumption — that domain requirements
+measured at Δz = 50 m transfer to finer grids — is **not** supported by the data
+(see §1's third bullet). If they do not transfer, §2 should have come first.
 
 ## Done
 
@@ -132,6 +139,11 @@ Full write-up in `PERFORMANCE.md`; only the outcomes are listed here.
 - [x] **Establish the cost model.** `t_solve ∝ DOF^1.56`, CG iterations
       ∝ DOF^0.31, columns ∝ Δz⁻², so the `K` build scales as **Δz⁻⁶·⁷**.
       Measured at Δz = 100/80/50 m on benchmark-shaped grids.
+- [x] **Confirm the assembly changes are physics-neutral end-to-end.** All six
+      configurations of `bp8_domain_convergence.jl` with published values
+      reproduce **to every digit** on full coupled 100 h runs, at two
+      resolutions — a far stronger check than the unit tests, since it exercises
+      the whole elastic → friction → pressure chain.
 
 **Stale references below.** The `Done` entries above this block mention
 `factorize_reduced`, `prolongation(rs)`, `solver=:cg` and the CHOLMOD fallback;
@@ -140,15 +152,57 @@ kept as history — do not treat them as API.
 
 ## 1. Act on the domain-convergence result — `L_normal = 400` is not innocent
 
-The sweep has been run; all three fault-normal rows fit (`L_normal = 800` is
-111k DOF, and its factorization completing is partly Cholesky paying off).
-Against `L_normal = 800`, the shipped `L_normal = 400` is off by 0.02% in
-`K_self`, 1.75% in slip and **42% in `V_max`**, with exactly the predicted
-signs. It is also not converged at 800 m — 600→800 still moves `V_max` 11.6%.
-Full table in `PROGRESS.md` "Results".
+**The sweep now runs to convergence** (2026-08-19): `L_normal ∈ {400, 600, 800,
+1000, 1200, 1600}` at Δz = 50 m, `L_fault` = 800 m. Full table and discussion in
+`PROGRESS.md` "Results".
+
+`V_max` **does** settle, in both directions — but only well beyond any domain
+previously used. **Both sweeps are now done** (fault-normal and the `L_fault`
+mirror), and the combined answer is:
+
+> **Required domain: `L_fault` ≥ 4·`l_f` = 1600 m, `L_normal` ≥ 3·`l_f` = 1200 m**
+> for ~1% in `V_max`. The shipped configuration (2·`l_f`, 1·`l_f`) is **~53%
+> low**. `build_model`'s defaults (3·`l_f`, 2·`l_f`) are also short.
+
+Successive estimates were 42% → 45.3% → 53%, each growing as the reference
+improved — the signature of measuring against an unconverged reference. The 53%
+is the first bounded in both directions. Convergence is slow for a physical
+reason: the elastostatic kernel decays as 1/r³, so doubling the domain cuts the
+error only ~8×. `K_self` and slip were converged throughout (≤0.3%); this is
+entirely a peak-slip-rate problem — and `V_max(t)` is one of the two global
+source parameters the benchmark requires, not a diagnostic.
+
+**This inflates every cost estimate**: ~4.5× compute and ~2.6× memory at each
+resolution. `PERFORMANCE.md` §4 is rewritten accordingly — Δz = 20 m is no
+longer a workstation job (~15 GB), and Δz = 10 m needs ~120 GB per node.
 
 So the answer to the original question is *no*: the halving was not free for
 peak `V`. It is free for slip and stiffness.
+
+- [x] **Push the fault-normal sweep past 800 m.** Done — `V_max` converges by
+      1600 m (Richardson limit 3.048e-7, 0.13% beyond that row). The rows were
+      previously thought not to fit; that was the direct solver's fill-in.
+- [x] **Mirror sweep: vary `L_fault` at large fixed `L_normal`.** Done, and it
+      was needed — `V_max` moved 12.8% over `L_fault` 2·`l_f` → 3·`l_f`, so the
+      fault-normal sweep's limit *was* set by its pinned `L_fault`. Run it with
+      `scripts/bp8_domain_convergence.jl mirror`.
+- [ ] **Re-run production at the converged domain.** Every number in `output/`
+      carries the ~53% `V_max` bias. Not yet done deliberately: at the required
+      domain Δz = 50 m is 634k DOF (~1.1 h) but still not resolution-converged,
+      so a regeneration now gets superseded by §2's resolution work. Decide
+      whether to ship a corrected-domain Δz = 50 m set as an interim, or wait
+      and regenerate once at the target resolution.
+- [ ] **Report the computational domain in the output headers.** The benchmark
+      asks for it (§4.3 of the description) and the current writers do not emit
+      it. Cheap, and required for submission.
+- [ ] **Do not assume these domain requirements transfer to finer Δz.** The
+      same `L_normal` 800→1200 step moves `V_max` +0.324% at Δz = 100 m but
+      +5.17% at Δz = 50 m. That comparison is confounded (different `L_fault`,
+      and Δz = 100 m is badly under-resolved) so it proves nothing either way —
+      but it removes the grounds for assuming transferability. A matched
+      two-resolution sweep would settle it; at Δz = 25 m that is ~12 h.
+      **If the requirement does grow with resolution, §2 should have come
+      first** and this study needs redoing at the target Δz.
 
 - [ ] **Decide whether to re-run production at a larger `L_normal`.** Now known
       to be affordable: `(Δz=50, L_fault=800, L_normal=800)` builds in 385 s,
