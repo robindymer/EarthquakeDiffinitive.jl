@@ -73,7 +73,7 @@ end
         χ = build_chi(g_minus, g_plus, slip_fn)
 
         rhs = HP_DSAT * (χ - U_true)
-        u_sol = reduced_solve(A, rhs, P)
+        u_sol = split_node_solve(CGSolver(A), rhs)
         U_reconstructed = reconstruct_U(P, u_sol, χ)
 
         # A direct solve on the (still somewhat ill-conditioned, given H's
@@ -104,7 +104,7 @@ end
 
         A, HP_DSAT, P = split_node_system(g_minus, g_plus, λ_sn, μ_sn, set)
         χ = build_chi(g_minus, g_plus, slip_fn)
-        U = reconstruct_U(P, reduced_solve(A, HP_DSAT * χ, P), χ)
+        U = reconstruct_U(P, split_node_solve(CGSolver(A), HP_DSAT * χ), χ)
 
         Nm = length(g_minus)
         # `traction_blocks` returns boundary-ordered vectors, and both fault
@@ -123,6 +123,7 @@ end
         return (; U, jump, slip, τ_minus, τ_plus, amp)
     end
 
+    # Test that the model is the right model
     @testset "interface conditions for a prescribed slip patch" begin
         r = solve_gaussian_slip(13)
         τ_scale = maximum(abs, r.τ_minus[2])
@@ -140,50 +141,11 @@ end
         @test maximum(abs, r.U) ≈ r.amp / 2 rtol = 1e-8
     end
 
-    # `factorize_reduced` defaults to a Cholesky of the Galerkin form `SᵀAS`,
-    # which is only legal if that matrix really is symmetric positive definite.
-    # It is SPD only because `traction_blocks` pairs each of `elastic_blocks`'
-    # two SBP schemes with its own boundary operator (`test/elasticity_test.jl`'s
-    # "SBP property" test) — Cholesky *fails* on the pre-fix operator. So this
-    # is the downstream half of that same check, and it is what would catch a
-    # silent regression into the LU fallback.
-    #
-    # The `:lu` comparison is the part that has teeth: LU assumes nothing about
-    # symmetry, so if the two agree, Cholesky's answer is not an artefact of
-    # `Symmetric` having discarded a real lower triangle.
-    @testset "Galerkin reduction is SPD and Cholesky agrees with LU" begin
-        set = split_node_stencil_set()
-        n = 11
-        g_minus = equidistant_grid((-1.0, -1.0, -1.0), (0.0, 1.0, 1.0), n, n, n)
-        g_plus = equidistant_grid((0.0, -1.0, -1.0), (1.0, 1.0, 1.0), n, n, n)
-        A, HP_DSAT, P = split_node_system(g_minus, g_plus, λ_sn, μ_sn, set)
-
-        rs_chol = factorize_reduced(A, P)                    # default
-        rs_lu = factorize_reduced(A, P; method=:lu)
-        # A silent PosDefException fallback would leave an LU here too.
-        @test rs_chol.fact isa SparseArrays.CHOLMOD.Factor
-
-        S = prolongation(rs_chol)
-        A_gal = S' * A * S
-        @test norm(A_gal - A_gal') / norm(A_gal) < 1e-12
-
-        χ = build_chi(g_minus, g_plus, (x2, x3) -> (exp(-(x2^2 + x3^2) / 0.125), 0.0))
-        rhs = HP_DSAT * χ
-        x_chol = reduced_solve(rs_chol, rhs)
-        x_lu = reduced_solve(rs_lu, rhs)
-        @test norm(x_chol - x_lu) / norm(x_lu) < 1e-10
-
-        # The Petrov form `E·A·S` the reduction used to build is nonsymmetric by
-        # construction even now that `A` is symmetric — asserted so that the
-        # Galerkin form is not quietly swapped back for it.
-        A_pet = (A*S)[rs_chol.keep, :]
-        @test norm(A_pet - A_pet') / norm(A_pet) > 1e-3
-    end
-
-    # `CGSolver` runs CG on the SINGULAR `A` with no reduction. That is only
-    # legitimate because of three properties, so each is asserted directly
-    # rather than inferred from the answer coming out right — an unconverged or
-    # null-space-polluted solve can still look plausible.
+    # `CGSolver` runs CG on the SINGULAR `A` directly, with no reduction and no
+    # factorization. That is only legitimate because of three properties, so
+    # each is asserted directly rather than inferred from the answer coming
+    # out right — an unconverged or null-space-polluted solve can still look
+    # plausible.
     @testset "CG on the singular system" begin
         set = split_node_stencil_set()
         n = 11
@@ -202,24 +164,16 @@ end
         #    what `traction_blocks` had to be fixed to achieve.
         @test norm(A - A') / norm(A) < 1e-12
 
-        cg = split_node_solver(A, P; method=:cg)
+        cg = CGSolver(A)
         u_cg = split_node_solve(cg, b)
-        direct = split_node_solver(A, P)
-        u_dir = split_node_solve(direct, b)
 
         @test solver_report(cg).unconverged == 0
         @test norm(b - A * u_cg) / norm(b) < 1e-8
 
         # 3. The iterates stay in range(A), so `u` carries no null-space
         #    component — and even if it did, `P` in the reconstruction removes
-        #    it. Both halves are checked.
+        #    it.
         @test norm(u_cg - P * u_cg) / norm(u_cg) < 1e-12
-        @test norm(P * u_cg - P * u_dir) / norm(P * u_dir) < 1e-8
-
-        # The reconstruction is what everything downstream consumes.
-        U_cg = reconstruct_U(P, u_cg, χ)
-        U_dir = reconstruct_U(P, u_dir, χ)
-        @test norm(U_cg - U_dir) / norm(U_dir) < 1e-8
     end
 
     @testset "fault-normal stress vanishes under refinement" begin

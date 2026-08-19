@@ -153,13 +153,13 @@ fault-parallel directions, `L_normal` their extent in the fault-normal
 direction. The far field is truncated with `u=0` at those boundaries, so both
 have to be comfortably larger than `l_f`; see the §6 domain-size study.
 
-The expensive part is `fault_stiffness`, which does `2·N_Ωf` back-substitutions
-of the factorized 3D elastic system.
+The expensive part is `fault_stiffness`, which does `2·N_Ωf` CG solves of the
+assembled 3D elastic system.
 """
 function build_model(; par::BP8Params=benchmark_parameters(),
                      Δz=par.Δz, L_fault=3par.l_f, L_normal=2par.l_f,
                      injection=:gaussian, order=4, verbose=false,
-                     solver=:cholesky, solver_kwargs...)
+                     solver_kwargs...)
     injection ∈ (:gaussian, :peaceman) ||
         error("injection must be :gaussian or :peaceman, got $injection")
     isapprox(par.l_f / Δz, round(par.l_f / Δz); atol=1e-9) ||
@@ -182,8 +182,8 @@ function build_model(; par::BP8Params=benchmark_parameters(),
 
     t0 = time()
     fe = FaultElasticity(g_minus, g_plus, lame_lambda(par), par.μ, set;
-                         l_f=par.l_f, solver, solver_kwargs...)
-    verbose && @info "split-node system ready" seconds = round(time() - t0, digits=1) solver
+                         l_f=par.l_f, solver_kwargs...)
+    verbose && @info "split-node system ready" seconds = round(time() - t0, digits=1)
 
     t0 = time()
     K = fault_stiffness(fe; verbose)

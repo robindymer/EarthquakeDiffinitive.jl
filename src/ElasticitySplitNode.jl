@@ -5,17 +5,16 @@ using Diffinitive.Grids
 using Diffinitive.SbpOperators
 using Diffinitive.LazyTensors
 using SparseArrays
-using LinearAlgebra: I, lu, cholesky, Symmetric, PosDefException, norm, dot
+using LinearAlgebra: I
 using Krylov: CgWorkspace, cg!
 using Tokens
 using StaticArrays
 using ..Elasticity: elastic_blocks, traction_blocks
 
 export split_node_system, dof_index_minus, dof_index_plus, build_chi,
-       reconstruct_U, reduced_solve, fault_node_pairs, ReducedSystem,
-       factorize_reduced, prolongation,
-       SplitNodeSolver, CGSolver, split_node_solver, split_node_solve,
-       solver_report, duplicate, threadsafe, merge_stats!
+       reconstruct_U, fault_node_pairs,
+       CGSolver, split_node_solve,
+       solver_report, duplicate, merge_stats!
 
 # ==============================================================================
 # Two-sided (split-node) SBP-SAT elastic system, matching the formulation in
@@ -44,6 +43,7 @@ dof_index_plus(g_minus, g_plus, component, I) = 3 * length(g_minus) + (component
 
 _to_sparse_matrix(M) = reduce(vcat, [reduce(hcat, [sparse(M[j][k]) for k in 1:length(M)]) for j in 1:length(M)])
 
+# Prolong = -H⁻¹∘e'∘Hᵧ, the SAT penalty prefactor.
 function _prolongation(g, stencil_set, bid)
     H_inv = inverse_inner_product(g, stencil_set)
     e = boundary_restriction(g, stencil_set, bid)
@@ -95,6 +95,7 @@ function split_node_system(g_minus, g_plus, λ, μ, stencil_set)
     bid_plus = CartesianBoundary{1,LowerBoundary}()
 
     # ---- D: block-diagonal elastic operator ----
+    # TODO: Investigate that we are matrix free where possible
     Dm = _to_sparse_matrix(elastic_blocks(g_minus, λ, μ, stencil_set))
     Dp = _to_sparse_matrix(elastic_blocks(g_plus, λ, μ, stencil_set))
     Dmat = blockdiag(Dm, Dp)
@@ -141,6 +142,7 @@ function split_node_system(g_minus, g_plus, λ, μ, stencil_set)
     DSAT = Dmat + SATmat
 
     # ---- P: projection (average tangential fault DOFs, zero far-field) ----
+    # TODO: Consider injection instead of explicit matrix
     P = sparse(1.0I, Ntot, Ntot)
 
     far_field_minus = filter(!=(bid_minus), boundary_identifiers(g_minus))
@@ -209,181 +211,6 @@ The true displacement field `U = P*u + χ`; tractions must be computed from
 """
 reconstruct_U(P, u, χ) = P * u + χ
 
-"""
-    SplitNodeSolver
-
-Something that can solve `A u = rhs` for the split-node system, applied with
-[`split_node_solve`](@ref). Two implementations, chosen by
-[`split_node_solver`](@ref):
-
-  * [`ReducedSystem`](@ref) — direct. Eliminates `P`'s null space, then
-    Cholesky- (or LU-) factorizes. One factorization amortized over many
-    right-hand sides.
-  * [`CGSolver`](@ref) — iterative. Runs CG on the singular `A` itself, with no
-    reduction and no factorization at all.
-
-They are interchangeable from `FaultResponse`'s point of view: both return a
-full-length `u` whose only guaranteed meaning is `P*u`, which is all the
-`U = P*u + χ` reconstruction uses.
-"""
-abstract type SplitNodeSolver end
-
-"""
-    ReducedSystem
-
-A factorized, non-redundant form of `A = -H*P*(D+SAT)*P`, produced by
-[`factorize_reduced`](@ref) and applied by [`reduced_solve`](@ref). Holds the
-factorization of the Galerkin reduction `SᵀAS` plus the bookkeeping — `S`
-itself, and the `keep`/`merge_pairs` it was derived from — needed to move
-between reduced unknowns and the full DOF vector.
-
-`λ` and `μ` are constant in this benchmark, so `A` never changes as slip
-evolves — only `χ(s)` and hence the right-hand side do. Factorizing once and
-reusing the factorization across every time step / RK stage is the whole
-reason for going constant-coefficient.
-"""
-struct ReducedSystem{F} <: SplitNodeSolver
-    keep::Vector{Int}                   # DOFs retained as unknowns
-    merge_pairs::Vector{Pair{Int,Int}}  # dropped DOF => the representative it equals
-    S::SparseMatrixCSC{Float64,Int}     # prolongation, reduced unknowns → full DOFs
-    fact::F                             # factorization of the Galerkin form SᵀAS
-    Ntot::Int
-end
-
-"""
-    prolongation(rs::ReducedSystem) -> S
-
-The `Ntot × length(rs.keep)` sparse map from reduced unknowns back onto the
-full DOF vector: identity on kept DOFs, plus a 1 setting each merged partner
-equal to its representative. Dropped (far-field) DOFs get an all-zero row,
-which is what zeroes them in [`reduced_solve`](@ref)'s output.
-
-`S` is also the congruence transform the reduction itself is built from — see
-[`factorize_reduced`](@ref). (Not to be confused with the module-private
-`_prolongation(g, stencil_set, bid)`, which is the SAT penalty `-H⁻¹∘e'∘Hᵧ`.)
-"""
-prolongation(rs::ReducedSystem) = rs.S
-
-"""
-    factorize_reduced(A, P; method=:cholesky) -> ReducedSystem
-
-`A = -H*P*(D+SAT)*P` is singular by construction — `P`'s null space
-(far-field DOFs, and the antisymmetric half of each fault pair) is a large
-fraction of the system, which makes plain Krylov solvers (GMRES) stall well
-short of convergence. This reduces the system to the non-redundant DOFs
-implied by `P`'s own structure (derived directly from `P`, not re-derived
-from the grids) — regular DOFs kept as-is, far-field DOFs dropped, and each
-averaging pair merged into a single unknown — giving a genuinely non-singular
-system, which is then factorized.
-
-The reduction is the **Galerkin** (congruence) form `SᵀAS`, with `S` the
-[`prolongation`](@ref). This is load-bearing rather than cosmetic. The obvious
-alternative `E·A·S` — which this function used to build — sums columns over the
-merge pairs but only *selects* rows, so it is not a congruence transform and
-comes out nonsymmetric even when `A` is symmetric. `SᵀAS` is the only reduction
-that inherits `A`'s symmetry. The two are the same linear system up to a factor
-of 2 on merged rows (`P` makes each merged pair's two rows of `A` identical), so
-they have the same solution — measured agreement 2.7e-15 at n=13 — and `SᵀAS`
-is simply the form that can be Cholesky-factorized.
-
-`method` picks the factorization:
-
-  * `:cholesky` (default) exploits the symmetry for a factor ≈1.9× fewer
-    nonzeros than LU at these sizes (10.6M vs 19.9M at n=13), and fill-in is
-    the binding resource — see PROGRESS.md "Known limitations" 2.
-  * `:lu` is the previous behaviour, kept for comparison.
-
-Cholesky is admissible only because `traction_blocks` pairs each of
-`elastic_blocks`' two SBP schemes with its own boundary operator, which makes
-`A` symmetric and `SᵀAS` SPD. It *fails* on the pre-fix operator, so a
-`PosDefException` here is a genuine regression signal, not a tuning problem —
-hence the fallback below warns loudly rather than degrading silently.
-"""
-function factorize_reduced(A, P; method=:cholesky)
-    P = dropzeros(P) # explicit zeros (from `P[r,:] .= 0.0`) would otherwise
-    # remain stored in the sparsity pattern, breaking the emptiness check below.
-    Ntot = size(P, 1)
-    keep = Int[]
-    merge_pairs = Pair{Int,Int}[]
-    seen = falses(Ntot)
-
-    for i in 1:Ntot
-        seen[i] && continue
-        rng = nzrange(P, i)
-        rows = P.rowval[rng]
-        if isempty(rows)
-            seen[i] = true
-        elseif length(rows) == 1 && rows[1] == i
-            push!(keep, i)
-            seen[i] = true
-        elseif length(rows) == 2
-            partner = rows[1] == i ? rows[2] : rows[1]
-            rep, other = max(i, partner), min(i, partner)
-            seen[rep] || push!(keep, rep)
-            push!(merge_pairs, other => rep)
-            seen[i] = true
-            seen[partner] = true
-        else
-            error("Unexpected P column structure at row $i: $rows")
-        end
-    end
-
-    # S: identity on kept DOFs, and each merged partner reading its
-    # representative's value. Zero rows for the dropped far-field DOFs.
-    pos = Dict(k => c for (c, k) in enumerate(keep))
-    rows = collect(keep)
-    cols = collect(1:length(keep))
-    for (other, rep) in merge_pairs
-        push!(rows, other)
-        push!(cols, pos[rep])
-    end
-    S = sparse(rows, cols, 1.0, Ntot, length(keep))
-
-    return ReducedSystem(keep, merge_pairs, S, _factorize_galerkin(S' * A * S, method), Ntot)
-end
-
-function _factorize_galerkin(M, method)
-    method === :lu && return lu(M)
-    method === :cholesky ||
-        throw(ArgumentError("unknown factorization method $method; use :cholesky or :lu"))
-    try
-        # `Symmetric` picks the upper triangle rather than averaging; legitimate
-        # here only because the two halves agree to round-off (measured
-        # ‖M-Mᵀ‖/‖M‖ ≈ 9e-17). The asymmetry is reported below if this fails.
-        return cholesky(Symmetric(M))
-    catch e
-        e isa PosDefException || rethrow()
-        @warn """
-              SᵀAS is not positive definite — falling back to LU, which costs \
-              ≈1.9× the factor nonzeros. This should not happen with the \
-              current operators: it is the signature of `traction_blocks` and \
-              `elastic_blocks` disagreeing about which boundary operator pairs \
-              with which SBP scheme, which is what made the pre-fix system \
-              non-SPD. See SYMMETRIC_SAT.md and \
-              `test/elasticity_test.jl`'s "SBP property" test.\
-              """ asymmetry = norm(M - M') / norm(M)
-        return lu(M)
-    end
-end
-
-"""
-    reduced_solve(rs::ReducedSystem, rhs)
-    reduced_solve(A, rhs, P)
-
-Solves the reduced system for `rhs`. Dropped/far-field entries of the
-returned `u` are set to `0` (their value is irrelevant — `P` discards them
-regardless). The three-argument form factorizes on every call; prefer
-[`factorize_reduced`](@ref) plus this two-argument form when solving
-repeatedly with the same operator.
-
-Restriction and expansion are both `S` (see [`prolongation`](@ref)): the
-Galerkin system is `SᵀAS w = Sᵀrhs`, and `u = S w` both scatters `w` back to
-the kept DOFs and copies each representative onto its merged partner.
-"""
-reduced_solve(rs::ReducedSystem, rhs) = rs.S * (rs.fact \ (rs.S' * rhs))
-
-reduced_solve(A, rhs, P; kwargs...) = reduced_solve(factorize_reduced(A, P; kwargs...), rhs)
-
 # ==============================================================================
 # Iterative solver: CG straight onto the singular A.
 # ==============================================================================
@@ -393,7 +220,7 @@ reduced_solve(A, rhs, P; kwargs...) = reduced_solve(factorize_reduced(A, P; kwar
 
 Running totals across every solve a [`CGSolver`](@ref) has performed. Iteration
 count is the thing to watch: it grows with problem size, and it is what decides
-whether the iterative path stays cheaper than a factorization.
+how expensive a build of `K` is.
 """
 mutable struct CGStats
     solves::Int
@@ -431,7 +258,8 @@ that hold *exactly* rather than approximately:
 
 `A` restricted to `range(A)` is positive definite (`λ ∈ [0.101, 11.9]`, κ = 118
 at n=9), so CG converges there at the normal rate — 71 iterations at n=9 and 108
-at n=13, agreeing with the direct solve's tractions to 1.4e-11.
+at n=13, agreeing with a reference direct solve's tractions to 1.4e-11 (measured
+when this module also carried a Cholesky/LU path; see git history).
 
 This all depends on `A` being **symmetric**, which it only became once
 `traction_blocks` was fixed; before that CG stalled at residual 3.7e-2 after
@@ -449,7 +277,7 @@ preserves the `range(A)` invariant above only if it commutes with `P`, i.e. if
 its entries agree within each merged fault pair. Left unimplemented rather than
 shipped unverified.
 """
-struct CGSolver{TA} <: SplitNodeSolver
+struct CGSolver{TA}
     A::TA
     workspace::CgWorkspace{Float64,Float64,Vector{Float64}}
     rtol::Float64
@@ -466,12 +294,9 @@ end
 """
     split_node_solve(solver, rhs) -> u
 
-Solves `A u = rhs`. Only `P*u` is meaningful: the direct path returns zeros on
-the dropped DOFs, the iterative path returns whatever CG's iterates happen to
-carry there. Both are correct inputs to `U = P*u + χ`.
+Solves `A u = rhs` by CG. Only `P*u` is meaningful — whatever CG's iterates
+carry on `P`'s null space is discarded by the `U = P*u + χ` reconstruction.
 """
-split_node_solve(rs::ReducedSystem, rhs) = reduced_solve(rs, rhs)
-
 function split_node_solve(s::CGSolver, rhs)
     cg!(s.workspace, s.A, rhs; rtol=s.rtol, atol=s.atol, itmax=s.itmax)
     st = s.workspace.stats
@@ -485,8 +310,7 @@ function split_node_solve(s::CGSolver, rhs)
             CG did not converge on a split-node solve (status "$(st.status)") \
             after $(st.niter) iterations. The returned displacement is not a \
             solution, and `fault_stiffness` would fold it into `K` silently. \
-            Raise `itmax`, loosen `rtol`, or use a direct solver \
-            (`solver=:cholesky`).""" rtol = s.rtol itmax = s.itmax
+            Raise `itmax` or loosen `rtol`.""" rtol = s.rtol itmax = s.itmax
     end
     # The workspace buffer is reused by the next solve, so hand back a copy.
     return copy(s.workspace.x)
@@ -495,28 +319,14 @@ end
 """
     duplicate(solver) -> solver
 
-An independent solver sharing the same operator, for use on another thread.
-Only the iterative path supports this: `CGSolver`'s per-solve state is its
-`CgWorkspace`, which is cheap to duplicate (a few vectors), while `A` is read
-concurrently. A `ReducedSystem` cannot — CHOLMOD's `\\` writes into workspace
-owned by the factor, so sharing one across threads is a data race.
-
-This is what makes the `K` build parallel under CG and not under a direct
-solve: `fault_stiffness`'s `2·N_Ωf` columns are independent, and a sparse
-factorization cannot exploit that.
+An independent solver sharing the same operator `A`, for use on another
+thread. `CGSolver`'s per-solve state is its `CgWorkspace`, which is cheap to
+duplicate (a few vectors) while `A` itself is only ever read concurrently.
+This is what makes the `K` build in `fault_stiffness` embarrassingly
+parallel: its `2·N_Ωf` columns are independent right-hand sides against the
+same `A`.
 """
 duplicate(s::CGSolver) = CGSolver(s.A; rtol=s.rtol, atol=s.atol, itmax=s.itmax)
-duplicate(::ReducedSystem) =
-    error("a direct ReducedSystem cannot be duplicated for threading (CHOLMOD's " *
-          "solve is not thread-safe); use `solver=:cg` for a threaded K build")
-
-"""
-    threadsafe(solver) -> Bool
-
-Whether [`duplicate`](@ref) works, i.e. whether the `K` build can be threaded.
-"""
-threadsafe(::CGSolver) = true
-threadsafe(::ReducedSystem) = false
 
 """
     merge_stats!(into, from)
@@ -532,40 +342,19 @@ function merge_stats!(into::CGSolver, from::CGSolver)
     a.unconverged += b.unconverged
     return into
 end
-merge_stats!(into::SplitNodeSolver, ::SplitNodeSolver) = into
 
 """
-    solver_report(solver) -> NamedTuple
+    solver_report(solver::CGSolver) -> NamedTuple
 
-What the solve cost. For the direct path this is static; for [`CGSolver`](@ref)
-it accumulates, so a build of `K` reports the total and worst-case iteration
-counts over all `2·N_Ωf` right-hand sides.
+What the solve has cost so far: total and worst-case iteration counts,
+accumulated over every solve — so a build of `K` reports the totals over all
+`2·N_Ωf` right-hand sides.
 """
-solver_report(rs::ReducedSystem) = (; kind=:direct, factorization=nameof(typeof(rs.fact)),
-                                    reduced_dofs=length(rs.keep))
 function solver_report(s::CGSolver)
     t = s.stats
     return (; kind=:cg, t.solves, t.iterations,
             mean_iterations=t.solves == 0 ? 0.0 : t.iterations / t.solves,
             t.max_iterations, t.unconverged)
-end
-
-"""
-    split_node_solver(A, P; method=:cholesky, kwargs...) -> SplitNodeSolver
-
-Builds the solver for `A`. `method` is `:cholesky` (default) or `:lu` for the
-direct reduction — see [`factorize_reduced`](@ref) — or `:cg` for
-[`CGSolver`](@ref), which ignores `P` entirely. Remaining `kwargs` go to the
-chosen constructor (`rtol`, `atol`, `itmax` for `:cg`).
-
-Which to pick is an access-pattern question, not a correctness one. The direct
-path pays one factorization and then serves right-hand sides nearly free, which
-suits `fault_stiffness`'s `2·N_Ωf` of them; CG pays per right-hand side but
-needs no factor, so it is the one that survives grid refinement.
-"""
-function split_node_solver(A, P; method=:cholesky, kwargs...)
-    method === :cg && return CGSolver(A; kwargs...)
-    return factorize_reduced(A, P; method, kwargs...)
 end
 
 end # module ElasticitySplitNode

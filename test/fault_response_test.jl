@@ -77,24 +77,14 @@ const FE_K = fault_stiffness(FE)
         @test all(iszero, Δτ3)
     end
 
-    # The three solvers are interchangeable, and `K` is what would carry a
-    # difference into every downstream result — so compare there, not on `u`.
-    @testset "all solvers agree on K" begin
+    @testset "K's sign convention" begin
         set = fr_stencil_set()
         gm, gp = fr_grids(11)
-        K = Dict{Symbol,Matrix{Float64}}()
-        for m in (:cholesky, :lu, :cg)
-            fe = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.4, solver=m)
-            K[m] = fault_stiffness(fe)
-            m === :cg && @test elastic_solver_report(fe).unconverged == 0
-        end
-        @test norm(K[:lu] - K[:cholesky]) / norm(K[:cholesky]) < 1e-12
-        @test norm(K[:cg] - K[:cholesky]) / norm(K[:cholesky]) < 1e-8
-        # The sign convention every coupled run depends on, checked per solver:
-        # slip must relieve the stress driving it.
-        for m in (:cholesky, :lu, :cg)
-            @test maximum(K[m][i, i] for i in 1:size(K[m], 1)) < 0
-        end
+        fe = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.4)
+        K = fault_stiffness(fe)
+        @test elastic_solver_report(fe).unconverged == 0
+        # Slip must relieve the stress driving it.
+        @test maximum(K[i, i] for i in 1:size(K, 1)) < 0
     end
 
     # The threaded K build must be bit-identical to the serial one: the columns
@@ -112,31 +102,12 @@ const FE_K = fault_stiffness(FE)
             @info "only 1 thread: the threaded K test cannot detect a data race here"
         set = fr_stencil_set()
         gm, gp = fr_grids(11)
-        fe_ser = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.4, solver=:cg)
-        fe_thr = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.4, solver=:cg)
+        fe_ser = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.4)
+        fe_thr = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.4)
         K_ser = fault_stiffness(fe_ser; threaded=false)
         K_thr = fault_stiffness(fe_thr; threaded=true)
         @test K_thr == K_ser
         # Same work done either way — a race usually perturbs iteration counts.
         @test solver_report(fe_thr.rs).iterations == solver_report(fe_ser.rs).iterations
-        # A direct solver cannot be threaded (CHOLMOD's solve is not
-        # thread-safe); asking for it must fall back, not race.
-        fe_dir = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.4, solver=:cholesky)
-        @test fault_stiffness(fe_dir; threaded=true) ≈ K_ser rtol = 1e-8
-    end
-
-    @testset "factorize_reduced matches the one-shot solve" begin
-        set = fr_stencil_set()
-        gm, gp = fr_grids(11)
-        A, HP_DSAT, P = split_node_system(gm, gp, λ_fr, μ_fr, set)
-        χ = build_chi(gm, gp, (x2, x3) -> (exp(-(x2^2 + x3^2) / 0.2), 0.0))
-        rhs = HP_DSAT * χ
-        rs = factorize_reduced(A, P)
-        # Reusing a factorization across steps must give the same answer as
-        # factorizing every time.
-        @test reduced_solve(rs, rhs) ≈ reduced_solve(A, rhs, P) rtol = 1e-8
-        # And it must be reusable for a different right-hand side.
-        χ2 = build_chi(gm, gp, (x2, x3) -> (0.0, exp(-(x2^2 + x3^2) / 0.3)))
-        @test reduced_solve(rs, HP_DSAT * χ2) ≈ reduced_solve(A, HP_DSAT * χ2, P) rtol = 1e-8
     end
 end
