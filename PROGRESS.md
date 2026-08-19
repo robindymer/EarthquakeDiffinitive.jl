@@ -642,7 +642,11 @@ Two things the figures make visible that the summary numbers did not:
 
 These are properties of the current approach, not loose ends to tidy.
 
-1. **The runs are not resolution-converged, and cannot be on this machine.**
+1. **The runs are not resolution-converged.** *(The original "and cannot be on
+   this machine" no longer holds: Δz = 20 m clears the `L_b/Δz ≥ 3` criterion,
+   needs ~5.5 GB, and is an overnight run on 12 cores. See `PERFORMANCE.md` §4.
+   Cluster access puts the nominal Δz = 10 m in range too, but only once the
+   `K` build can leave one node — see `TODO.md` §2.)*
    The rate-and-state process zone is `L_b = μD_RS/(bσ̄) ≈ 64 m` at
    σ̄ = 25 MPa. The benchmark's Δz = 10 m gives ~6 cells per `L_b`; the
    Δz = 50 m used here gives 1.3, and Δz = 100 m gives 0.6. Because slip rate
@@ -658,7 +662,13 @@ These are properties of the current approach, not loose ends to tidy.
    so the nodes exactly on `±l_f` are locked. That is the correct discrete
    reading of eq. 13 and converges as Δz → 0, but at these spacings it means
    the slipping patch is 600 m across at Δz = 100 m and 700 m at Δz = 50 m.
-2. **Why Δz = 50 m is the ceiling.** Fill-in in the sparse factorization of the
+2. **Why Δz = 50 m *was* the ceiling.** *(Superseded — see `PERFORMANCE.md`
+   §4. The direct solver this describes has since been removed, and the
+   remaining ceiling is compute, not memory: Δz = 20 m is ~5.5 GB and ~182
+   core-hours, and Δz = 20 m — not the benchmark's 10 m — is the coarsest grid
+   `resolution_report` calls converged. The account below is kept because it
+   explains why `L_normal` was halved, which still biases the shipped runs.)*
+   Fill-in in the sparse factorization of the
    3D elastic system, not the grid itself. Measured on a cube with LU: 20M
    nonzeros at n=13, 93M at n=17, 297M (2.4 GB) at n=21, and OOM by n=25. The
    production configuration (58,806 DOF) takes 92 s to factorize and 125 s to

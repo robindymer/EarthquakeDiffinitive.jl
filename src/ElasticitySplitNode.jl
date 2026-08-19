@@ -43,6 +43,22 @@ dof_index_plus(g_minus, g_plus, component, I) = 3 * length(g_minus) + (component
 
 _to_sparse_matrix(M) = reduce(vcat, [reduce(hcat, [sparse(M[j][k]) for k in 1:length(M)]) for j in 1:length(M)])
 
+# Appends block `B`'s stored entries to the (I,J,V) triplet lists, shifted so
+# that B[1,1] lands at (row0+1, col0+1). Lets `SATmat` be built in one
+# `sparse(I,J,V,…)` call instead of repeated `SATmat[rows,cols] .+= B`, which
+# rewrites the whole CSC structure each time and made assembly quadratic
+# (199× slower by n=21). See `PERFORMANCE.md` §2.2.
+function _append_block!(I, J, V, B::AbstractSparseMatrix, row0, col0)
+    rows = rowvals(B)
+    vals = nonzeros(B)
+    for col in 1:size(B, 2), idx in nzrange(B, col)
+        push!(I, row0 + rows[idx])
+        push!(J, col0 + col)
+        push!(V, vals[idx])
+    end
+    return nothing
+end
+
 # Prolong = -H⁻¹∘e'∘Hᵧ, the SAT penalty prefactor.
 function _prolongation(g, stencil_set, bid)
     H_inv = inverse_inner_product(g, stencil_set)
@@ -95,7 +111,9 @@ function split_node_system(g_minus, g_plus, λ, μ, stencil_set)
     bid_plus = CartesianBoundary{1,LowerBoundary}()
 
     # ---- D: block-diagonal elastic operator ----
-    # TODO: Investigate that we are matrix free where possible
+    # Assembled rather than applied matrix-free, which is the measured choice,
+    # not an oversight: lazy composition re-expands the stencil at every point
+    # and benchmarks 41-67× slower than `mul!`. See `PERFORMANCE.md` §1.
     Dm = _to_sparse_matrix(elastic_blocks(g_minus, λ, μ, stencil_set))
     Dp = _to_sparse_matrix(elastic_blocks(g_plus, λ, μ, stencil_set))
     Dmat = blockdiag(Dm, Dp)
@@ -123,26 +141,33 @@ function split_node_system(g_minus, g_plus, λ, μ, stencil_set)
     Prolong_p = _prolongation(g_plus, stencil_set, bid_plus)
     Prolong_m = _prolongation(g_minus, stencil_set, bid_minus)
 
-    SATmat = spzeros(Ntot, Ntot)
+    # Accumulated as triplets and assembled in one `sparse` call — see
+    # `_append_block!` for why the obvious `SATmat[rows, cols] .+= …` form is
+    # not used. Column offset 0 addresses the `-` side's block, `D*Nm` the `+`
+    # side's, matching the `1:D*Nm` / `D*Nm+1:Ntot` ranges this replaces.
+    Isat, Jsat, Vsat = Int[], Int[], Float64[]
     for j in 1:D
-        rows_p = D * Nm .+ ((j-1)*Np+1:j*Np)
-        rows_m = (j-1)*Nm+1:j*Nm
+        row0_m = (j-1) * Nm
+        row0_p = D * Nm + (j-1) * Np
         Tp_j = reduce(hcat, Tp[j, :])   # Nb × Np
         Tm_j = reduce(hcat, Tm[j, :])   # Nb × Nm
 
         # - side (fault = upper boundary, outward = +x₁):  ½ Prolong₋ (τ₋ - τ₊)
-        SATmat[rows_m, 1:D*Nm] .+= 0.5 .* (Prolong_m * Tm_j)
-        SATmat[rows_m, D*Nm+1:Ntot] .+= -0.5 .* (Prolong_m * Tp_j)
+        _append_block!(Isat, Jsat, Vsat, 0.5 .* (Prolong_m * Tm_j), row0_m, 0)
+        _append_block!(Isat, Jsat, Vsat, -0.5 .* (Prolong_m * Tp_j), row0_m, D * Nm)
 
         # + side (fault = lower boundary, outward = -x₁): -½ Prolong₊ (τ₊ - τ₋)
-        SATmat[rows_p, D*Nm+1:Ntot] .+= -0.5 .* (Prolong_p * Tp_j)
-        SATmat[rows_p, 1:D*Nm] .+= 0.5 .* (Prolong_p * Tm_j)
+        _append_block!(Isat, Jsat, Vsat, -0.5 .* (Prolong_p * Tp_j), row0_p, D * Nm)
+        _append_block!(Isat, Jsat, Vsat, 0.5 .* (Prolong_p * Tm_j), row0_p, 0)
     end
+    SATmat = sparse(Isat, Jsat, Vsat, Ntot, Ntot)
 
     DSAT = Dmat + SATmat
 
     # ---- P: projection (average tangential fault DOFs, zero far-field) ----
-    # TODO: Consider injection instead of explicit matrix
+    # An explicit matrix deliberately: `P` is a near-identity applied once per
+    # solve, and making it lazy would force `A` into a composite that measured
+    # 1.66× slower per mat-vec. See `PERFORMANCE.md` §1.
     P = sparse(1.0I, Ntot, Ntot)
 
     far_field_minus = filter(!=(bid_minus), boundary_identifiers(g_minus))
@@ -170,6 +195,12 @@ function split_node_system(g_minus, g_plus, λ, μ, stencil_set)
             end
         end
     end
+
+    # `P[r,:] .= 0.0` on a CSC zeroes the value but KEEPS the structural entry,
+    # and those stored zeros multiply into full rows of `DSAT`, inflating
+    # `HP_DSAT` and `A` by 29-52%. Same matrix either way — see `PERFORMANCE.md`
+    # §2.1.
+    dropzeros!(P)
 
     # ---- H: block-diagonal volume inner product (for symmetrization) ----
     Hm = sparse(inner_product(g_minus, stencil_set))

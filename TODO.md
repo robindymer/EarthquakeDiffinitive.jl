@@ -1,7 +1,25 @@
 # TODO
 
 Open work, in dependency order. Background for the symmetry items is in
-`SYMMETRIC_SAT.md`; the rest is from `PROGRESS.md`'s "Known limitations".
+`SYMMETRIC_SAT.md`, for the cost items in `PERFORMANCE.md`; the rest is from
+`PROGRESS.md`'s "Known limitations".
+
+## Agreed next steps (2026-08-19)
+
+In this order, and the order matters:
+
+1. **§1 — the `L_normal = 400` domain bias.** A **42% error in `V_max`**, and
+   still unconverged at 800 m. Correctness before speed: this is a wrong number
+   in a reported quantity, and no amount of resolution fixes it. Doing it first
+   also means the re-runs it forces happen once, not twice.
+2. **§2 — multi-node parallelism for the `K` build.** The cluster blocker.
+   Unlocks the resolution that item 1's re-runs should then be done at.
+3. **§2 — test whether `K` is near-block-Toeplitz.** Cheap experiment, largest
+   possible prize; deliberately *after* the above because it is speculative and
+   neither of the first two depends on it.
+
+The preconditioner sits behind all three: it is a constant-factor win on a
+quantity item 3 might make irrelevant.
 
 ## Done
 
@@ -93,6 +111,33 @@ Open work, in dependency order. Background for the symmetry items is in
       no `D1` at all and no `D2` stencils. Upstream Diffinitive data gap, not
       fixable here. Recorded as `PROGRESS.md` limitation 5.
 
+### Performance session (2026-08-19)
+
+Full write-up in `PERFORMANCE.md`; only the outcomes are listed here.
+
+- [x] **Answer "should this be matrix-free?"** No — and by a wide margin.
+      Diffinitive's lazy composition re-expands the stencil at every point,
+      measuring **41-67× slower** than sparse `mul!` on the same operator.
+      A matrix-free `P` is worse still (forces `A` into a composite, 1.66×
+      slower per mat-vec). Both TODO notes in `ElasticitySplitNode.jl` are
+      now answered in place with pointers to `PERFORMANCE.md` §1.
+- [x] **Remove stored zeros from `P`.** `P[r,:] .= 0.0` keeps the CSC
+      structural entry; those zeros multiplied into full `DSAT` rows and
+      inflated `HP_DSAT`/`A` by **29-52%**. One `dropzeros!`. Operators
+      bit-identical, 179/179.
+- [x] **Fix quadratic SAT assembly.** `SATmat[rows,cols] .+= B` rewrote the
+      whole CSC each of 12 times; assembly scaled quadratically and was 64% of
+      all assembly by n=21. Triplet accumulation + one `sparse()` call:
+      **199× faster** at n=21, growth now linear, matrix identical, 179/179.
+- [x] **Establish the cost model.** `t_solve ∝ DOF^1.56`, CG iterations
+      ∝ DOF^0.31, columns ∝ Δz⁻², so the `K` build scales as **Δz⁻⁶·⁷**.
+      Measured at Δz = 100/80/50 m on benchmark-shaped grids.
+
+**Stale references below.** The `Done` entries above this block mention
+`factorize_reduced`, `prolongation(rs)`, `solver=:cg` and the CHOLMOD fallback;
+none of those exist in `src/` any more (commit `02b6c91` "Only CG"). They are
+kept as history — do not treat them as API.
+
 ## 1. Act on the domain-convergence result — `L_normal = 400` is not innocent
 
 The sweep has been run; all three fault-normal rows fit (`L_normal = 800` is
@@ -122,25 +167,46 @@ peak `V`. It is free for slip and stiffness.
 ## 2. Resolution — the actual blocker
 
 `PROGRESS.md` "Known limitations" 1 and 2. Δz = 50 m gives 1.3 cells per
-process zone `L_b ≈ 64 m` against the benchmark's 10 m / ~6 cells.
+process zone `L_b ≈ 64 m`.
 
-| | effect on Δz | cost |
-|---|---|---|
-| Cholesky (done) | 50 m → ~45 m | free |
-| CG (done) | removes the fill-in ceiling; ~3× on memory alone | ~2× slower serially, recovered by threading |
-| needed | 50 m → 10 m | |
+**The target is Δz = 20 m, not the benchmark's 10 m.** `resolution_report`
+calls a grid converged at `L_b/Δz ≥ 3`, i.e. Δz ≤ 21 m — so 10 m is 6.7× more
+expensive than convergence actually requires. Quote 10 m only if the submission
+demands the nominal spec.
 
-CG turns the memory wall into a compute problem. What remains is that CG's cost
-grows on two fronts under refinement at once: iterations per solve (≈ `O(1/h)`
-unpreconditioned) *and* the number of right-hand sides (`2·N_Ωf`, growing as
-`h⁻²`). Threading covers a constant factor, not the scaling.
+Costs from `PERFORMANCE.md` §4 (extrapolated ±2×):
 
-- [ ] **Preconditioner.** The obvious next lever, and it attacks the iteration
-      count directly. Deliberately not shipped unvalidated: a diagonal
-      preconditioner preserves the `range(A)` invariant CG relies on here only
-      if it commutes with `P`, i.e. if its entries agree within each merged
-      fault pair. Check that before assuming it is safe — `CGSolver`'s
-      docstring has the argument.
+| Δz | DOF | `A`+`HP_DSAT` | `K` build | converged |
+|---|---|---|---|---|
+| 50 m (shipped) | 245 k | 0.34 GB | 0.5 core-h | no (1.3) |
+| **20 m** | 3.6 M | ~5.5 GB | **182 core-h** | **yes (3.2)** |
+| 10 m (spec) | 28.2 M | ~42 GB | ~17,700 core-h | yes (6.4) |
+
+`PROGRESS.md` limitation 2's "Δz = 50 m is the ceiling" is **stale** — that was
+the removed direct solver's fill-in. Memory is no longer what binds.
+
+- [ ] **Multi-node parallelism — the cluster blocker, and now item 2's top
+      priority.** `fault_stiffness` uses `Threads.@spawn` only, so it cannot
+      leave one node, and within a node the sparse mat-vec is
+      memory-bandwidth-bound (2.13× on 16 threads, per PROGRESS). The `2·N_Ωf`
+      columns are independent RHSs against a shared `A` — the ideal shape for
+      distribution: one copy of `A` per node, a slice of the columns each,
+      near-linear because each node has its own bandwidth. Needs
+      `Distributed`/MPI; neither is present. Δz = 10 m is unreachable without
+      it and comfortable with it.
+- [ ] **Test whether `K` is near-block-Toeplitz** (`PERFORMANCE.md` §5 item 2).
+      Potentially the largest win available — in a homogeneous medium `K[i,j]`
+      should depend mainly on `x_i − x_j`, which would collapse thousands of
+      solves to a handful. Far-field truncation breaks it exactly, so it needs
+      measuring, and it is cheap to measure: build `K` at Δz = 50 m and check
+      how well entries collapse onto separation alone. Do this *before* the
+      preconditioner — bigger prize, cheaper experiment.
+- [ ] **Preconditioner.** Attacks the iteration count directly (236 at
+      Δz = 50 m, ~450 extrapolated at Δz = 20 m). Deliberately not shipped
+      unvalidated: a diagonal preconditioner preserves the `range(A)` invariant
+      CG relies on here only if it commutes with `P`, i.e. if its entries agree
+      within each merged fault pair. Check that before assuming it is safe —
+      `CGSolver`'s docstring has the argument.
 - [ ] **Decide between preconditioned/multigrid CG on this discretization and
       the boundary-integral route** most SEAS codes take (whole-space
       fault-to-fault kernel is a convolution, `O(N log N)` with FFTs, no volume

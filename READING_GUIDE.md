@@ -34,7 +34,7 @@ side, not after — the tests here aren't just usage examples, they carry
 comment above `solve_gaussian_slip` (why self-consistency alone doesn't catch
 a wrong model) is a good example of this pattern.
 
-## 4. Treat `SYMMETRIC_SAT.md` and `PROGRESS.md` as reference material, not front-to-back reading
+## 4. Treat `SYMMETRIC_SAT.md`, `PERFORMANCE.md` and `PROGRESS.md` as reference material, not front-to-back reading
 
 Jump into them only when a code comment cites them (`traction_blocks`'s
 docstring does this, for example). That's where the actual derivations and
