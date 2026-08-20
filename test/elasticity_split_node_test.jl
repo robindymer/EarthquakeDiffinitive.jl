@@ -176,6 +176,55 @@ end
         @test norm(u_cg - P * u_cg) / norm(u_cg) < 1e-12
     end
 
+    @testset "preconditioned CG: Jacobi is safe, and measurably useless" begin
+        set = split_node_stencil_set()
+        n = 11
+        g_minus = equidistant_grid((-1.0, -1.0, -1.0), (0.0, 1.0, 1.0), n, n, n)
+        g_plus = equidistant_grid((0.0, -1.0, -1.0), (1.0, 1.0, 1.0), n, n, n)
+        A, HP_DSAT, P = split_node_system(g_minus, g_plus, λ_sn, μ_sn, set)
+        χ = build_chi(g_minus, g_plus, (x2, x3) -> (exp(-(x2^2 + x3^2) / 0.125), 0.0))
+        b = HP_DSAT * χ
+
+        # 1. `diag(A)` has EXACT zeros, on precisely the far-field DOFs — `P`
+        #    zeroes those rows and `A = -HP·DSAT·P` inherits it. This is why
+        #    `jacobi_preconditioner` needs a floor; without it the entries are
+        #    `Inf` and CG returns NaN. Pinning the fact, not just the workaround.
+        d = diag(A)
+        zero_diag = findall(iszero, d)
+        @test !isempty(zero_diag)
+        @test Set(zero_diag) == Set(r for r in 1:size(A, 2) if nnz(P[r, :]) == 0)
+        @test all(>(0), d[d .!= 0])
+        @test all(isfinite, jacobi_preconditioner(A).diag)
+
+        # 2. A diagonal M commutes with P EXACTLY, not approximately. Rows rm
+        #    and rp of P are identical, so rows rm and rp of A are identical,
+        #    and symmetry forces A[rm,rm] == A[rp,rp]. This is the property
+        #    that made Jacobi safe to ship; if it ever stops holding, the
+        #    argument in CGSolver's docstring is void.
+        M = jacobi_preconditioner(A)
+        @test norm(M * P - P * M) / norm(M * P) < 1e-14
+
+        # 3. Preconditioning does not change the answer. `U`, not `u`, is the
+        #    physical quantity — `u` may differ in null(P) and does not matter.
+        u_none = split_node_solve(CGSolver(A; precond=:none), b)
+        s_jac = CGSolver(A; precond=:jacobi)
+        u_jac = split_node_solve(s_jac, b)
+        U_none = reconstruct_U(P, u_none, χ)
+        U_jac = reconstruct_U(P, u_jac, χ)
+        @test solver_report(s_jac).unconverged == 0
+        @test solver_report(s_jac).precond === :jacobi
+        @test norm(U_jac - U_none) / norm(U_none) < 1e-8
+
+        # 4. `duplicate` must carry the preconditioner, or the threaded
+        #    `fault_stiffness` build would silently run unpreconditioned on
+        #    every thread but the first.
+        d_jac = duplicate(s_jac)
+        @test d_jac.precond === :jacobi
+        @test d_jac.M === s_jac.M          # shared, not rebuilt
+
+        @test_throws ErrorException CGSolver(A; precond=:nonsense)
+    end
+
     @testset "fault-normal stress vanishes under refinement" begin
         coarse = solve_gaussian_slip(11)
         fine = solve_gaussian_slip(15)

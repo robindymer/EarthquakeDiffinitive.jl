@@ -5,7 +5,7 @@ using Diffinitive.Grids
 using Diffinitive.SbpOperators
 using Diffinitive.LazyTensors
 using SparseArrays
-using LinearAlgebra: I
+using LinearAlgebra: I, Diagonal, diag
 using Krylov: CgWorkspace, cg!
 using Tokens
 using StaticArrays
@@ -13,7 +13,7 @@ using ..Elasticity: elastic_blocks, traction_blocks
 
 export split_node_system, dof_index_minus, dof_index_plus, build_chi,
        reconstruct_U, fault_node_pairs,
-       CGSolver, split_node_solve,
+       CGSolver, split_node_solve, jacobi_preconditioner,
        solver_report, duplicate, merge_stats!
 
 # ==============================================================================
@@ -303,13 +303,29 @@ counted in [`solver_report`](@ref)'s `unconverged` and warned about once —
 silently returning an unconverged `u` would corrupt `K` in a way nothing
 downstream would notice.
 
-No preconditioner. A diagonal one is tempting but not obviously safe here: it
-preserves the `range(A)` invariant above only if it commutes with `P`, i.e. if
-its entries agree within each merged fault pair. Left unimplemented rather than
-shipped unverified.
+## Preconditioning
+
+`precond` selects `M⁻¹`. `:none` (default) is plain CG; `:jacobi` is
+[`jacobi_preconditioner`](@ref).
+
+The safety question the earlier version of this docstring left open is now
+**measured and closed**: a diagonal `M` commutes with `P` *exactly*, not
+approximately. Rows `rm` and `rp` of `P` are identical (both `0.5e_rm + 0.5e_rp`),
+so rows `rm` and `rp` of `A = -HP·DSAT·P` are identical, and symmetry then forces
+`A[rm,rm] = A[rp,rp]`. Measured at n1=9, n23=13: worst relative disagreement
+within a merged pair is `0.0`, and `‖MP − PM‖/‖MP‖ = 0.0`.
+
+**Jacobi does not help, and is kept only so that stays visible.** 86 iterations
+against plain CG's 79 — a 0.92× *regression*. `diag(A)`'s nonzero entries span
+only 13.5×, so there is almost no diagonal scaling to remove. The reconstructed
+`U` is unchanged to 2.5e-11, so the option is correct; it is simply not worth
+selecting. See `PERFORMANCE.md` §6.
 """
-struct CGSolver{TA}
+struct CGSolver{TA,TM}
     A::TA
+    M::TM                  # applies M⁻¹; `I` for unpreconditioned
+    ldiv::Bool             # true ⇒ Krylov calls ldiv!(M, r) rather than M*r
+    precond::Symbol
     workspace::CgWorkspace{Float64,Float64,Vector{Float64}}
     rtol::Float64
     atol::Float64
@@ -317,9 +333,40 @@ struct CGSolver{TA}
     stats::CGStats
 end
 
-function CGSolver(A; rtol=1e-10, atol=0.0, itmax=0)
+"""
+    jacobi_preconditioner(A) -> Diagonal
+
+`M⁻¹ = diag(A)⁻¹`, with the **zero** diagonal entries floored to 1.
+
+The floor is not defensive coding, it is required. `P` zeroes every far-field
+DOF's row, and `A = -HP·DSAT·P` inherits that, so `A` has entirely zero rows and
+columns there and `diag(A)` contains *exact* zeros — measured at n1=9, n23=13:
+3,318 of 9,126 entries, and that set is precisely the far-field DOF set. Naive
+`1 ./ diag(A)` gives `Inf`.
+
+The floor *value* is arbitrary: those DOFs lie in `null(P)`, so whatever the
+solve puts there is annihilated by `U = P*u + χ`. It only has to keep `M`
+positive definite, which CG requires. Every nonzero entry is positive (measured),
+so no other entry needs guarding.
+"""
+function jacobi_preconditioner(A)
+    d = diag(A)
+    any(x -> x < 0, d) && error("diag(A) has negative entries; A is not PSD and " *
+                                "a Jacobi preconditioner would not be SPD")
+    return Diagonal([x == 0 ? 1.0 : inv(x) for x in d])
+end
+
+function build_preconditioner(A, precond::Symbol)
+    precond === :none   && return I, false
+    precond === :jacobi && return jacobi_preconditioner(A), false
+    error("precond must be :none or :jacobi, got $precond")
+end
+
+function CGSolver(A; rtol=1e-10, atol=0.0, itmax=0, precond::Symbol=:none)
     n = size(A, 2)
-    return CGSolver(A, CgWorkspace(n, n, Vector{Float64}), rtol, atol, itmax, CGStats())
+    M, ldiv = build_preconditioner(A, precond)
+    return CGSolver(A, M, ldiv, precond, CgWorkspace(n, n, Vector{Float64}),
+                    rtol, atol, itmax, CGStats())
 end
 
 """
@@ -329,7 +376,8 @@ Solves `A u = rhs` by CG. Only `P*u` is meaningful — whatever CG's iterates
 carry on `P`'s null space is discarded by the `U = P*u + χ` reconstruction.
 """
 function split_node_solve(s::CGSolver, rhs)
-    cg!(s.workspace, s.A, rhs; rtol=s.rtol, atol=s.atol, itmax=s.itmax)
+    cg!(s.workspace, s.A, rhs; M=s.M, ldiv=s.ldiv,
+        rtol=s.rtol, atol=s.atol, itmax=s.itmax)
     st = s.workspace.stats
     t = s.stats
     t.solves += 1
@@ -357,7 +405,17 @@ This is what makes the `K` build in `fault_stiffness` embarrassingly
 parallel: its `2·N_Ωf` columns are independent right-hand sides against the
 same `A`.
 """
-duplicate(s::CGSolver) = CGSolver(s.A; rtol=s.rtol, atol=s.atol, itmax=s.itmax)
+function duplicate(s::CGSolver)
+    n = size(s.A, 2)
+    # `M` is SHARED, not rebuilt: rebuilding is pointless for a Diagonal and
+    # would be expensive for anything with a setup phase. That is only valid
+    # while `M` is stateless under application — true for `I` and `Diagonal`.
+    # A preconditioner carrying internal scratch (AMG's cycle temporaries) must
+    # be duplicated here instead, or the threaded build races exactly the way
+    # the shared per-task buffers did (see `fault_stiffness`).
+    return CGSolver(s.A, s.M, s.ldiv, s.precond, CgWorkspace(n, n, Vector{Float64}),
+                    s.rtol, s.atol, s.itmax, CGStats())
+end
 
 """
     merge_stats!(into, from)
@@ -383,7 +441,7 @@ accumulated over every solve — so a build of `K` reports the totals over all
 """
 function solver_report(s::CGSolver)
     t = s.stats
-    return (; kind=:cg, t.solves, t.iterations,
+    return (; kind=:cg, precond=s.precond, t.solves, t.iterations,
             mean_iterations=t.solves == 0 ? 0.0 : t.iterations / t.solves,
             t.max_iterations, t.unconverged)
 end
