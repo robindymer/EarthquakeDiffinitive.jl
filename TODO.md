@@ -98,12 +98,36 @@ stand.
    Confirmed as stiffness by control: the Gaussian variant takes **405** steps
    on an identical grid.
 
-   A stiff integrator is the likely remedy but is **not demonstrated**. A
+   **Route being pursued: regularize via `σ̄_min`** (Robin's call, 2026-08-20 —
+   measure before committing to a solver project). At Δz = 50 m a 10 kPa floor
+   buys **9.2× for 0.04% in `V_max`**; 100 kPa buys 38× for 0.47%. Table and
+   caveats in `PROGRESS.md` "BP8-PW stiffness: σ̄_min as a regularization".
+
+   **Two things to carry forward, because they change the argument:**
+   - `V_max` does **not** live at the well cell — global and `r > 20 m` values
+     are identical — so the "confined to an already-invalid region" defence is
+     **not available**. Any change to `V_max` is a change to genuine fault.
+   - What remains is quantitative: 0.04% against a 0.41-0.87% Toeplitz error and
+     a much larger resolution error. Defensible, but it *is* a deliberate physics
+     perturbation to a submitted number where the spec is silent, not permissive.
+     **Worth raising with the benchmark organizers.**
+
+   **Δz = 25 m confirmation is DONE and it holds — better than at 50 m.**
+   100 kPa gives **113× for 0.00% in `V_max`** and 0.14% in slip (at Δz = 50 m
+   the same floor cost 0.47%). The speedup grew and the perturbation shrank,
+   because a finer grid makes the floored cell smaller in area while its
+   stiffness worsens. Suggested value **`σ̄_min` = 100 kPa**; 1 MPa gives 748×
+   but moves slip 1.42%, above the Toeplitz error, and slip is a §4.1 output.
+
+   **Remaining to do:** adopt the value (it is `par.σ̄_min`, currently 1 kPa —
+   a one-line default change plus a docstring), and decide the disclosure
+   question below.
+
+   A stiff integrator remains the fallback if it does not. Not demonstrated: a
    `Rosenbrock23` probe was still running on the *easy* Gaussian case after 90 s,
    because the RHS carries a dense `K` mat-vec, a nested Newton friction solve
-   per node, and a non-smooth `max(σ̄, σ̄_min)`. Doing this properly probably
-   means Jacobian-free Newton-Krylov — a design decision, not an increment, and
-   deliberately not started.
+   per node, and a non-smooth `max(σ̄, σ̄_min)`. Doing it properly probably means
+   Jacobian-free Newton-Krylov — a design decision, not an increment.
 
    **The benchmark description is silent on both stiffness and σ̄ < 0** (checked
    directly against the PDF). These are gaps in the specification.
