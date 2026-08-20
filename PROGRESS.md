@@ -714,6 +714,55 @@ Two things the figures make visible that the summary numbers did not:
   one grid node at a time across only ~15 active nodes. This is the same
   limitation as item 1 below, seen directly rather than inferred.
 
+## Domain requirement relaxes with resolution (2026-08-20)
+
+The requirement `L_fault ≥ 4·l_f`, `L_normal ≥ 3·l_f` was measured at Δz = 50 m,
+and `TODO.md` recorded its transferability to finer grids as unproven. It is now
+measured, and it **does not transfer — it relaxes substantially.**
+
+`scripts/bp8_domain_convergence.jl resolution`, Δz = 25 m, `:toeplitz`, t = 100 h,
+relative to `(1600, 1200)`:
+
+| `L_fault` | `L_normal` | DOF | d(`V_max`) |
+|---|---|---|---|
+| 800 | 400 | 431 k | **6.30%** |
+| 800 | 800 | 837 k | 3.50% |
+| 800 | 1200 | 1.24 M | 2.55% |
+| **1200** | **1200** | 2.77 M | **0.37%** |
+| 1600 | 1200 | 4.89 M | — |
+
+The shipped `(800, 400)` configuration is **6.3%** low here against **~53%** at
+Δz = 50 m — roughly 8× less sensitive for a 2× refinement. `(1200, 1200)` is
+0.37% from the largest domain, so `L_fault` relaxes from 4·`l_f` to 3·`l_f`.
+
+**Why this is believable: the control.** The study had to use `:toeplitz` (the
+exact build at `(1600, 1200)` and Δz = 25 m is 2,178 columns ≈ 94 h), and the
+reconstruction assumes translation invariance — which truncation is precisely
+what breaks. A Toeplitz `K` could therefore be structurally under-sensitive to
+domain size and manufacture this result. Run `... control` to test it: the same
+`:toeplitz` build on the published Δz = 50 m configurations gives
+
+| `L_normal` | `:toeplitz` | `:exact` (published) |
+|---|---|---|
+| 400 | **45.33%** | **45.31%** |
+| 800 | **5.45%** | **5.44%** |
+
+— the exact sensitivity to 0.02 percentage points, and absolute `V_max` to
+0.02-0.06%. It tracks truncation faithfully. (This is also an independent
+validation of `:toeplitz` as the default, on a quantity it was never tuned for.)
+
+**Consequence for the Δz = 10 m production run.** DOF ∝ `L_normal·L_fault²/Δz³`:
+
+| domain at Δz = 10 m | DOF | `A`+`HP_DSAT` |
+|---|---|---|
+| (1600, 1200) — the Δz = 50 m requirement | 74.8 M | ~116 GB |
+| **(1200, 1200) — sufficient at Δz = 25 m** | **42.2 M** | **~65 GB** |
+
+Memory is the binding constraint for that run, so this is a 1.8× saving on the
+quantity that binds. The trend is toward *less* sensitivity at finer Δz, so
+`(1200, 1200)` should be safe at 10 m — but that is an extrapolation from two
+resolutions, not a measurement, and `(1200, 800)` was never tested.
+
 ## Known limitations
 
 These are properties of the current approach, not loose ends to tidy.
@@ -780,22 +829,88 @@ These are properties of the current approach, not loose ends to tidy.
    preconditioned, threaded CG the fallback if the volume discretization is
    kept. **This is the one open blocker**; everything else in this file is now
    either done or a documented, bounded caveat.
-3. **The Peaceman variant drives σ̄ negative at the well cell.** At Δz = 50 m
-   pressure there reaches 25.85 MPa against σ = 25 MPa, so `σ̄ = σ - p` goes
-   to −0.85 MPa and the `σ̄_min` floor binds. This is not a numerical
-   artefact: the point-source solution is logarithmically singular, so the
-   well-cell pressure *rises* as Δz shrinks (eq. 25 at `r_e = 0.198Δz` gives
-   ~29 MPa at Δz = 50 m and ~44 MPa at the specified Δz = 10 m). Physically
-   the fault fully unclamps and eq. 3's no-opening condition stops applying.
-   The solution stays bounded because slip relieves the shear stress as fast
-   as the strength drops (τ₂ → 600 Pa at that node), but those nodes are
-   outside the model's stated range of validity. `effective_stress_report`
-   flags it; the GS variant never gets there.
-4. **Peaceman well-cell pressure is ~10% below eq. 25** at the equivalent
-   radius, while matching to under 1% for r ≥ 50 m. The `r_e = 0.198Δz`
-   calibration is derived for steady radial flow; this is a transient. Worth
-   revisiting against the benchmark's suggested alternatives (implicit or
-   Gaussian-eliminated well pressure) if the well-cell value matters.
+3. **The Peaceman variant drives σ̄ negative at the well cell** — and the
+   *extent* of that is bounded, which the earlier version of this entry did not
+   say. Measured well-cell pressure is 25.85 MPa at Δz = 50 m against
+   σ = 25 MPa, so `σ̄` goes to −0.87 MPa and the `σ̄_min` floor binds. It is not
+   a numerical artefact: eq. 25 is logarithmically singular, so the well-cell
+   value rises steeply as Δz shrinks — **−7.5 MPa at Δz = 25 m and −16.3 MPa at
+   the benchmark's Δz = 10 m**. There the fault fully unclamps and eq. 3's
+   no-opening condition stops applying.
+
+   **But the unclamped region is a disc of fixed physical radius ≈ 15 m**, set
+   by where eq. 25 crosses σ and therefore independent of Δz. Refining does not
+   enlarge it, only resolves it: ~0.3 cells across at Δz = 50 m, ~1.5 at
+   Δz = 10 m. Against `l_f` = 400 m that is a localized defect in BP8-PW's own
+   point-source specification, not a discretization problem. The solution stays
+   bounded because slip relieves shear stress as fast as strength drops.
+   `effective_stress_report` now reports `nodes`, `fraction` and `radius` rather
+   than only an evaluation count; the GS variant never reaches the floor.
+
+   **It also has a runtime cost that was not previously recorded, and at
+   Δz = 10 m that cost — not the `K` build — is the binding constraint for
+   BP8-PW.** The floored node makes `V ~ exp(τ/aσ̄)` stiff, and `run_bp8`'s
+   default `Tsit5` is explicit. Measured over 100 h, `L_fault` = 800,
+   `L_normal` = 400:
+
+   | Δz | wall | accepted steps | σ̄_lowest | unclamped |
+   |---|---|---|---|---|
+   | 50 m | 17.4 s | 31,249 | −0.85 MPa | 1 / 289 |
+   | 25 m | **4901 s** | **488,885** | −7.47 MPa | 1 / 1089 |
+
+   Steps grow **15.6× for a 2× refinement (≈ Δz⁻⁴)**; wall-clock grows 282×
+   because the dense `K` mat-vec per step also grows as `nf²`. Extrapolated to
+   Δz = 10 m that is **order weeks-to-months** for the coupled integration alone
+   — against ~1-4 days for the `K` build. (Two-point fit; indicative.)
+
+   **The cause is confirmed by control, not assumed.** The Gaussian variant on
+   an identical grid and duration takes **405** steps against Peaceman's 31,249
+   — a 77× difference whose only distinguishing feature is whether the σ̄ floor
+   is reached. BP8-GS is therefore unaffected; this is specific to BP8-PW.
+
+   Note this **supersedes "the `K` build is ~98-99.8% of the run cost"** wherever
+   that appears: it was measured on the Gaussian variant, where the integration
+   really is free.
+
+   A stiff integrator is the obvious remedy and is *probably* the right one —
+   the node reaching a quasi-equilibrium (τ → 600 Pa) is the signature of a fast
+   mode decaying to a slow manifold, which implicit methods handle. But it is
+   **not yet demonstrated**: a first probe with `Rosenbrock23` was still running
+   on the *easy* Gaussian case after 90 s, because the RHS carries a dense `K`
+   mat-vec, a nested Newton friction solve per node, and a non-smooth
+   `max(σ̄, σ̄_min)` — an expensive and badly-behaved Jacobian. Making this work
+   likely needs a Jacobian-free Newton-Krylov approach rather than a stock
+   solver, and that is a design decision, not an increment.
+4. **~~Peaceman well-cell pressure is ~10% below eq. 25~~ — RESOLVED; it was a
+   measurement artefact, not a model error.** The cell was being compared
+   against eq. 25 at `r_e = 0.198Δz`, which is **Peaceman's constant for a
+   centred five-point stencil**. This code uses a wider SBP order-4 Laplacian,
+   whose well cell represents `r_e ≈ 0.268Δz` — measured by inverting eq. 25
+   against the numeric cell pressure at two resolutions (0.2716 at Δz = 100 m,
+   0.2687 at Δz = 50 m, t = 100 h). At the right radius the agreement is exact.
+
+   The residual time dependence (0.3275 → 0.2716 over 10 → 100 h) is the
+   transient the old entry blamed, but it is secondary and it collapses on
+   `Δz²/(4αt)`: Δz = 100 m at 30 h and Δz = 50 m at 10 h give 0.2865 and 0.2883
+   at nearly equal group despite 2× different resolution. As that group → 0 the
+   near-well flow becomes quasi-steady and the factor tends to ≈ 0.268.
+
+   **This is what §2.1.2 actually asks for.** It states the equivalent radius is
+   "discretization-dependent (and consequently, the model output
+   mesh-independent)", gives `0.198Δx` only as an *example* for the five-point
+   stencil, quotes `0.208√A` for finite volumes, and refers participants to the
+   literature for other schemes. So 0.198 was never mandated; using it with a
+   wider SBP operator is a misreading of the spec, and it breaks exactly the
+   mesh-independence the construction exists to provide. `r_e/Δz` measuring
+   constant across resolutions is that mesh-independence.
+
+   `PorePressure.SBP4_RE_FACTOR` carries the value and **`well_index` now
+   defaults to it**, which lowers `WI` ~6% against the five-point number. Pass
+   `r_e_factor=0.198` to reproduce a run made the old way.
+
+   The benchmark says **nothing** about σ̄ going negative (limitation 3) or about
+   time integration and stiffness — both are gaps in the specification, not
+   corners this implementation wandered into.
 5. **Order 6 is unusable, and the cause is upstream.** `standard_diagonal.toml`
    provides, per stencil set: orders 2 and 4 have `H`, `e`, `d1`, `D1`, `D2`,
    `D2variable`; **order 6 has only `H`, `e`, `d1` and `D2.positivity`** — no

@@ -54,57 +54,71 @@ is not a dependency**; the experiments live in a scratch environment.
   but `:toeplitz` largely dissolves it again. Revisit after the item below.
 - **Housekeeping:** `diffinitive_registry` is still in `~/.julia/registries`.
 
-## Agreed next steps (2026-08-20, revised) — items 1 and 2 DONE
+## State as of 2026-08-20 (end of session)
 
-1. **[x] Validate `:toeplitz` at a finer Δz.** Done, and it passes in the
-   *opposite* direction from the concern. `scripts/k_toeplitz_resolution.jl`,
-   matched pair at fixed small domain, full 30 days:
+Everything below the "Done" heading is history. This is where things actually
+stand.
 
-   | Δz | Ω_f | exact solves | `K` Frob. err | **`V_max(t)` worst** |
-   |---|---|---|---|---|
-   | 50 m | 17×17 | 578 | 0.0155% | 5.7767% |
-   | 25 m | 33×33 | 2,178 | 0.0034% | **0.8743%** |
+### Closed this session
 
-   The error **falls 6.6× under refinement**. The discrete kernel converges
-   toward the smooth continuum one, so translation invariance — the premise of
-   the whole reconstruction — holds *better* on finer grids. Amplification from
-   matrix error into `V_max` is comparable at both resolutions (373×, 257×),
-   which is the consistency check.
+1. **[x] `:toeplitz` validated at finer Δz and made the default.** Error *falls*
+   6.6× under refinement (5.78% → 0.87%, small domain, 30 d). Independently
+   re-validated by the domain control below, which reproduces the exact build's
+   truncation sensitivity to 0.02 percentage points.
+2. **[x] Preconditioning measured and rejected.** Jacobi 0.92×; AMG 3-8× slower
+   and *not* mesh-independent (`iters ∝ DOF^0.31` vs plain CG's 0.264), with a
+   computable break-even ceiling of ~1.03× even with an ideal smoother.
+   `PERFORMANCE.md` §6. `precond=:none|:jacobi` ships so the dead ends stay
+   visible; AlgebraicMultigrid is **not** a dependency.
+3. **[x] Domain requirement re-measured at Δz = 25 m — it relaxes.** `(1200,
+   1200)` is 0.37% from converged, against a Δz = 50 m requirement of `(1600,
+   1200)`. Takes the Δz = 10 m footprint from ~116 GB to **~65 GB**. See
+   `PROGRESS.md` "Domain requirement relaxes with resolution".
+4. **[x] Peaceman limitation 4 resolved** — it was a measurement artefact.
+   `r_e = 0.198Δz` is a *five-point* constant; the measured value for this SBP
+   order-4 operator is `SBP4_RE_FACTOR ≈ 0.268`, and §2.1.2 explicitly asks for
+   the radius appropriate to your discretization. `well_index` now defaults to
+   it.
+5. **[x] Peaceman limitation 3 bounded and half-fixed.** The unclamped patch is
+   a disc of radius ≈ 15 m *independent of Δz* (confirmed: exactly 1 node at
+   both Δz = 50 and 25 m). `effective_stress_report` now reports `nodes`,
+   `fraction`, `radius`. The dense-output blowup is fixed
+   (`save_everystep=false`, 284 MB → 1.1 MB).
 
-2. **[x] `:toeplitz` is now the default** (`build_model`). Its error shrinks
-   along both axes production moves along: 5.78% (small domain, Δz = 50 m) →
-   0.41% (converged domain) → 0.87% (Δz = 25 m). Every configuration that will
-   be run is more favourable than the ones measured, and all sit far below the
-   resolution error.
+### The two things standing between here and a Δz = 10 m submission
 
-   **Scripts that measure the approximation now pin `stiffness=:exact`
-   explicitly** — `k_toeplitz_{structure,validate,symmetrise,resolution}.jl`,
-   `bp8_domain_convergence.jl`, `bp8_validate_pressure.jl`. Without that they
-   would silently take a Toeplitz `K` as their own reference. Anything new that
-   compares against the exact build must do the same.
+1. **[ ] Memory: ~65 GB for `A`+`HP_DSAT`.** The 15 GB workstation cannot hold
+   it. This is now the *only* blocker for BP8-GS, and it is a single-node
+   requirement — `:toeplitz` removed the multi-node one. The `K` build itself is
+   ~1-4 days (extrapolation spread; `DOF^1.56` vs `DOF^1.80` bracket it).
+2. **[ ] BP8-PW is stiffness-bound, and this is unsolved.** The floored well
+   cell makes the coupled integration cost `≈ Δz⁻⁴` in steps: 31,249 steps
+   (17 s) at Δz = 50 m, **488,885 steps (4,901 s)** at Δz = 25 m. Extrapolated
+   to Δz = 10 m that is **weeks-to-months** — larger than the `K` build.
+   Confirmed as stiffness by control: the Gaussian variant takes **405** steps
+   on an identical grid.
 
-3. **[ ] Multi-node parallelism — no longer needed for the target run.** With
-   `:toeplitz`, Δz = 20 m converged is ~10 solves ≈ **2.5-3 h on one node**
-   against `:exact`'s ~17 days. Memory (~15 GB for `A`+`HP_DSAT`) becomes the
-   binding constraint, and it is a single-node constraint. Keep this item only
-   if a future result forces `:exact` back.
+   A stiff integrator is the likely remedy but is **not demonstrated**. A
+   `Rosenbrock23` probe was still running on the *easy* Gaussian case after 90 s,
+   because the RHS carries a dense `K` mat-vec, a nested Newton friction solve
+   per node, and a non-smooth `max(σ̄, σ̄_min)`. Doing this properly probably
+   means Jacobian-free Newton-Krylov — a design decision, not an increment, and
+   deliberately not started.
 
-4. **[ ] Run production at the converged domain and Δz = 20 m.** Now the
-   critical path. Needs a machine with >15 GB — the 15 GB workstation cannot
-   hold `A` at that resolution, which is the one remaining hardware blocker.
-   This is what regenerates `output/` and retires the ~53% `V_max` domain bias.
+   **The benchmark description is silent on both stiffness and σ̄ < 0** (checked
+   directly against the PDF). These are gaps in the specification.
 
-### Measured cost, for sizing the production run
+   Note this supersedes "the `K` build is ~98-99.8% of run cost" wherever it
+   appears — that was measured on the Gaussian variant.
 
-At Δz = 25 m, small domain (430,950 DOF), 12 threads:
+### Smaller items, unchanged
 
-- assembly 179 s; exact `K` **7,643 s** for 2,178 solves (271 mean CG
-  iterations, 0 unconverged)
-- the two coupled 30-day integrations: **11.4 s and 8.9 s**
-
-So the `K` build is **99.8%** of the cost — more dominant than §4b's "~98%".
-Everything downstream of `K` is free. `t_solve ∝ DOF^1.56` (§3) predicted the
-build to within a few percent, so it can be trusted for the Δz = 20 m estimate.
+- [ ] **Order 6** — blocked upstream; needs Mattsson's coefficients in
+  Diffinitive's `standard_diagonal.toml`.
+- [ ] **Variable coefficients** — a foreclosed capability, not a defect.
+- [ ] **CRESCENT DET upload** — files are written in the §4 formats but nothing
+  has been validated against the server's parser.
+- [ ] **Housekeeping:** `diffinitive_registry` is still in `~/.julia/registries`.
 
 ## Done
 

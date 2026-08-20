@@ -58,14 +58,14 @@ boundary would bias. A configuration that fails — too coarse for the SBP
 closure, or out of memory — is warned about and skipped rather than aborting
 the rest, since the expensive rows are the ones most likely to fail.
 """
-function sweep(configs, Δz)
+function sweep(configs, Δz; stiffness=:exact)
     results = NamedTuple[]
     for cfg in configs
-        @info "building" Δz cfg...
+        @info "building" Δz cfg... stiffness
         flush(stdout)
         try
             t0 = time()
-            m = build_model(; Δz, cfg.L_fault, cfg.L_normal, stiffness=:exact)
+            m = build_model(; Δz, cfg.L_fault, cfg.L_normal, stiffness)
             t_build = time() - t0
             sol = run_bp8(m; tspan=(0.0, T_END), saveat=3600.0)
             c = evaluate!(m, sol.u[end], sol.t[end])
@@ -139,7 +139,59 @@ fault_configs = [(L_fault=800.0, L_normal=1200.0),
                  (L_fault=1200.0, L_normal=1200.0),
                  (L_fault=1600.0, L_normal=1200.0)]
 
-# Which studies to run: "lfault", "lnormal", "mirror", or "all" (default).
+# Fourth study: DOES THE DOMAIN REQUIREMENT TRANSFER TO FINER Δz?
+#
+# The requirement (L_fault ≥ 4·l_f, L_normal ≥ 3·l_f) was measured at Δz = 50 m.
+# Theory says it should transfer: truncation is a continuum effect, a function of
+# L/l_f and the 1/r³ kernel decay, with nothing in it that refers to the grid.
+# But that is an argument, not a measurement, and it could fail in either
+# direction — at Δz = 50 m the process zone is 1.3 cells, so the rupture front is
+# smeared and peak V is indicative-only; a sharper front at finer Δz means more
+# slip and potentially MORE far-field transfer, i.e. a LARGER requirement.
+#
+# The payoff is large either way, because DOF ∝ L_normal·L_fault²/Δz³. At
+# Δz = 10 m, relaxing (1600, 1200) to (1200, 800) takes 74.8 M DOF to 28.2 M —
+# ~116 GB to ~44 GB, the difference between needing a large-memory node and an
+# ordinary one.
+#
+# **This study uses `:toeplitz`, and that is a real caveat.** The exact build at
+# (1600, 1200) and Δz = 25 m is 2,178 columns ≈ 94 h; 10 solves makes it minutes.
+# But the Toeplitz error itself VARIES with domain size (5.78% small → 0.41%
+# converged at Δz = 50 m), so it contaminates exactly the quantity being
+# measured. The contamination is bounded by the Δz = 25 m small-domain figure of
+# **0.87%**, and shrinks as the domain grows, against domain effects of ~5-13%.
+# Usable — but read any difference below ~1% as noise, not signal.
+const RES_STUDY_Δz = 25.0
+res_configs = [(L_fault=800.0, L_normal=400.0),
+               (L_fault=800.0, L_normal=800.0),
+               (L_fault=800.0, L_normal=1200.0),
+               (L_fault=1200.0, L_normal=1200.0),
+               (L_fault=1600.0, L_normal=1200.0)]   # 4.89 M DOF, ~7 GB — the ceiling here
+
+# CONTROL for the resolution study: does a Toeplitz K preserve domain
+# sensitivity at all?
+#
+# The resolution study above uses `:toeplitz` out of necessity, but the
+# reconstruction assumes translation invariance — and boundary truncation is
+# exactly what breaks translation invariance. A Toeplitz K could therefore be
+# STRUCTURALLY under-sensitive to domain size, flattening that sweep and
+# manufacturing the very conclusion it is being used to test. The sampled
+# columns do come from the truncated domain, so the sensitivity is not zero, but
+# "not zero" is not "correct".
+#
+# This runs the SAME configurations as the published Δz = 50 m fault-normal
+# study, where `:exact` is only 578 columns and the exact answers are already in
+# PROGRESS.md: d(V_max) = 45.31% at L_normal = 400 and 5.44% at 800, against the
+# 1600 m row. If `:toeplitz` reproduces that shape, it tracks truncation and the
+# Δz = 25 m table can be believed. If it returns much smaller changes, it damps
+# truncation and that table is an artefact.
+const CONTROL_Δz = 50.0
+control_configs = [(L_fault=800.0, L_normal=400.0),
+                   (L_fault=800.0, L_normal=800.0),
+                   (L_fault=800.0, L_normal=1600.0)]
+
+# Which studies to run: "lfault", "lnormal", "mirror", "resolution", "control",
+# or "all".
 # The first two take ~40 min combined and are already published in PROGRESS.md,
 # so the usual invocation while iterating on the third is `... mirror`.
 const WHICH = isempty(ARGS) ? "all" : lowercase(ARGS[1])
@@ -161,6 +213,33 @@ if runs("lnormal")
     `V_max` does settle: successive steps shrink and Richardson on the last pair
     lands 0.13% beyond it. Slow convergence is physical — the elastostatic
     kernel decays as 1/r³ — not a numerical defect.""")
+end
+
+if runs("control")
+    control_results = sweep(control_configs, CONTROL_Δz; stiffness=:toeplitz)
+    report(control_results, "CONTROL: :toeplitz on the published Δz = 50 m configurations",
+           CONTROL_Δz; ref_label="L_normal = 1600 m")
+    println("""
+    Exact values for these same rows (PROGRESS.md, :exact build):
+        L_normal =  400  ->  V_max 1.66456e-7,  d(V_max) 45.31%
+        L_normal =  800  ->  V_max 2.87795e-7,  d(V_max)  5.44%
+        L_normal = 1600  ->  V_max 3.04360e-7,  d(V_max)     —
+    Matching d(V_max) means :toeplitz tracks truncation and the Δz = 25 m
+    resolution study is trustworthy. Much smaller d(V_max) means it damps
+    truncation, and that study must be redone with :exact or discarded.""")
+end
+
+if runs("resolution")
+    res_results = sweep(res_configs, RES_STUDY_Δz; stiffness=:toeplitz)
+    report(res_results, "BP8-QD-GS domain requirement at Δz = 25 m (:toeplitz K)",
+           RES_STUDY_Δz; ref_label="the largest domain that fitted")
+    println("""
+    Compare the shape of the last column against the Δz = 50 m studies above,
+    not the absolute values. If the relative changes across these rows track the
+    Δz = 50 m ones, the domain requirement transfers and (1600, 1200) stands at
+    Δz = 10 m. If they are markedly smaller, a cheaper domain may suffice and the
+    Δz = 10 m memory estimate drops with it. Differences below ~1% are within the
+    Toeplitz contamination bound and mean nothing.""")
 end
 
 if runs("mirror")

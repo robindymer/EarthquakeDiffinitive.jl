@@ -6,6 +6,7 @@
 #   julia --project=. scripts/bp8_validate_pressure.jl
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.BP8
+using EarthquakeDiffinitive.PorePressure: SBP4_RE_FACTOR
 using Printf
 
 const T_CHECK = 100 * 3600.0    # t_off; well inside t ≪ l_f²/4α ≈ 220 h
@@ -24,8 +25,12 @@ function check(injection, Δz)
     for i in i0:n2
         r = abs(m.x2[i])
         num = p[i+(j0-1)*n2]
+        # The well cell is compared at the equivalent radius its pressure actually
+        # represents. That is SBP4_RE_FACTOR ≈ 0.268Δz for this operator, NOT
+        # Peaceman's five-point 0.198Δz — using the latter is what produced the
+        # "~10% low" reading recorded as PROGRESS.md limitation 4.
         ana = injection === :gaussian ? analytic_pressure_gaussian(r, T_CHECK, m.par) :
-              analytic_pressure_point(max(r, 0.198Δz), T_CHECK, m.par)
+              analytic_pressure_point(max(r, SBP4_RE_FACTOR * Δz), T_CHECK, m.par)
         push!(rows, (; r, num, ana))
     end
     return m, rows
@@ -45,7 +50,9 @@ for injection in (:gaussian, :peaceman), Δz in (100.0, 50.0)
     if injection === :peaceman
         rep = effective_stress_report(m)
         @printf("  effective normal stress: lowest σ̄ = %.4f MPa, floor bound %s\n",
-                rep.σ̄_lowest / 1e6, rep.bound ? "YES ($(rep.floor_hits) evaluations)" : "no")
+                rep.σ̄_lowest / 1e6, rep.bound ? "YES" : "no")
+        rep.bound && @printf("  unclamped patch: %d of %d nodes (%.2f%% of Ω_f), radius %.1f m\n",
+                             rep.nodes, m.nf, 100rep.fraction, rep.radius)
     end
 end
 
@@ -57,8 +64,11 @@ Notes
   only marginally and Δz = 100 m not at all — the near-source error shrinks
   quickly with resolution, which is the point of the comparison.
 * The point-source solution is singular at r = 0, so the Peaceman row at r = 0
-  is compared at the equivalent radius r_e = 0.198Δz, which is what the well
-  cell's pressure is supposed to represent.
+  is compared at the equivalent radius the well cell's pressure represents.
+  That is r_e ≈ 0.268Δz for this SBP order-4 operator (`SBP4_RE_FACTOR`),
+  measured by inverting eq. 25; Peaceman's 0.198Δz is a five-point-stencil
+  constant and reading the cell against it understates the cell by ~10%.
+  `WI` itself still uses 0.198 — see `well_index`'s docstring for why.
 * Both analytic solutions assume an unbounded fault; ours has no-flux edges at
   |x2|,|x3| = 400 m, so agreement degrades near the boundary and for later t.
 """)

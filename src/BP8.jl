@@ -111,9 +111,14 @@ mutable struct Cache
     Vprev::Vector{Float64}
     σ̄_lowest::Float64   # smallest σ̄ = σ - p seen, BEFORE the floor is applied
     floor_hits::Int     # how many times that floor actually bound
+    # WHICH nodes were ever unclamped, not just how many evaluations hit the
+    # floor. `floor_hits` counts RHS evaluations, so it scales with the
+    # integrator's step count and says nothing about how much of the fault is
+    # affected — the question a reader of the limitation actually has.
+    floor_nodes::BitVector
 end
 Cache(nf) = Cache(zeros(2nf), zeros(nf), zeros(nf), zeros(nf), zeros(nf), zeros(nf),
-                  fill(1e-12, nf), Inf, 0)
+                  fill(1e-12, nf), Inf, 0, falses(nf))
 
 """
     BP8Model
@@ -259,16 +264,35 @@ state_length(m::BP8Model) = 4m.nf + (m.injection === :peaceman ? 1 : 0)
 """
     effective_stress_report(m) -> NamedTuple
 
-Whether the effective-normal-stress floor `par.σ̄_min` ever bound, and how low
-`σ̄ = σ - p` actually went. `σ̄ ≤ 0` means fluid pressure has fully unclamped
-the fault, at which point BP8's no-opening condition (eq. 3) no longer holds
-and the model is outside its range of validity — worth knowing about rather
-than silently clamping. The Peaceman-well variant reaches this at Table 1's
-parameters; the Gaussian-source variant does not.
+Whether the effective-normal-stress floor `par.σ̄_min` ever bound, how low
+`σ̄ = σ - p` went, and — the part that decides whether it matters — **how much
+of the fault was affected**. `σ̄ ≤ 0` means fluid pressure has fully unclamped
+the fault, at which point BP8's no-opening condition (eq. 3) no longer holds and
+the model is outside its range of validity. The Peaceman-well variant reaches
+this at Table 1's parameters; the Gaussian-source variant does not.
+
+`nodes` and `radius` are what bound the damage. The unclamped region is a disc
+whose *physical* radius is set by where eq. 25's pressure crosses `σ` — about
+**15 m** at Table 1's parameters — and is therefore **independent of Δz**.
+Refining the grid does not enlarge it, it only resolves it: ~0.3 cells across at
+Δz = 50 m, ~1.5 at Δz = 10 m. So the well-cell `σ̄` falls steeply with resolution
+(−0.87 MPa at 50 m, −16.3 MPa at 10 m) while the affected *area* does not grow.
+Against `l_f` = 400 m that is a localized defect in BP8-PW's own point-source
+specification, not a discretization problem and not one that contaminates the
+fault at large. See `PROGRESS.md` "Known limitations" 3.
+
+`floor_hits` counts RHS **evaluations**, so it scales with the integrator's step
+count and is not a measure of extent; use `nodes` for that.
 """
-effective_stress_report(m::BP8Model) =
-    (; σ̄_lowest=m.cache.σ̄_lowest, floor_hits=m.cache.floor_hits,
-       floor=m.par.σ̄_min, bound=m.cache.floor_hits > 0)
+function effective_stress_report(m::BP8Model)
+    idx = findall(m.cache.floor_nodes)
+    n2 = length(m.x2)
+    radius = isempty(idx) ? 0.0 :
+        maximum(hypot(m.x2[mod1(i, n2)], m.x3[(i - 1) ÷ n2 + 1]) for i in idx)
+    return (; σ̄_lowest=m.cache.σ̄_lowest, floor_hits=m.cache.floor_hits,
+              floor=m.par.σ̄_min, bound=m.cache.floor_hits > 0,
+              nodes=length(idx), fraction=length(idx) / m.nf, radius)
+end
 
 """
     process_zone(par, σ̄) = μ·D_RS/(b·σ̄)
@@ -352,7 +376,10 @@ function evaluate!(m::BP8Model, u, t)
         end
         σ̄_raw = p.σ0 - pres[i]
         σ̄_raw < c.σ̄_lowest && (c.σ̄_lowest = σ̄_raw)
-        σ̄_raw < p.σ̄_min && (c.floor_hits += 1)
+        if σ̄_raw < p.σ̄_min
+            c.floor_hits += 1
+            c.floor_nodes[i] = true
+        end
         σ̄ = max(σ̄_raw, p.σ̄_min)
         θ = exp(ϕ[i])
         Δτv = SVector(c.Δτ[i], c.Δτ[nf+i])
@@ -424,9 +451,21 @@ function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=Tsit5(), reltol=1e-8,
 
     prob = ODEProblem(rhs!, u0, tspan, m)
     t0 = time()
-    sol = solve(prob, alg; reltol, abstol, saveat, save_everystep=true,
+    # `save_everystep=false`: `saveat` already defines the output grid, and
+    # storing every accepted step on top of it is what made the Peaceman variant
+    # blow up. Measured at Δz = 50 m over 100 h: 31,249 accepted steps for 101
+    # wanted outputs, 284 MB against 1.1 MB — and the stiffness that drives that
+    # step count grows steeply as Δz shrinks (a Δz = 25 m run reached 7.9 GB
+    # without finishing; see `PROGRESS.md` limitation 3).
+    #
+    # `sol(t)` still works: on the `saveat` grid it is bit-identical, and
+    # `write_profiles`' default `profile_dt` equals the default `saveat`, so the
+    # shipped path only ever asks for on-grid times. A `profile_dt` that is not
+    # a multiple of `saveat` interpolates across hour-wide gaps instead of
+    # actual steps — measured at 1.3e-5 relative, negligible here but not zero.
+    sol = solve(prob, alg; reltol, abstol, saveat, save_everystep=false,
                 tstops=[m.par.t_off], kwargs...)
-    verbose && @info "integration finished" seconds = round(time() - t0, digits=1) steps = length(sol.t) retcode = sol.retcode
+    verbose && @info "integration finished" seconds = round(time() - t0, digits=1) saved = length(sol.t) steps = sol.stats.naccept retcode = sol.retcode
     return sol
 end
 
