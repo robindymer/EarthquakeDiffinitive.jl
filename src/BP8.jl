@@ -156,12 +156,19 @@ have to be comfortably larger than `l_f`; see the §6 domain-size study.
 The expensive part is `fault_stiffness`, which does `2·N_Ωf` CG solves of the
 assembled 3D elastic system.
 
-`stiffness` selects how `K` is built. `:exact` (default) does all `2·N_Ωf`
-solves. `:toeplitz` does **10**, expanding 5 sources by the whole-space kernel's
-translation invariance — 0.41% worst-case in `V_max(t)` over 30 days at the
-converged domain, for a cost that no longer grows with resolution at all. That
-removes the term which dominates runtime and scales as Δz⁻². See
-[`fault_stiffness_toeplitz`](@ref) and `PERFORMANCE.md` §4b.
+`stiffness` selects how `K` is built. **`:toeplitz` is the default**: it does
+**10** solves, expanding 5 sources by the whole-space kernel's translation
+invariance, instead of `2·N_Ωf`. `:exact` does all `2·N_Ωf` and remains available
+as the reference — use it whenever you are measuring the approximation itself.
+
+It is an approximation, and the case for defaulting to it is that its error is
+bounded and shrinks along **both** axes production moves along
+(`PERFORMANCE.md` §4b): 5.78% at the small domain and Δz = 50 m, **0.41%** at the
+converged domain, **0.87%** at Δz = 25 m. Every configuration that will actually
+be run is more favourable than the ones measured, and all of them sit far below
+the resolution error. The cost difference at the Δz = 20 m target is ~17 days
+against ~3 h on one node, which is the difference between the run happening on a
+single machine and needing a cluster.
 
 `precond` is forwarded to [`CGSolver`](@ref) and selects the preconditioner for
 each solve. It is an **independent** axis from `stiffness`: `stiffness` sets how
@@ -172,7 +179,7 @@ than none, and exists so that stays visible rather than being rediscovered.
 function build_model(; par::BP8Params=benchmark_parameters(),
                      Δz=par.Δz, L_fault=3par.l_f, L_normal=2par.l_f,
                      injection=:gaussian, order=4, verbose=false,
-                     stiffness=:exact,
+                     stiffness=:toeplitz,
                      solver_kwargs...)
     injection ∈ (:gaussian, :peaceman) ||
         error("injection must be :gaussian or :peaceman, got $injection")

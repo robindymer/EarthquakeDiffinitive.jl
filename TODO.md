@@ -54,18 +54,57 @@ is not a dependency**; the experiments live in a scratch environment.
   but `:toeplitz` largely dissolves it again. Revisit after the item below.
 - **Housekeeping:** `diffinitive_registry` is still in `~/.julia/registries`.
 
-## Agreed next steps (2026-08-20, revised)
+## Agreed next steps (2026-08-20, revised) — items 1 and 2 DONE
 
-1. **Validate `:toeplitz` at a finer Δz — the one remaining gate.**
-   **Cost correction:** TODO previously called this "~2.4 h". That figure is for
-   the *small* domain. At the converged domain Δz = 25 m is 4.9 M DOF, ~7 GB and
-   **~77 h** (`PERFORMANCE.md` §4) — not feasible on a 15 GB workstation.
-   The affordable and still-meaningful experiment is a **matched pair at fixed
-   (small) domain**: Δz = 50 m already scores 5.7767% there over 30 days, so
-   re-running at Δz = 25 m answers the actual question — *does the Toeplitz error
-   grow with resolution?* — while holding the domain fixed. ~1.5-2 h.
-2. **Then decide `:toeplitz` as default.** Gated on (1).
-3. **Multi-node over the RHSs**, only if (2) goes against `:toeplitz`.
+1. **[x] Validate `:toeplitz` at a finer Δz.** Done, and it passes in the
+   *opposite* direction from the concern. `scripts/k_toeplitz_resolution.jl`,
+   matched pair at fixed small domain, full 30 days:
+
+   | Δz | Ω_f | exact solves | `K` Frob. err | **`V_max(t)` worst** |
+   |---|---|---|---|---|
+   | 50 m | 17×17 | 578 | 0.0155% | 5.7767% |
+   | 25 m | 33×33 | 2,178 | 0.0034% | **0.8743%** |
+
+   The error **falls 6.6× under refinement**. The discrete kernel converges
+   toward the smooth continuum one, so translation invariance — the premise of
+   the whole reconstruction — holds *better* on finer grids. Amplification from
+   matrix error into `V_max` is comparable at both resolutions (373×, 257×),
+   which is the consistency check.
+
+2. **[x] `:toeplitz` is now the default** (`build_model`). Its error shrinks
+   along both axes production moves along: 5.78% (small domain, Δz = 50 m) →
+   0.41% (converged domain) → 0.87% (Δz = 25 m). Every configuration that will
+   be run is more favourable than the ones measured, and all sit far below the
+   resolution error.
+
+   **Scripts that measure the approximation now pin `stiffness=:exact`
+   explicitly** — `k_toeplitz_{structure,validate,symmetrise,resolution}.jl`,
+   `bp8_domain_convergence.jl`, `bp8_validate_pressure.jl`. Without that they
+   would silently take a Toeplitz `K` as their own reference. Anything new that
+   compares against the exact build must do the same.
+
+3. **[ ] Multi-node parallelism — no longer needed for the target run.** With
+   `:toeplitz`, Δz = 20 m converged is ~10 solves ≈ **2.5-3 h on one node**
+   against `:exact`'s ~17 days. Memory (~15 GB for `A`+`HP_DSAT`) becomes the
+   binding constraint, and it is a single-node constraint. Keep this item only
+   if a future result forces `:exact` back.
+
+4. **[ ] Run production at the converged domain and Δz = 20 m.** Now the
+   critical path. Needs a machine with >15 GB — the 15 GB workstation cannot
+   hold `A` at that resolution, which is the one remaining hardware blocker.
+   This is what regenerates `output/` and retires the ~53% `V_max` domain bias.
+
+### Measured cost, for sizing the production run
+
+At Δz = 25 m, small domain (430,950 DOF), 12 threads:
+
+- assembly 179 s; exact `K` **7,643 s** for 2,178 solves (271 mean CG
+  iterations, 0 unconverged)
+- the two coupled 30-day integrations: **11.4 s and 8.9 s**
+
+So the `K` build is **99.8%** of the cost — more dominant than §4b's "~98%".
+Everything downstream of `K` is free. `t_solve ∝ DOF^1.56` (§3) predicted the
+build to within a few percent, so it can be trusted for the Δz = 20 m estimate.
 
 ## Done
 

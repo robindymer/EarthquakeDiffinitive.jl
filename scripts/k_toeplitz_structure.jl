@@ -27,7 +27,7 @@ L_normal = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 400.0
 
 @info "building model" Δz L_fault L_normal
 t0 = time()
-m = build_model(; Δz, L_fault, L_normal)
+m = build_model(; Δz, L_fault, L_normal, stiffness=:exact)
 @info "built" seconds = round(time() - t0, digits=1) nf = m.nf
 
 const n2, n3 = length(m.x2), length(m.x3)

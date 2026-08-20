@@ -14,7 +14,7 @@ function check(injection, Δz)
     # Pressure is one-way decoupled from elasticity (σ̄ feeds friction, nothing
     # feeds back into eq. 17), so the elastic block only has to be legal, not
     # converged — 8Δz is the smallest an SBP order-4 grid can be.
-    m = build_model(; Δz, L_fault=800.0, L_normal=8Δz, injection)
+    m = build_model(; Δz, L_fault=800.0, L_normal=8Δz, injection, stiffness=:exact)
     sol = run_bp8(m; tspan=(0.0, T_CHECK), saveat=T_CHECK)
     nf = m.nf
     p = sol.u[end][3nf+1:4nf]

@@ -65,7 +65,7 @@ function sweep(configs, Δz)
         flush(stdout)
         try
             t0 = time()
-            m = build_model(; Δz, cfg.L_fault, cfg.L_normal)
+            m = build_model(; Δz, cfg.L_fault, cfg.L_normal, stiffness=:exact)
             t_build = time() - t0
             sol = run_bp8(m; tspan=(0.0, T_END), saveat=3600.0)
             c = evaluate!(m, sol.u[end], sol.t[end])

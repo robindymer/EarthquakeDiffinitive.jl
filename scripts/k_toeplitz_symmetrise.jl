@@ -30,7 +30,7 @@ const T_END = (length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 720.0) * 3600.0
 
 @info "building model" Δz L_fault L_normal T_hours = T_END / 3600
 t0 = time()
-m = build_model(; Δz, L_fault, L_normal, verbose=true)
+m = build_model(; Δz, L_fault, L_normal, stiffness=:exact, verbose=true)
 @info "exact model ready" seconds = round(time() - t0, digits=1)
 
 const n2, n3, nf = length(m.x2), length(m.x3), m.nf

@@ -221,6 +221,44 @@ independent of resolution. That removes the dominant term from §4 entirely: the
 on one node. It also makes §5 item 1 (multi-node) largely moot, since the
 parallel work it was meant to distribute no longer exists.
 
+### Resolution transferability: settled, and it improves
+
+The last open gate. `scripts/k_toeplitz_resolution.jl`, **matched pair at fixed
+small domain**, full 30 days — holding the domain fixed so resolution is the only
+variable, because the converged domain at Δz = 25 m is 4.9 M DOF and ~77 h:
+
+| Δz | Ω_f nodes | exact solves | `K` Frobenius err | **`V_max(t)` worst** |
+|---|---|---|---|---|
+| 50 m | 17×17 | 578 | 0.0155% | **5.7767%** |
+| **25 m** | 33×33 | 2,178 | 0.0034% | **0.8743%** |
+
+**The error falls 6.6× under refinement**, and the matrix error falls 4.6× with
+it — the doubt was that the centre source's ~44% coverage gap might bite harder
+as the grid refines, and it does the opposite. The discrete kernel converges
+toward the smooth continuum one, so translation invariance holds *better*, not
+worse. Amplification from matrix error into `V_max` is comparable at both
+resolutions (373× and 257×), which is the consistency check on the claim.
+
+So the approximation improves along **both** axes that production moves along —
+domain size (5.78% → 0.41% small → converged at Δz = 50 m) and resolution
+(5.78% → 0.87% at 50 → 25 m). Every configuration that will actually be run is
+more favourable than the ones measured.
+
+**What this does to the production estimate.** The exact build at Δz = 25 m,
+small domain took **7,643 s** for 2,178 solves (271 mean CG iterations, 0
+unconverged) on 12 threads. `:toeplitz` needs 10 solves for the same `K`. At the
+Δz = 20 m converged target (9.5 M DOF, §4), extrapolating `t_solve ∝ DOF^1.56`
+gives ~880 s per solve, so:
+
+| build | solves | one node |
+|---|---|---|
+| `:exact` | 3,362 | **~17 days** |
+| `:toeplitz` | **10** | **~2.5-3 h** |
+
+Memory (~15 GB for `A`+`HP_DSAT`), not time, becomes the binding constraint —
+and it is a single-node constraint, not a cluster one. This is what removes the
+multi-node requirement rather than merely deferring it.
+
 **Caveats before relying on it.** Validated at Δz = 50 m, at both the small and
 the converged domain. **Not** yet validated at a finer Δz — the centre source
 covers ~56% of separations (the rest far-field, set to zero) and that fraction

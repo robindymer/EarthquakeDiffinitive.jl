@@ -267,7 +267,14 @@ function fault_stiffness(fe::FaultElasticity; verbose=false,
         verbose && @info "fault_stiffness: threaded build" columns = ncols threads = nt
         # Strided partition: iteration counts vary a little between columns, so
         # interleaving balances the chunks better than contiguous blocks.
-        tasks = [Threads.@spawn run_columns!(t:nt:ncols, duplicate(fe.rs)) for t in 1:nt]
+        # Only task 1 reports, or 12 threads interleave their progress lines.
+        # Its ETA is representative of the whole build even though it sees just
+        # its own slice: the slices are equal-sized and run concurrently, so the
+        # time for one to finish IS the time for all of them. Without this the
+        # progress reporting only worked on the serial path, which is the one
+        # nobody runs at production size — a 2.1 h build with no visible progress.
+        tasks = [Threads.@spawn run_columns!(t:nt:ncols, duplicate(fe.rs);
+                                             progress=(verbose && t == 1)) for t in 1:nt]
         # Fold each worker's counters back so `solver_report` totals the build.
         for task in tasks
             merge_stats!(fe.rs, fetch(task))

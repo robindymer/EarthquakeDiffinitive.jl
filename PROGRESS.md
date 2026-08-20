@@ -706,11 +706,15 @@ Two things the figures make visible that the summary numbers did not:
 
 These are properties of the current approach, not loose ends to tidy.
 
-1. **The runs are not resolution-converged.** *(The original "and cannot be on
-   this machine" no longer holds: Δz = 20 m clears the `L_b/Δz ≥ 3` criterion,
-   needs ~5.5 GB, and is an overnight run on 12 cores. See `PERFORMANCE.md` §4.
-   Cluster access puts the nominal Δz = 10 m in range too, but only once the
-   `K` build can leave one node — see `TODO.md` §2.)*
+1. **The runs are not resolution-converged.** *(Status as of 2026-08-20: the
+   compute obstacle is gone, a memory one remains. Δz = 20 m clears the
+   `L_b/Δz ≥ 3` criterion. With `:toeplitz` — now `build_model`'s default — its
+   `K` is 10 solves, ~2.5-3 h on one node, against `:exact`'s ~17 days; the
+   multi-node requirement is removed, not deferred. What binds instead is
+   ~15 GB for `A`+`HP_DSAT` at that resolution, which this 15 GB workstation
+   cannot hold. The earlier "~5.5 GB and ~182 core-hours" here is **stale** —
+   it predates the domain-convergence correction, which raised every cost
+   ~4.5× in compute and ~2.6× in memory. See `PERFORMANCE.md` §4 and §4b.)*
    The rate-and-state process zone is `L_b = μD_RS/(bσ̄) ≈ 64 m` at
    σ̄ = 25 MPa. The benchmark's Δz = 10 m gives ~6 cells per `L_b`; the
    Δz = 50 m used here gives 1.3, and Δz = 100 m gives 0.6. Because slip rate
