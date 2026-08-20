@@ -162,6 +162,12 @@ translation invariance — 0.41% worst-case in `V_max(t)` over 30 days at the
 converged domain, for a cost that no longer grows with resolution at all. That
 removes the term which dominates runtime and scales as Δz⁻². See
 [`fault_stiffness_toeplitz`](@ref) and `PERFORMANCE.md` §4b.
+
+`precond` is forwarded to [`CGSolver`](@ref) and selects the preconditioner for
+each solve. It is an **independent** axis from `stiffness`: `stiffness` sets how
+*many* solves are done, `precond` how each one converges, and every combination
+is valid. `:none` (default) or `:jacobi` — the latter measures 0.92×, i.e. worse
+than none, and exists so that stays visible rather than being rediscovered.
 """
 function build_model(; par::BP8Params=benchmark_parameters(),
                      Δz=par.Δz, L_fault=3par.l_f, L_normal=2par.l_f,

@@ -6,80 +6,66 @@ Open work, in dependency order. Background for the symmetry items is in
 
 ## Direction (2026-08-20)
 
-**Robin's call: go the standard route — preconditioned CG, sized for a cluster.**
-The Toeplitz `K` build is judged too much work and testing for what it buys, and
-the boundary-element route is explicitly ruled out. Multi-node parallelism is
-back in scope, because it was only ever dissolved *by* Toeplitz.
+**Preconditioned CG was tried, measured, and does not pay. Back to finishing the
+Toeplitz build.** Robin's call was to go the standard route — preconditioned CG
+sized for a cluster — with Toeplitz as the fallback "if the preconditioning
+becomes too complex". It did not become complex; it became *measurably
+worthless*, which is a cleaner reason to stop. Full write-up in
+`PERFORMANCE.md` §6. The boundary-element route remains ruled out.
 
-`:toeplitz` stays in the tree as opt-in with `:exact` the default. It is written,
-tested and documented, so keeping it costs nothing; no further work goes into it,
-including the Δz = 25 m validation, which is dropped.
+### What preconditioning bought: ~1×
+
+- **Jacobi: 0.92×** — a regression. `diag(A)`'s nonzero entries span only 13.5×,
+  so there is no diagonal scaling to remove.
+- **AMG: 3-8× slower in wall-clock**, and — the decisive part — **not
+  mesh-independent**. Fitting `iters ∝ DOF^p` over 4,374 → 34,398 DOF gives
+  plain CG `p = 0.264`, Ruge-Stüben `p = 0.298`, smoothed aggregation
+  `p = 0.311`. AMG's iteration count grows *faster* than plain CG's, so its
+  ~3.3× is a flat constant that narrows with size.
+- **The ceiling is computable, and it is break-even.** Even with a perfectly
+  implemented smoother (the measured V-cycle is 9.2 mat-vecs against an operator
+  complexity implying ~3.5), a preconditioned iteration costs ~5.1 mat-vecs
+  against plain CG's ~1.6 — a 3.2× cost ratio against a 3.3× iteration
+  reduction. **Net ~1.03×.** AMG needs ~10× to pay for a V-cycle.
+
+Against `:toeplitz`'s 578 → 10 solves, ~1× is not a route. **AlgebraicMultigrid
+is not a dependency**; the experiments live in a scratch environment.
+
+### What was kept
+
+- The **`precond` knob** (`build_model(; precond=:none|:jacobi)`), because it is
+  small, tested, and records the dead ends so they are not re-proposed from first
+  principles. `:none` is the default.
+- Two results that close long-standing questions in `CGSolver`'s docstring:
+  a diagonal `M` commutes with `P` **exactly**, and **`null(A) == null(P)`**, so
+  *any* SPD preconditioner is safe here — verified end-to-end with a
+  non-commuting `M` that leaves 41% null-space content in the iterate and still
+  reproduces `U` to 1.5e-10. That is worth having even though nothing currently
+  uses it.
+- Suite green at **200/200** (was 176).
 
 ### Decisions settled
 
 - **2 → 5 sources in `fault_stiffness_toeplitz`** — delegated back to me and
-  kept. Centre-only is 0.004% through injection and 97% over 30 days; the
-  5-source priority build is 0.41%. Moot for production now that `:toeplitz`
-  is frozen, but the code should not ship the version that scores 97%.
-- **`:toeplitz` as default** — no. Superseded by the direction above.
-- **`output/` regeneration** — not needed now. It is gitignored and not present
-  locally, so no biased numbers are sitting in the repo; the shipped set gets
-  generated once, at the converged domain and target resolution.
-- **Multi-node parallelism** — wanted, per the direction above.
+  kept. Centre-only is 0.004% through injection and 97% over 30 days.
+- **`output/` regeneration** — not needed now; gitignored and not present
+  locally. Generate the shipped set once, at the final domain and resolution.
+- **Multi-node parallelism** — still required for Δz = 10 m if `:exact` is used,
+  but `:toeplitz` largely dissolves it again. Revisit after the item below.
 - **Housekeeping:** `diffinitive_registry` is still in `~/.julia/registries`.
-  Remove with `Pkg.Registry.rm("diffinitive_registry")` if unwanted.
 
-### Why preconditioning alone is not the whole answer
+## Agreed next steps (2026-08-20, revised)
 
-Total `K` cost = (solves) × (iterations per solve) × (cost per iteration).
-Preconditioning attacks **only the middle term**. The solve count is
-`2·N_Ωf ∝ Δz⁻²` and is untouched — that was the term Toeplitz removed, so
-dropping Toeplitz means keeping it and needing the cluster.
-
-Iterations scale as `DOF^0.31` (measured), giving ~300 per solve at Δz = 50 m,
-~710 at 20 m, ~1345 at 10 m against `PERFORMANCE.md` §4's measured baseline.
-
-**Δz = 20 m is the target, and it is close.** `resolution_report` calls a grid
-converged at `L_b/Δz ≥ 3`, i.e. Δz ≤ 21 m, so the nominal 10 m is 6.7× more
-expensive than convergence requires. §4 puts Δz = 20 m at ~306 h on 12 cores; a
-5× iteration cut makes that ~60 h — one node for a weekend, no multi-node
-strictly required. Δz = 10 m needs the distribution.
-
-**The unusually favourable part:** `A` is fixed for the whole run and an
-expensive preconditioner setup amortizes over 3,362 (or 13,122) right-hand
-sides. The per-solve economics here are the opposite of the usual ones, which is
-the strongest argument for AMG over anything cheap.
-
-## Agreed next steps (2026-08-20)
-
-1. **Jacobi preconditioner, validated.** Cheap, and it builds the preconditioner
-   plumbing whether or not Jacobi itself is worth shipping. Gate measurements
-   below are done.
-2. **AMG (AlgebraicMultigrid.jl) — the actual lever.** Measure iterations vs DOF
-   at three sizes; the question is whether it is mesh-independent *here*. Not a
-   given: this is an SBP split-node operator with SAT terms and a deliberate 40%
-   null space, not a textbook elasticity discretization. Not currently a dep.
-3. **Multi-node over the RHSs.** Needed only for Δz = 10 m. `Distributed`/MPI;
-   neither is present.
-
-### Preconditioner gate — measured, not assumed
-
-`CGSolver`'s docstring left a diagonal preconditioner unimplemented pending one
-check. Both parts are now measured at n1=9, n23=13 (9,126 DOF):
-
-- **The commutation condition holds by construction, not by luck.** Rows `rm`
-  and `rp` of `P` are identical (both `0.5e_rm + 0.5e_rp`), so rows `rm` and `rp`
-  of `A = -HP·DSAT·P` are identical, and symmetry then forces
-  `A[rm,rm] = A[rp,rp]`. Verified numerically rather than left as a derivation.
-- **A second issue the docstring does not mention:** `P` has entirely zero rows
-  on the far-field DOFs, so `A` has zero rows *and* columns there and `diag(A)`
-  contains **exact zeros** — 3,318 of 9,126, and that set is *exactly* the
-  far-field DOF set. Naive Jacobi divides by zero and needs a floor. Those DOFs
-  are annihilated by `P`, so the floor value cannot affect the answer, only `M`'s
-  definiteness.
-- `diag(A)` varies only **13.5×** max/min over the nonzero entries, and all are
-  positive. That is a narrow spread, and it is the reason to expect little from
-  Jacobi: there is not much diagonal scaling to remove.
+1. **Validate `:toeplitz` at a finer Δz — the one remaining gate.**
+   **Cost correction:** TODO previously called this "~2.4 h". That figure is for
+   the *small* domain. At the converged domain Δz = 25 m is 4.9 M DOF, ~7 GB and
+   **~77 h** (`PERFORMANCE.md` §4) — not feasible on a 15 GB workstation.
+   The affordable and still-meaningful experiment is a **matched pair at fixed
+   (small) domain**: Δz = 50 m already scores 5.7767% there over 30 days, so
+   re-running at Δz = 25 m answers the actual question — *does the Toeplitz error
+   grow with resolution?* — while holding the domain fixed. ~1.5-2 h.
+2. **Then decide `:toeplitz` as default.** Gated on (1).
+3. **Multi-node over the RHSs**, only if (2) goes against `:toeplitz`.
 
 ## Done
 

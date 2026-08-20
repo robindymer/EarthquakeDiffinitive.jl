@@ -266,6 +266,82 @@ or a far larger domain — and neither was in reach. Measured at the small domai
 only; the converged-domain repeat was cut when the project moved to
 preconditioned CG.
 
+## 6. Preconditioning: measured, and it does not pay
+
+Preconditioning was the natural alternative to §4b's Toeplitz build — it is the
+standard route, it needs no approximation, and it attacks the iteration count
+directly. It was measured end to end and **rejected on the numbers**. Both dead
+ends are kept as `precond` options rather than deleted, so neither gets
+re-proposed from first principles.
+
+### The safety question, closed
+
+`CGSolver`'s docstring previously left diagonal preconditioning unimplemented
+pending a check that `M` commutes with `P`. Two results close it:
+
+- **A diagonal `M` commutes with `P` exactly.** Rows `rm` and `rp` of `P` are
+  identical, so rows `rm` and `rp` of `A = -HP·DSAT·P` are identical, and
+  symmetry forces `A[rm,rm] = A[rp,rp]`. Measured: worst in-pair disagreement
+  `0.0`, `‖MP − PM‖/‖MP‖ = 0.0`.
+- **`null(A) == null(P)`, so *any* SPD preconditioner is safe.** Measured at
+  N = 4,374: `rank(P) = tr(P) = 2205` and `rank(A) = 2205`, with a 13-order gap
+  between the largest "zero" eigenvalue (6.9e-15) and the smallest nonzero
+  (8.7e-2). Confirmed end-to-end with a deliberately non-commuting SPD `M`
+  (`‖MP − PM‖/‖MP‖ = 0.51`): the iterate picks up **41% null-space content** —
+  the leak the old invariant ruled out — and `U` is still unchanged to 1.5e-10,
+  because all of it lands in `null(P)` and `U = P·u + χ` annihilates it.
+
+A practical trap worth recording: `P` zeroes the far-field rows, so `A` has
+entirely zero rows *and* columns there and `diag(A)` contains **exact** zeros
+(3,318 of 9,126, precisely the far-field DOF set). Naive Jacobi divides by zero.
+
+### Jacobi: 0.92×
+
+`diag(A)`'s nonzero entries span only 13.5×, so there is almost no diagonal
+scaling to remove. 86 iterations against plain CG's 79 — a regression. `U`
+unchanged to 2.5e-11, so the option is correct, just not worth selecting.
+
+### AMG: valid hierarchy, no mesh-independence, 3-8× slower
+
+AlgebraicMultigrid.jl, both `ruge_stuben` and `smoothed_aggregation`. It builds a
+*working* hierarchy — symmetric to 1e-15 (so CG's recursive residual stays
+valid), correct answers to ~1e-10, and it needs no null-space handling at all:
+building on the full `A` and on `A[keep,keep]` gives identical iteration counts,
+because AMG isolates the zero rows as their own coarse points.
+
+| N | plain CG | RS | SA | RS wall | SA wall |
+|---|---|---|---|---|---|
+| 4,374 | 72 | 20 | 20 | 0.19× | 0.33× |
+| 9,126 | 79 | 24 | 25 | 0.17× | 0.30× |
+| 19,074 | 102 | 30 | 31 | 0.24× | 0.25× |
+| 34,398 | 124 | 37 | 38 | 0.12× | 0.32× |
+
+**There is no asymptotic gain.** Fitting `iters ∝ DOF^p`: plain CG `p = 0.264`,
+RS `p = 0.298`, SA `p = 0.311`. AMG's iteration count grows *slightly faster*
+than plain CG's, so the ~3.3× is a flat constant that narrows with size — the
+opposite of the mesh-independence that motivates AMG. The cause is not mysterious:
+coarsening heuristics assume something Laplacian-like, and an SBP order-4
+operator with wide mixed-sign closures, SAT coupling and a 50% null space is not.
+
+**Tuning the smoother cannot rescue it, and the ceiling is computable.** The
+V-cycle measures 9.2 mat-vecs against an operator complexity of 1.05 that implies
+~3.5, so the Gauss-Seidel implementation is ~2.5× slower than it should be. But
+even at the ideal 3.5:
+
+- preconditioned iteration ≈ 1.6 (CG) + 3.5 (V-cycle) ≈ **5.1** mat-vecs
+- plain iteration ≈ **1.6** mat-vecs → cost ratio **3.2×**
+- measured iteration reduction **3.3×**
+- **net ≈ 1.03× — break-even.**
+
+AMG needs roughly a 10× iteration cut to pay for a V-cycle. It delivers 3.3×,
+shrinking. **AlgebraicMultigrid is therefore not a dependency of this package**;
+the experiments live in a scratch environment.
+
+### Consequence
+
+Against `:toeplitz`'s 578 → 10 solves (~58× on the dominant term), preconditioning
+offers ~1×. That is what returned the project to finishing the Toeplitz build.
+
 ## 5. Where the time goes, and what to attack
 
 At any converged resolution, `fault_stiffness` is ~98% of the cost. Assembly is
