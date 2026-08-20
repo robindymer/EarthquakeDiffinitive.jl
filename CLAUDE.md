@@ -28,6 +28,11 @@ doesn't.
 
 ## Dev workflow
 
+- **Do not commit. Robin commits all code himself.** Leave finished work staged
+  or in the working tree and say what changed; do not run `git commit`, `git
+  push`, or anything that rewrites history. Writing files, running tests and
+  `git add` are fine.
+
 - Run the test suite: `julia --project=. -e 'using Pkg; Pkg.test()'` (or
   `julia --project=. test/runtests.jl` after `Pkg.instantiate()`).
 - **Set `JULIA_NUM_THREADS=4`+ when running tests locally.** The threaded `fault_stiffness` build
