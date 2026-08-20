@@ -763,6 +763,72 @@ quantity that binds. The trend is toward *less* sensitivity at finer Δz, so
 `(1200, 1200)` should be safe at 10 m — but that is an extrapolation from two
 resolutions, not a measurement, and `(1200, 800)` was never tested.
 
+## BP8-PW stiffness: σ̄_min as a regularization (2026-08-20, in progress)
+
+Limitation 3's runtime cost (`≈ Δz⁻⁴` step growth, weeks-to-months at Δz = 10 m)
+comes from the σ̄_min floor binding at the well cell. Sweeping the floor,
+Δz = 50 m, t = 100 h (`scratchpad/sigma_min.jl`):
+
+| `σ̄_min` | steps | speedup | d(`V_max`) | d(moment rate) |
+|---|---|---|---|---|
+| 1 kPa (default) | 31,202 | 1.0× | — | — |
+| **10 kPa** | 3,375 | **9.2×** | **0.04%** | 0.00% |
+| 100 kPa | 815 | 38.3× | 0.47% | 0.01% |
+| 1 MPa | 557 | 56.0× | 4.84% | 0.36% |
+| 5 MPa | 524 | 59.5× | 22.44% | 3.94% |
+
+**Two results that change how this must be argued.**
+
+1. **`V_max` does NOT live at the well cell.** Global `V_max` and `V_max`
+   restricted to `r > 20 m` are *identical* in every row — the floored node
+   slips, but elastic coupling drives its traction down until it self-limits, so
+   it never dominates. The prediction that it would (V ≈ τ/η ~ 1e-4 m/s) was
+   wrong.
+2. **Therefore this is not a confined regularization.** Since `V_max` always
+   lies outside the disc, *any* change to it is a change to genuine fault,
+   reached through `K` from the single floored node. The "we only rewrite a
+   region the model already declares invalid" argument is **not available**.
+
+What remains is a quantitative trade: 10 kPa buys 9.2× for **0.04%** in `V_max`,
+an order of magnitude below the Toeplitz error (0.41-0.87%) and far below the
+resolution error. 100 kPa buys 38× for 0.47%, comparable to Toeplitz.
+
+**Only one node is ever floored**, even at 5 MPa — at Δz = 50 m the next node
+out sits at σ̄ ≈ 11.7 MPa.
+
+**It survives refinement — and improves on both axes.** Δz = 25 m (baseline row
+reproduces the standalone measurement to 0.02%: 4910.9 s, 488,788 steps):
+
+| `σ̄_min` | steps | speedup | d(`V_max`) | d(moment rate) | d(slip) |
+|---|---|---|---|---|---|
+| 1 kPa | 488,788 | 1.0× | — | — | — |
+| 10 kPa | 37,938 | 12.9× | **0.00%** | 0.02% | 0.01% |
+| **100 kPa** | 4,322 | **113.1×** | **0.00%** | 0.01% | **0.14%** |
+| 1 MPa | 653 | 748.5× | 0.00% | 0.05% | 1.42% |
+
+Compare against Δz = 50 m: 100 kPa cost 0.47% in `V_max` there and **nothing
+measurable** here; 1 MPa cost 4.84% there and 0.00% here. The speedup grew
+(38× → 113×) while the perturbation shrank.
+
+The mechanism is coherent: as Δz falls the floored cell occupies less area, so
+its influence on the fault decreases, while the stiffness it generates worsens.
+Regularizing it is therefore **both more valuable and less harmful** at finer
+resolution — the favourable direction for a Δz = 10 m run.
+
+**Suggested value: `σ̄_min` = 100 kPa.** 113× at Δz = 25 m for zero change in
+`V_max` and 0.14% in slip — below the Toeplitz error. 1 MPa gives 748× but moves
+slip 1.42%, which exceeds it; slip is itself a §4.1 reported output.
+
+Extrapolated, this puts the Δz = 10 m PW integration in the **hours**, not
+weeks-to-months. That extrapolation compounds two uncertain factors (the `Δz⁻⁴`
+step growth and a speedup ratio that itself grew 3× between the two
+resolutions), so treat it as an order of magnitude, not a schedule.
+
+**This needs a decision, not just a measurement.** It is a deliberate physics
+perturbation to a submitted quantity, in a place where the benchmark is *silent*
+rather than permissive. Worth raising with the organizers rather than only
+documenting.
+
 ## Known limitations
 
 These are properties of the current approach, not loose ends to tidy.
