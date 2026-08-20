@@ -229,6 +229,43 @@ And it is an approximation — a controlled ~0.004% against a ~53% domain bias a
 a much larger resolution error, so it is nowhere near the accuracy-limiting
 step, but `:exact` stays the default until the finer-Δz check lands.
 
+### Symmetrising the reconstruction: tested, rejected
+
+Reciprocity says the whole-space kernel is even, so the exact `K` should be
+symmetric — it is, to 0.2003%. The reconstruction reads the kernel off sampled
+columns and does not enforce that, so `(K + Kᵀ)/2` looked like a free
+improvement. It is not an improvement, and it is not free.
+`scripts/k_toeplitz_symmetrise.jl`, Δz = 50 m, small domain, full 30 days:
+
+| `K` variant | asymmetry | Frob. err | `V_max(t)` worst |
+|---|---|---|---|
+| Toeplitz (shipped) | 0.2004% | 0.0155% | **5.7767%** |
+| Toeplitz + sym full | 0.0000% | 0.1013% | 5.7846% |
+| Toeplitz + sym diag blocks only | 0.2004% | 0.0155% | 5.7767% |
+| exact + sym full | 0.0000% | 0.1001% | **2.1489%** |
+
+**The premise was wrong.** `K_toep`'s asymmetry (0.2004%) matches the exact
+`K`'s (0.2003%) to four digits — the expansion preserves whatever evenness the
+sampled columns carried, so there was nothing to recover. Symmetrising moves
+`K_toep` 6.5× *further* from the exact `K` in Frobenius norm and leaves `V_max`
+marginally worse. The diagonal-blocks-only variant is bit-identical to shipped,
+i.e. `K22` and `K33` are already even and all 0.2% lives in the cross blocks.
+
+**The last row is the durable result.** Symmetrising the *exact* `K` — no
+reconstruction error in play at all — moves worst `V_max(t)` by **2.15%**. A
+0.2% asymmetry amplifies ~10× into the observable, so enforcing reciprocity is
+not a neutral projection: it is a 2.15% perturbation, five times the Toeplitz
+error at the converged domain. Anyone re-proposing this on "it costs nothing"
+grounds should read that row first.
+
+**What this does not settle.** It says symmetrisation *perturbs* the answer, not
+that it perturbs it the wrong way. If the continuous kernel is genuinely even,
+`(K + Kᵀ)/2` may be the better matrix and the exact `K` the biased reference.
+Deciding that needs an independent reference — an analytic whole-space solution,
+or a far larger domain — and neither was in reach. Measured at the small domain
+only; the converged-domain repeat was cut when the project moved to
+preconditioned CG.
+
 ## 5. Where the time goes, and what to attack
 
 At any converged resolution, `fault_stiffness` is ~98% of the cost. Assembly is
