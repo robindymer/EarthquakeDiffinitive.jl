@@ -8,16 +8,28 @@ as a Gaussian source or a Peaceman well. Built on the `Diffinitive` SBP-FD
 library, pinned in `Project.toml`'s `[sources]`.
 
 **Both injection models run end to end** and write the §4 output files; see
-"Results" below. The implementation is complete and validated, but the runs
-are **not resolution-converged** and are not submission-ready — the reason is
-a hard memory limit on the 3D elastic factorization, quantified under "Known
-limitations".
+"Results" below. The implementation is complete and validated, but the shipped
+runs are **not resolution-converged** and are not submission-ready. What blocks
+that has changed twice and is now a single, concrete thing — see "Known
+limitations" 1.
 
-The discrete operator `A = -HP(D+SAT)P` is now **symmetric positive definite**
-(it was ~14% asymmetric), the reduction is the Galerkin form `SᵀAS`, and the
-solve is a Cholesky factorization. Full suite green at 176/176. That closed the
-project's main correctness question; it did **not** move the resolution ceiling
-in any material way, which remains the one open blocker.
+The discrete operator `A = -HP(D+SAT)P` is **symmetric positive definite** (it
+was ~14% asymmetric). That closed the project's main correctness question.
+
+**Solver status (2026-08-20).** The Cholesky/Galerkin path described further
+down was **removed** (commit `02b6c91`); the solve is now CG straight onto the
+singular `A`, which has no fill-in and therefore no factorization memory
+ceiling. `K` is built by `:toeplitz` (10 solves) by default, with `:exact`
+(`2·N_Ωf` solves) kept as the reference — see `PERFORMANCE.md` §4b for the
+validation behind that default. Preconditioning was measured and rejected
+(§6): Jacobi 0.92×, AMG break-even at best.
+
+**The remaining blocker is memory for `A` itself at Δz = 20 m (~15 GB), not
+compute and not the `K` build.** With `:toeplitz` the target run is ~3 h on one
+node. Full suite green at **200/200**.
+
+Sections below that describe `factorize_reduced`, `prolongation`, Cholesky
+fallbacks or a 176/176 suite are **history, not current API**.
 
 ## Done
 
