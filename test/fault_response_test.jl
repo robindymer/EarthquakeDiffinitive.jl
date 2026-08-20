@@ -111,16 +111,20 @@ const FE_K = fault_stiffness(FE)
         @test solver_report(fe_thr.rs).iterations == solver_report(fe_ser.rs).iterations
     end
 
-    # `fault_stiffness_toeplitz` rebuilds K from ONE centre source instead of
-    # 2*N_Ωf, using the whole-space kernel's translation invariance. It is an
-    # approximation, so this pins two things: that it reproduces the exact build
-    # closely, and — the part that actually broke in development — that its
-    # centre column is reproduced EXACTLY, since that column is measured rather
-    # than inferred and is what the near-field physics rides on.
+    # `fault_stiffness_toeplitz` rebuilds K from FIVE sources (10 solves) instead
+    # of 2*N_Ωf, using the whole-space kernel's translation invariance. It is now
+    # `build_model`'s DEFAULT, so this guards what ships. It pins two things:
+    # that it reproduces the exact build closely, and — the part that actually
+    # broke in development — that its centre column is reproduced EXACTLY, since
+    # that column is measured rather than inferred and is what the near-field
+    # physics rides on.
     #
-    # The accuracy claim that matters (~0.03% in V_max end-to-end) is measured
-    # by scripts/k_toeplitz_validate.jl, not here; this test is a cheap guard
-    # against the index arithmetic silently regressing.
+    # The accuracy claims that justify the default are end-to-end and measured
+    # elsewhere (`PERFORMANCE.md` §4b): worst `V_max(t)` over 30 days is 0.41% at
+    # the converged domain and 0.87% at Δz = 25 m, both far below the resolution
+    # error, and both better than the 5.78% of the small-domain Δz = 50 m case.
+    # This test is a cheap guard against the index arithmetic silently
+    # regressing, not a substitute for those runs.
     @testset "Toeplitz K build approximates the exact one" begin
         set = fr_stencil_set()
         gm, gp = fr_grids(11)

@@ -21,7 +21,7 @@ L_normal = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 400.0
 const T_END = (length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 100.0) * 3600.0
 
 @info "building model" Δz L_fault L_normal
-m = build_model(; Δz, L_fault, L_normal)
+m = build_model(; Δz, L_fault, L_normal, stiffness=:exact)
 const n2, n3, nf = length(m.x2), length(m.x3), m.nf
 node_ab(k) = (mod1(k, n2), (k - 1) ÷ n2 + 1)
 corner(a, b) = (b - 1) * n2 + a
