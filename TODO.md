@@ -4,65 +4,82 @@ Open work, in dependency order. Background for the symmetry items is in
 `SYMMETRIC_SAT.md`, for the cost items in `PERFORMANCE.md`; the rest is from
 `PROGRESS.md`'s "Known limitations".
 
-## Decisions needed from Robin
+## Direction (2026-08-20)
 
-Things the 2026-08-19 session left open that are judgement calls, not work items.
+**Robin's call: go the standard route — preconditioned CG, sized for a cluster.**
+The Toeplitz `K` build is judged too much work and testing for what it buys, and
+the boundary-element route is explicitly ruled out. Multi-node parallelism is
+back in scope, because it was only ever dissolved *by* Toeplitz.
 
-- [ ] **Review the 2 → 5 source change in `fault_stiffness_toeplitz`.** Made
-      mid-session without sign-off. The evidence: centre-only (2 solves) scores
-      0.004% through injection but **97%** over the full 30 days, because the
-      relaxation phase is sensitive to long-range interactions the centre source
-      cannot reach. Adding 4 corners *in priority order* gives 0.41%. Rationale
-      and the full table are in the docstring and `PERFORMANCE.md` §4b. The cost
-      is 10 solves instead of 2 — irrelevant next to the 13,122 it replaces.
-- [ ] **Whether `:toeplitz` becomes the default.** Currently opt-in, `:exact`
-      default. Gated on the Δz = 25 m validation (below). It is an
-      approximation, so this is a correctness-posture decision, not just a
-      performance one — 0.41% against a ~53% domain bias is defensible, but it
-      is your call whether the submitted numbers rest on it.
-- [ ] **When to regenerate `output/`.** Every shipped number carries the ~53%
-      `V_max` bias. Regenerating now at the corrected domain fixes it but gets
-      superseded by any resolution work; waiting leaves knowingly-biased numbers
-      in the repo. Interim corrected set, or one regeneration at the end?
-- [ ] **Whether multi-node parallelism is still wanted.** Its entire purpose was
-      distributing `2·N_Ωf` independent solves. At 10 solves there is nothing
-      left to distribute, so it is listed below as largely dissolved — but that
-      depends on `:toeplitz` being adopted. If it is not, the blocker returns.
-- [ ] **Housekeeping:** `diffinitive_registry` was added to `~/.julia/registries`
-      during the session to make the project instantiable. Remove with
-      `Pkg.Registry.rm("diffinitive_registry")` if unwanted.
+`:toeplitz` stays in the tree as opt-in with `:exact` the default. It is written,
+tested and documented, so keeping it costs nothing; no further work goes into it,
+including the Δz = 25 m validation, which is dropped.
 
-## Agreed next steps (2026-08-19)
+### Decisions settled
 
-In this order, and the order matters:
+- **2 → 5 sources in `fault_stiffness_toeplitz`** — delegated back to me and
+  kept. Centre-only is 0.004% through injection and 97% over 30 days; the
+  5-source priority build is 0.41%. Moot for production now that `:toeplitz`
+  is frozen, but the code should not ship the version that scores 97%.
+- **`:toeplitz` as default** — no. Superseded by the direction above.
+- **`output/` regeneration** — not needed now. It is gitignored and not present
+  locally, so no biased numbers are sitting in the repo; the shipped set gets
+  generated once, at the converged domain and target resolution.
+- **Multi-node parallelism** — wanted, per the direction above.
+- **Housekeeping:** `diffinitive_registry` is still in `~/.julia/registries`.
+  Remove with `Pkg.Registry.rm("diffinitive_registry")` if unwanted.
 
-1. **§1 — the domain bias.** *Diagnostic DONE, both directions.* Required domain
-   is **`L_fault` ≥ 4·`l_f`, `L_normal` ≥ 3·`l_f`**; the shipped configuration is
-   **~53% low** in `V_max`. What remains is deciding when to regenerate
-   `output/`, and emitting the domain size in the output headers.
-2. **§2 — the Toeplitz `K` build.** *Experiment DONE and it worked* — 2 solves
-   reproduce `V_max(t)` to 0.03% (`PERFORMANCE.md` §4b). Implementing it is now
-   the top item: it attacks the **scaling** of the dominant cost, not its
-   constant, and needs no cluster.
-3. **§2 — multi-node parallelism.** *Largely dissolved by item 2.* Its whole
-   purpose was distributing `2·N_Ωf` independent solves; at 2 solves there is
-   nothing left to distribute. Keep it only if the Toeplitz build fails
-   validation at finer Δz.
+### Why preconditioning alone is not the whole answer
 
-The preconditioner sits behind all of these: a constant-factor win on a
-quantity item 2 has already made ~300× smaller.
+Total `K` cost = (solves) × (iterations per solve) × (cost per iteration).
+Preconditioning attacks **only the middle term**. The solve count is
+`2·N_Ωf ∝ Δz⁻²` and is untouched — that was the term Toeplitz removed, so
+dropping Toeplitz means keeping it and needing the cluster.
 
-**This ordering was rewritten mid-session.** The original plan put multi-node
-parallelism second and the Toeplitz test third, on the grounds that the latter
-was speculative. It was speculative and it paid off ~300×, which is the case
-for running the cheap uncertain experiment before the expensive certain one.
+Iterations scale as `DOF^0.31` (measured), giving ~300 per solve at Δz = 50 m,
+~710 at 20 m, ~1345 at 10 m against `PERFORMANCE.md` §4's measured baseline.
 
-**Caveat on this ordering, recorded honestly.** The argument for doing §1 first
-was that domain size is an *input* to sizing the expensive runs — go to the
-cluster without it and you burn the budget on a well-resolved but biased result.
-That still holds. But the supporting assumption — that domain requirements
-measured at Δz = 50 m transfer to finer grids — is **not** supported by the data
-(see §1's third bullet). If they do not transfer, §2 should have come first.
+**Δz = 20 m is the target, and it is close.** `resolution_report` calls a grid
+converged at `L_b/Δz ≥ 3`, i.e. Δz ≤ 21 m, so the nominal 10 m is 6.7× more
+expensive than convergence requires. §4 puts Δz = 20 m at ~306 h on 12 cores; a
+5× iteration cut makes that ~60 h — one node for a weekend, no multi-node
+strictly required. Δz = 10 m needs the distribution.
+
+**The unusually favourable part:** `A` is fixed for the whole run and an
+expensive preconditioner setup amortizes over 3,362 (or 13,122) right-hand
+sides. The per-solve economics here are the opposite of the usual ones, which is
+the strongest argument for AMG over anything cheap.
+
+## Agreed next steps (2026-08-20)
+
+1. **Jacobi preconditioner, validated.** Cheap, and it builds the preconditioner
+   plumbing whether or not Jacobi itself is worth shipping. Gate measurements
+   below are done.
+2. **AMG (AlgebraicMultigrid.jl) — the actual lever.** Measure iterations vs DOF
+   at three sizes; the question is whether it is mesh-independent *here*. Not a
+   given: this is an SBP split-node operator with SAT terms and a deliberate 40%
+   null space, not a textbook elasticity discretization. Not currently a dep.
+3. **Multi-node over the RHSs.** Needed only for Δz = 10 m. `Distributed`/MPI;
+   neither is present.
+
+### Preconditioner gate — measured, not assumed
+
+`CGSolver`'s docstring left a diagonal preconditioner unimplemented pending one
+check. Both parts are now measured at n1=9, n23=13 (9,126 DOF):
+
+- **The commutation condition holds by construction, not by luck.** Rows `rm`
+  and `rp` of `P` are identical (both `0.5e_rm + 0.5e_rp`), so rows `rm` and `rp`
+  of `A = -HP·DSAT·P` are identical, and symmetry then forces
+  `A[rm,rm] = A[rp,rp]`. Verified numerically rather than left as a derivation.
+- **A second issue the docstring does not mention:** `P` has entirely zero rows
+  on the far-field DOFs, so `A` has zero rows *and* columns there and `diag(A)`
+  contains **exact zeros** — 3,318 of 9,126, and that set is *exactly* the
+  far-field DOF set. Naive Jacobi divides by zero and needs a floor. Those DOFs
+  are annihilated by `P`, so the floor value cannot affect the answer, only `M`'s
+  definiteness.
+- `diag(A)` varies only **13.5×** max/min over the nonzero entries, and all are
+  positive. That is a narrow spread, and it is the reason to expect little from
+  Jacobi: there is not much diagonal scaling to remove.
 
 ## Done
 
