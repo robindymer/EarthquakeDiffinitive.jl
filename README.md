@@ -84,6 +84,14 @@ on 16 at production size, because the sparse mat-vec is memory-bandwidth bound
 once the working set leaves cache. Expect the memory system, not the core count,
 to be the limit.
 
+`build_model`'s `stiffness` keyword (`:toeplitz` by default) reconstructs the
+dense fault stiffness `K` from 10 CG solves instead of the full `2·N_Ωf` — the
+fault-to-fault kernel is near-block-Toeplitz, so a handful of columns near the
+diagonal reproduce the rest to <1% in `V_max(t)`. `:exact` remains available as
+the reference build. This is what turned the `K` build from a multi-node job
+(~17 days at Δz = 20 m) into a single-node one (~2.5-3 h) — see
+`PERFORMANCE.md` §4b for the validation.
+
 ## Plotting
 
 ```julia
@@ -122,10 +130,18 @@ solver satisfies BP8's interface conditions to machine precision, the discrete
 operator `-HP(D+SAT)P` is symmetric positive definite, and 30-day runs of both
 injection models produce physically sensible aseismic slip.
 
-**The runs are not resolution-converged**, and cannot be on a single
-workstation: fill-in in the sparse factorization of the 3D elastic system caps
-the node spacing at ~50 m against the benchmark's specified 10 m. Exploiting
-the symmetry (Cholesky rather than LU) cuts the factor by ~1.9×, but fill-in
-scales ≈ `n^5.6`, so that buys ~45 m rather than 10 m. See the "Known
-limitations" section of [PROGRESS.md](PROGRESS.md) for the measurements
-behind that and what reaching spec resolution would take.
+**The runs are not resolution-converged on a single workstation, but both
+injection models are now viable on a cluster node.** CG removes the sparse
+factorization entirely, so there is no fill-in ceiling; what binds instead is
+memory for the assembled operator itself — ~15 GB at Δz = 20 m (the resolution
+`resolution_report` calls converged, `L_b/Δz ≥ 3`, well short of the
+benchmark's nominal 10 m), against a 15 GB development workstation. The `K`
+build, previously the reason a multi-node job was needed, no longer is one:
+`:toeplitz` (see "Solving the elastic system") cuts it from ~17 days to
+~2.5-3 h on a single node. BP8-PW was separately blocked by the well-cell
+stress singularity making the coupled time integration scale ≈ Δz⁻⁴ in step
+count (weeks-to-months extrapolated at Δz = 10 m); regularizing the
+effective-normal-stress floor (`σ̄_min`) buys two orders of magnitude there for
+well under 1% change in the reported peak slip rate. See "Known limitations"
+in [PROGRESS.md](PROGRESS.md) for the measurements behind all of this and what
+remains before a submission-ready run.
