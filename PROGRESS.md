@@ -829,6 +829,125 @@ perturbation to a submitted quantity, in a place where the benchmark is *silent*
 rather than permissive. Worth raising with the organizers rather than only
 documenting.
 
+## BP8-PW stiffness: what the stiff eigenvalue is (2026-08-21)
+
+The section above establishes *that* the floor causes the stiffness and what
+raising it buys. This one identifies the eigenvalue, which changes what a
+solver fix has to look like. `scripts/bp8_stiffness_spectrum.jl` reproduces
+everything here. Measured at Δz = 50 m, default `σ̄_min` = 1 kPa; the ODE state
+is only `N = 4·nf+1 = 1157`, so full eigendecompositions are affordable.
+
+### The stiff eigenvalue is `K_ww / D`
+
+`D = ∂g/∂V = η + σ̄·a·(u/V)/√(1+u²)` is the derivative of the scalar force
+balance `solve_slip_rate` already computes as `dgdx` (that is `V·∂g/∂V`).
+`K_ww = -4.383e8 Pa/m` is the well node's **self**-stiffness.
+
+| t | σ̄ [Pa] | `D` | `K_ww/D` (pred) | λ (measured) | ratio |
+|---|---|---|---|---|---|
+| 60 h | 1.62e6 | 3.73e11 | -1.174e-3 | -1.078e-3 | 1.088 |
+| 75 h | 5.39e5 | 7.88e10 | -5.565e-3 | -5.432e-3 | 1.025 |
+| 85 h | **1000** (floored) | 2.59e8 | -1.691 | -1.668 | 1.013 |
+| 95 h | 1000 | 2.36e8 | -1.859 | -1.835 | 1.013 |
+| 99.5 h | 1000 | 2.95e8 | -1.485 | -1.465 | 1.013 |
+
+The residual is a constant 1.3% once the floor binds — the `η` term dropped
+from `D ≈ σ̄a/V`. So the stiff mode is **the well node's slip responding to its
+own elastic self-stiffness**, damped by friction's traction sensitivity. It
+jumps 300× at the step where σ̄ first crosses zero (between t = 82 and 84 h).
+
+**The identification holds only where the floor binds.** Run at Δz = 100 m the
+floor never binds at all (σ̄ stays 5.9-8.4 MPa), PW is not stiff — **613 steps
+over 100 h** against Δz = 50 m's 32,328 — and the stiffest eigenvalue is a
+constant -5.05e-4 belonging to some other mode, which `K_ww/D` does not predict
+(ratio 0.27). That is the expected behaviour, and it is a second confirmation
+that the floored well cell is the whole source: remove the floor event and the
+stiffness goes with it.
+
+**This explains `σ̄_min` quantitatively for the first time.** `D ≈ σ̄·a/V`, so
+`λ_stiff ∝ 1/σ̄`: a 1 kPa → 100 kPa floor predicts ~100× less stiffness,
+against the **113×** measured at Δz = 25 m above. The regularization works by
+shrinking this eigenvalue, and nothing else.
+
+### It is local — a per-node 3×3 block carries it
+
+| Jacobian | stiffest eigenvalue | ratio to full |
+|---|---|---|
+| full `N×N` | -1.668434 | — |
+| per-node 3×3 blocks (`s2,s3,ϕ`) with `diag(K)` only | **-1.668427** | **1.0000** |
+| pressure block alone (`Ap`) | -2.112e-4 | not stiff |
+
+Zeroing **every off-diagonal of the dense `K`** changes the stiff eigenvalue in
+the 4th decimal. Two consequences:
+
+- The dense elastic coupling contributes **nothing** to the stiffness. An
+  implicit treatment never has to invert `K`.
+- Pore-pressure diffusion is **not** stiff here, despite being the parabolic
+  part. `PorePressure.jl`'s standalone use of a Rosenbrock solver is about the
+  pressure-only problem, and does not indicate where the coupled stiffness is.
+
+### So the fix is IMEX, not JFNK
+
+The implicit part is `nf` independent **3×3** solves — no Krylov, no
+preconditioner, no dense factorization. Explicit part: `K`'s off-diagonals and
+pressure. JFNK (the fallback recorded in `TODO.md`) is overkill by a wide
+margin.
+
+**Why the earlier `Rosenbrock23` probe looked hopeless was Jacobian
+*construction*, not implicit integration.** Measured at Δz = 50 m:
+
+| | cost |
+|---|---|
+| one `rhs!` eval | 0.066 ms (64% of it the dense `K` mat-vec) |
+| FD/AD Jacobian = `N` × rhs | **0.076 s** |
+| analytic JVP ≈ 1 `K` mat-vec | **0.042 ms** |
+| dense LU of `N×N` | ~0.01 s |
+
+Each of those 1157 RHS evals runs 289 nested friction Newton solves. The ratio
+grows as `N`: at Δz = 10 m an FD Jacobian is ~10 minutes *each*, which is dead,
+while an analytic JVP stays one mat-vec.
+
+**The analytic derivatives are available in closed form and verified.** The
+implicit function theorem on `g(V)=0` gives, all from quantities already inside
+`solve_slip_rate`'s loop:
+
+```
+∂V/∂T = 1/D,   ∂V/∂ϕ = -σ̄·b·u/(√(1+u²)·D),   ∂V/∂σ̄ = -a·asinh(u)/D
+```
+
+Checked against finite differences for `∂(dϕ/dt)/∂ϕ` at the well cell:
+analytic `-9.067713e-05`, FD `-9.067713e-05`, stable over `h` = 1e-2…1e-10.
+
+### Two code changes any implicit route needs first
+
+1. **`solve_slip_rate` throws on non-convergence** (`src/RateStateFriction.jl`).
+   An implicit solver probing a trial state would kill the run instead of
+   having the step rejected; it needs to return `NaN`.
+2. **`evaluate!` mutates `m.cache`** (`Vprev` warm starts, `floor_hits`,
+   `σ̄_lowest`, `floor_nodes`). Implicit methods evaluate off-trajectory, so the
+   diagnostics over-count and the warm starts are seeded from states that are
+   not on the solution. *(Measured as harmless for the numbers above — pinning
+   `Vprev` reproduced the FD Jacobian bit-identically — but it is not sound
+   under a solver that backtracks.)*
+
+### Caveat before anyone benchmarks this
+
+**At Δz = 50 m implicit will probably still lose.** Tsit5 does 100 h in 15.8 s;
+no implicit method will beat that on a 1157-state problem. Validate
+*correctness* at 50 m and expect the crossover around Δz = 20-25 m. A
+wall-clock comparison at 50 m would reject the approach for the wrong reason.
+
+### Superseded en route to this
+
+Recorded because each was asserted before being checked, and each was wrong:
+`λ_stiff` is **not** `-exp(-ϕ)` (θ at the well cell stays ~6000 s, never
+collapses); the stiff mode is **not** a single diagonal entry
+(`J[ϕ_w,ϕ_w] = -9.07e-5` against `λ = -1.67`). The Jacobian is strongly
+non-normal — the (ϕ←s) coupling is ~+4900 against (s←ϕ) ~4e-8 — so the stiff
+eigenvector localizes almost entirely in `ϕ` while the eigenvalue belongs to
+the *slip* direction. Eigenvector localization does not imply the eigenvalue
+sits on that diagonal.
+
 ## Known limitations
 
 These are properties of the current approach, not loose ends to tidy.

@@ -123,11 +123,38 @@ stand.
    a one-line default change plus a docstring), and decide the disclosure
    question below.
 
-   A stiff integrator remains the fallback if it does not. Not demonstrated: a
-   `Rosenbrock23` probe was still running on the *easy* Gaussian case after 90 s,
-   because the RHS carries a dense `K` mat-vec, a nested Newton friction solve
-   per node, and a non-smooth `max(σ̄, σ̄_min)`. Doing it properly probably means
-   Jacobian-free Newton-Krylov — a design decision, not an increment.
+   **The solver fallback is now scoped, and it is smaller than assumed
+   (2026-08-21).** `PROGRESS.md` "BP8-PW stiffness: what the stiff eigenvalue
+   is"; `scripts/bp8_stiffness_spectrum.jl` reproduces it. Three results:
+
+   - **The stiff eigenvalue is `K_ww/D`**, `D = ∂g/∂V ≈ σ̄a/V` — the well
+     node's slip against its own self-stiffness. Predicts the measured λ to
+     1.3% at every time. Since `λ ∝ 1/σ̄`, this is *why* `σ̄_min` works: a
+     1 kPa → 100 kPa floor predicts ~100× against the 113× measured.
+   - **It is local.** A per-node **3×3** block-diagonal (`s2,s3,ϕ`, using only
+     `diag(K)`) reproduces the stiff eigenvalue to ratio **1.0000**. The dense
+     `K` off-diagonals contribute nothing, and the pressure block is *not*
+     stiff (-2.1e-4).
+   - **So the fix is IMEX, not JFNK** — `nf` independent 3×3 solves, no Krylov,
+     no preconditioner, no dense factorization. JFNK is overkill.
+
+   The `Rosenbrock23` probe failed on **Jacobian construction**, not implicit
+   integration: an FD/AD Jacobian is `N` RHS evals (0.076 s at Δz = 50 m,
+   ~10 min at Δz = 10 m — dead), each running `nf` nested Newton solves. An
+   analytic JVP is one `K` mat-vec, 0.042 ms. The derivatives are closed-form
+   from quantities `solve_slip_rate` already computes, and are verified to 6
+   digits against FD.
+
+   - [ ] **Prerequisite for any implicit route:** `solve_slip_rate` must return
+         `NaN` rather than `error()` (`src/RateStateFriction.jl`), and
+         `evaluate!`'s cache mutation (`Vprev`, `floor_hits`, `σ̄_lowest`,
+         `floor_nodes`) must not accumulate on off-trajectory evaluations.
+   - [ ] **Then the 3×3 IMEX split.** Not started — deferred, since BP8-GS is
+         not stiffness-bound (405 steps) and is the next run.
+
+   **Do not benchmark this at Δz = 50 m.** Tsit5 does 100 h in 15.8 s there and
+   no implicit method will beat it at `N` = 1157. Validate correctness at 50 m;
+   the crossover is expected around Δz = 20-25 m.
 
    **The benchmark description is silent on both stiffness and σ̄ < 0** (checked
    directly against the PDF). These are gaps in the specification.
