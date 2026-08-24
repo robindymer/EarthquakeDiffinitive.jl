@@ -12,6 +12,9 @@ using Printf
 const MODELER = get(ENV, "BP8_MODELER", "Robin Dymér")
 
 injection = length(ARGS) >= 1 ? Symbol(lowercase(ARGS[1]) == "pw" ? :peaceman : :gaussian) : :gaussian
+# TODO: Check that below is true
+# When Δz = 20, set L_fault = 1600 and L_normal = 1200 for domain-convergence
+# If Δz = 10, should get away with 1200 for both
 Δz = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 50.0
 L_fault = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 800.0
 L_normal = length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 400.0
@@ -30,7 +33,7 @@ flush(stdout)
 t0 = time()
 # §4.1 asks for 1e4-1e5 rows in the time series; §4.3 for ~1e3 in the
 # profiles. 5-minute saves plus the solver's own adaptive steps lands in range.
-sol = run_bp8(m; saveat=300.0, verbose=true)
+sol = run_bp8(m; saveat=300.0, verbose=true, progress=true)
 @info "integrated" seconds = round(time() - t0, digits=1) steps = length(sol.t) retcode = sol.retcode
 flush(stdout)
 
