@@ -433,34 +433,77 @@ largely dissolves item 1 rather than competing with it.
 
 0. **Implement the Toeplitz `K` build** (§4b). Turns `2·N_Ωf` solves into 2, at
    ~0.03% cost in `V_max`. Purely local work, no cluster needed.
-0b. **Exploit `K`'s square symmetry (`D4`) in the `:exact` build — measured to
-   hold at machine precision, and *not* an approximation.** `Ω_f` and both
-   elastic grids are square and centred, so the discretization is invariant
-   under the eight symmetries of the square. Reflecting `x2 → −x2` flips `s2`
-   and `τ2` and leaves `s3`, `τ3` alone; reflecting about the diagonal swaps
-   the two. Measured at Δz = 100 m against a full `:exact` build:
+0b. **Exploit `K`'s square symmetry (`D4`) in the `:exact` build — an exact
+   discrete identity, not an approximation.** `Ω_f` and the elastic grids are
+   square and centred in the two fault-parallel directions, the medium is
+   homogeneous, and all four fault-parallel far-field faces carry the same
+   `u=0` condition. So the whole discretization is invariant under the eight
+   symmetries of the square, acting on positions and on the slip/traction
+   components together: reflecting `x2 → −x2` flips `s2` and `τ2` and leaves
+   `s3`, `τ3` alone; reflecting about the diagonal swaps the two. In block form,
+   with `Q` one of the eight signed permutations and `g` its action on node
+   indices,
 
-   | relation | residual |
-   |---|---|
-   | `K22[R,R] = K22`, `K33[R,R] = K33` | 1.1e-16, 8.7e-17 |
-   | `K23[R,R] = −K23`, `K32[R,R] = −K32` | 2.4e-15 |
-   | `K22[S,S] = K33`, `K23[S,S] = K32` | 1.0e-16, 2.8e-15 |
-   | (for contrast) `K = Kᵀ` | **1.8e-3** |
+       K[g·i, g·j] = Q · K[i, j] · Qᵀ
 
-   The `D4` relations hold to *machine precision* — three orders tighter than
-   reciprocity, which carries the known interface-SAT asymmetry (§"Symmetrising
-   the reconstruction"). So they are exact discrete identities, not physical
-   near-symmetries, and using them costs nothing in accuracy.
+   Rebuilding the whole `K` from one node per orbit and differencing against a
+   full `:exact` build: **1.09e-16** at Δz = 100 m, **1.51e-16** at Δz = 80 m
+   (Frobenius, relative; worst single entry 4.3e-16).
 
-   The group acts freely on most (node, component) pairs, so the fundamental
-   domain is `2·N_Ωf / 8` — **an 8× cut in the exact build**: ~17 days → ~2 days
-   at the Δz = 20 m target, 578 → 72 solves at Δz = 50 m. Combined with §4c that
-   is a one-off two-day job for a `K` that is then reused indefinitely, which is
-   what makes the `:toeplitz` approximation avoidable for the submission rather
-   than merely defensible. Validate the same way §4b was: rebuild `K` from the
-   octant at Δz = 50 m and difference it against the full build (must agree to
-   the CG tolerance, not merely closely), then check `V_max(t)` over 30 days at
-   the converged domain.
+   **Why that is roundoff and not a small error.** `A` commutes with the
+   symmetry and the symmetry is orthogonal, so CG started from zero produces
+   *exactly* the mapped iterates — same Krylov space, same stopping test, same
+   iteration count. The symmetry therefore survives in the CG **error**, not
+   just in the converged solution. Measured by loosening the tolerance until the
+   columns are visibly wrong:
+
+   | `rtol` | `K` error vs `rtol` = 1e-12 | `D4` residual |
+   |---|---|---|
+   | 1e-12 | — | 1.09e-16 |
+   | 1e-6 | 1.9e-7 | 1.22e-16 |
+   | **1e-3** | **1.5e-4** | **1.04e-16** |
+
+   A badly converged `K` is still symmetric to the last bit. An approximation
+   would track *something* — the tolerance, `Δz`, the domain size; this tracks
+   only the machine epsilon. Contrast reciprocity, `K = Kᵀ`, which sits at
+   **1.8e-3**: that one is a physical near-symmetry spoiled by the interface-SAT
+   asymmetry, and it is what a real approximation looks like here.
+
+   **Contrast with §4b.** `:toeplitz` assumes *translation* invariance, which
+   the truncation boundary genuinely breaks — hence its 0.41–5.8%. `D4` assumes
+   only *reflection* invariance, which the truncation boundary **preserves**,
+   because the boundary is itself square and centred. Same idea, and the
+   difference between the two is exactly why one costs accuracy and the other
+   does not.
+
+   **The payoff.** The group does not act freely — nodes on the axes and
+   diagonals have stabilizers — so the reduction is 8× only asymptotically:
+
+   | Δz | `2·N_Ωf` | solves needed | speedup |
+   |---|---|---|---|
+   | 50 m | 578 | 81 | 6.5–7.1× |
+   | 25 m | 2,178 | 289 | 7.5× |
+   | **20 m** | **3,362** | **441** | **7.6×** |
+   | 10 m | 13,122 | 1,681 | 7.8× |
+
+   That turns §4b's ~17 days at the Δz = 20 m target into **~2.2 days**, with no
+   approximation at all — and combined with §4c it is a one-off job for a `K`
+   that is then reused indefinitely. It is what makes `:toeplitz` *avoidable*
+   for the submission rather than merely defensible.
+
+   **What it depends on**, in case the geometry ever changes: square and centred
+   `Ω_f` *and* elastic grid (a rectangular fault or `L_fault` differing between
+   `x2` and `x3` loses the diagonal reflection — 4× not 8×, still exact);
+   homogeneous λ, μ; the same boundary condition on all four fault-parallel
+   faces; a uniform grid with mirror-image SBP closures. The fault-normal
+   direction is untouched by these maps, so `L_normal` and the `x1`
+   discretization are unconstrained. Crucially it is a property of the
+   **operator and geometry only** — the injection source, the initial
+   conditions, and how asymmetrically slip evolves during the run are all
+   irrelevant, because `K` never sees them. A **free-surface** problem (BP1/BP3
+   rather than BP8's whole space) would break the depth reflection and leave
+   2×; that is the change most likely to cost this.
+
 1. **Multi-node parallelism (the cluster blocker).** `fault_stiffness` uses
    `Threads.@spawn` only — single node. Worse, PROGRESS records threading
    scaling as sublinear (2.13× on 16 threads at production) because sparse
