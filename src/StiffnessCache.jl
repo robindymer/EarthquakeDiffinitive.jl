@@ -3,7 +3,7 @@ module StiffnessCache
 using ..ElasticitySplitNode: CG_DEFAULTS
 
 export stiffness_cache_dir, stiffness_cache_key, stiffness_cache_path,
-       save_stiffness, load_stiffness, stiffness_cache_entries
+       save_stiffness, load_stiffness, stiffness_cache_entries, stencil_digest
 
 # ==============================================================================
 # On-disk reuse of the fault stiffness `K`.
@@ -26,6 +26,9 @@ export stiffness_cache_dir, stiffness_cache_key, stiffness_cache_path,
 #   L_fault, L_normal   truncation distances — K is NOT truncation-independent,
 #                       that is exactly what the domain study measures
 #   order           SBP order
+#   stencil         digest of the SBP coefficients themselves — `order` names
+#                   them, but Diffinitive is pinned by git revision and could
+#                   change them under a fixed `order`
 #   stiffness       :exact or :toeplitz — different K for the same physics,
 #                   which is why it is in the FILENAME and not just the key
 #   rtol, atol, itmax, precond   CG settings; rtol especially, since it sets
@@ -74,6 +77,46 @@ function fnv1a(s::AbstractString)
     return h
 end
 
+# --- canonical serialisation of the SBP operator coefficients ------------------
+#
+# `order` alone does NOT pin the operators: the coefficients live in
+# Diffinitive's `standard_diagonal.toml`, and Diffinitive is a git dependency
+# pinned by revision. Bump that revision — or add the order-6 stencils that
+# `TODO.md` wants — and `K` changes while every other part of the key stays put.
+# That is precisely the silent wrong-hit this cache is built to prevent, so the
+# coefficients go in the key too.
+#
+# Recursion is structural rather than by field name, so it does not depend on
+# `StencilSet`'s internals. Dictionary keys are SORTED because the table is a
+# `Dict{String,Any}`, whose iteration order follows `Base.hash` and is therefore
+# only stable within a Julia version — unsorted, a Julia upgrade would rename
+# every cache file and silently rebuild a multi-day `K`.
+canonical(io, x::AbstractDict) =
+    for k in sort!(collect(keys(x)); by=string)
+        print(io, k, "=")
+        canonical(io, x[k])
+        print(io, ";")
+    end
+canonical(io, x::Union{AbstractVector,Tuple}) =
+    for v in x
+        canonical(io, v)
+        print(io, ",")
+    end
+canonical(io, x::Union{Real,AbstractString,Symbol,Nothing}) = print(io, repr(x))
+canonical(io, x) =                                  # any other struct, incl. StencilSet
+    for f in fieldnames(typeof(x))
+        canonical(io, getfield(x, f))
+        print(io, "|")
+    end
+
+"""
+    stencil_digest(stencil_set) -> String
+
+A 16-hex digest of the SBP operator coefficients, for the cache key. Stable
+across processes and Julia versions; changes if any coefficient changes.
+"""
+stencil_digest(set) = string(fnv1a(sprint(canonical, set)); base=16, pad=16)
+
 # `repr` on a Float64 round-trips exactly, so the key distinguishes values that
 # print the same but are not equal.
 num(x::Float64) = repr(x)
@@ -90,6 +133,10 @@ The full identity of a cached `K`: `(; text, name)`, where `text` is the
 canonical string stored in and verified against the file, and `name` is the
 filename it goes under.
 
+`stencil` is the `StencilSet` the operators are built from (or a digest string
+from [`stencil_digest`](@ref)). It is separate from `order` on purpose — see the
+comment above `canonical`.
+
 `solver_kwargs` are the `CGSolver` keywords `build_model` forwards. They are
 normalised against [`CG_DEFAULTS`](@ref) so that passing a value explicitly and
 letting it default produce the *same* key, and an unrecognised keyword is an
@@ -97,7 +144,7 @@ error rather than a silent omission from the key — the failure mode being a
 cache hit for settings that were never the ones cached.
 """
 function stiffness_cache_key(; λ, μ, l_f, Δz, L_fault, L_normal, order, stiffness,
-                             solver_kwargs...)
+                             stencil, solver_kwargs...)
     unknown = setdiff(keys(solver_kwargs), keys(CG_DEFAULTS))
     isempty(unknown) ||
         error("solver keyword(s) $(join(unknown, ", ")) are not part of the stiffness " *
@@ -113,6 +160,7 @@ function stiffness_cache_key(; λ, μ, l_f, Δz, L_fault, L_normal, order, stiff
                  "L_fault=" * num(Float64(L_fault)),
                  "L_normal=" * num(Float64(L_normal)),
                  "order=" * num(Int(order)),
+                 "stencil=" * (stencil isa AbstractString ? stencil : stencil_digest(stencil)),
                  "stiffness=" * string(stiffness),
                  "rtol=" * num(Float64(cg.rtol)),
                  "atol=" * num(Float64(cg.atol)),

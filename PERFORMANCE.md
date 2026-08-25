@@ -306,8 +306,9 @@ preconditioned CG.
 
 ## 4c. `K` on disk: the same build never runs twice
 
-`K` depends on exactly nine things — λ, μ, `l_f`, `Δz`, `L_fault`, `L_normal`,
-`order`, the build mode, and the CG settings — and on nothing else in the model.
+`K` depends on exactly ten things — λ, μ, `l_f`, `Δz`, `L_fault`, `L_normal`,
+`order`, the SBP coefficients that `order` selects, the build mode, and the CG
+settings — and on nothing else in the model.
 Injection variant, friction parameters, `t_f`, integrator tolerances, output
 choices: none of them touch it. So the entire cost of §4's table is paid per
 *configuration*, not per run, and `StiffnessCache` makes that literal by writing
@@ -336,8 +337,10 @@ does not move the grid is free.
 
 **The correctness risk is a hit that should have been a miss**, and it is silent:
 `K` looks plausible whatever configuration produced it, and nothing downstream
-would notice. The key therefore spells out all nine inputs, is stored in the
-file, and is re-compared on load — the filename hash only has to be
+would notice. The key therefore spells out all ten inputs — including a digest of the operator
+coefficients themselves, since Diffinitive is pinned by git revision and could
+change them under a fixed `order` — is stored in the file, and is re-compared on
+load — the filename hash only has to be
 unique-in-practice, since a collision produces a miss. `:exact` and `:toeplitz`
 are separate entries and are distinguishable in the filename, not merely in the
 hash.

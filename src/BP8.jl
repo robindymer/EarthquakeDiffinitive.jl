@@ -163,7 +163,8 @@ function stiffness_matrix(; par, Δz, L_fault, L_normal, n1, n23, order, set,
         error("cache must be :auto, :read, :refresh or :off, got $cache")
 
     key = stiffness_cache_key(; λ=lame_lambda(par), μ=par.μ, l_f=par.l_f,
-                              Δz, L_fault, L_normal, order, stiffness, solver_kwargs...)
+                              Δz, L_fault, L_normal, order, stencil=set, stiffness,
+                              solver_kwargs...)
     path = (cache === :off || cache_dir === nothing) ? nothing :
            stiffness_cache_path(cache_dir, key)
 
@@ -238,9 +239,9 @@ than none, and exists so that stays visible rather than being rediscovered.
 
 ## Reusing `K` from disk
 
-`K` depends only on the elastic constants, the geometry, the grid, `order`,
-`stiffness` and the CG settings — nothing that varies between runs of the same
-configuration — so it is cached. `cache_dir` defaults to
+`K` depends only on the elastic constants, the geometry, the grid, the SBP
+operators, `stiffness` and the CG settings — nothing that varies between runs of
+the same configuration — so it is cached. `cache_dir` defaults to
 [`stiffness_cache_dir`](@ref) (the `EQD_STIFFNESS_CACHE` environment variable);
 caching is off when that is unset. `cache` selects the mode:
 

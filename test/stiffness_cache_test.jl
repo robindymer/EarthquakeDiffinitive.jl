@@ -1,6 +1,7 @@
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.BP8
 using EarthquakeDiffinitive.StiffnessCache
+using Diffinitive.SbpOperators
 using Test
 
 # The cache's only real hazard is a hit that should have been a miss: `K` looks
@@ -11,8 +12,10 @@ using Test
 
 @testset "StiffnessCache" begin
     # Shared baseline key. Values are arbitrary but fixed; only differences matter.
+    ops(order) = read_stencil_set(SbpOperators.sbp_operators_path() *
+                                  "standard_diagonal.toml"; order)
     base = (; λ=3.204e10, μ=3.204e10, l_f=400.0, Δz=100.0,
-            L_fault=800.0, L_normal=800.0, order=4, stiffness=:exact)
+            L_fault=800.0, L_normal=800.0, order=4, stencil=ops(4), stiffness=:exact)
     k0 = stiffness_cache_key(; base...)
 
     @testset "the key separates everything K depends on" begin
@@ -32,6 +35,23 @@ using Test
             @test k.text != k0.text
             @test k.name != k0.name
         end
+    end
+
+    @testset "the SBP coefficients are in the key, separately from `order`" begin
+        # `order` names the operators but does not pin them: Diffinitive is a git
+        # dependency pinned by revision, so its coefficients can change while
+        # `order` stays 4. Holding `order` fixed and swapping only the stencil
+        # set must still change the key, or bumping that revision would silently
+        # reuse a stale K.
+        k = stiffness_cache_key(; merge(base, (; stencil=ops(2)))...)
+        @test k.name != k0.name
+        @test occursin("order=4", k.text) && occursin("order=4", k0.text)
+
+        # The digest must be stable across processes and Julia versions, which
+        # means it cannot depend on `Dict` iteration order.
+        @test stencil_digest(ops(4)) == stencil_digest(ops(4))
+        @test stencil_digest(ops(4)) != stencil_digest(ops(2))
+        @test length(stencil_digest(ops(4))) == 16
     end
 
     @testset "defaults normalise: explicit == implicit" begin
