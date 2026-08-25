@@ -7,6 +7,7 @@ using SparseArrays
 using StaticArrays
 using LinearAlgebra: mul!, norm, diag
 using OrdinaryDiffEq
+using ProgressMeter: Progress, update!, finish!
 using Printf
 using Dates: today
 using Tokens
@@ -508,9 +509,12 @@ end
 
 Integrates the coupled system. Absolute tolerances are set per block (slip,
 ln θ, pressure) because they live on wildly different scales.
+
+`progress` (defaults to `verbose`) shows a `ProgressMeter` bar tracking `t/tspan[2]`,
+updated on every accepted step (ProgressMeter throttles the redraws itself).
 """
 function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=Tsit5(), reltol=1e-8,
-                 saveat=3600.0, verbose=false, kwargs...)
+                 saveat=3600.0, verbose=false, progress=verbose, kwargs...)
     u0 = initial_state(m)
     nf = m.nf
     abstol = similar(u0)
@@ -521,6 +525,15 @@ function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=Tsit5(), reltol=1e-8,
 
     prob = ODEProblem(rhs!, u0, tspan, m)
     t0 = time()
+    solve_kwargs = (; reltol, abstol, saveat, save_everystep=false,
+                     tstops=[m.par.t_off], kwargs...)
+    if progress
+        prog = Progress(100; desc="bp8: ")
+        cb = DiscreteCallback((u, t, integrator) -> true,
+            integrator -> update!(prog, floor(Int, 100 * (integrator.t - tspan[1]) / (tspan[2] - tspan[1])));
+            save_positions=(false, false))
+        solve_kwargs = (; solve_kwargs..., callback=cb)
+    end
     # `save_everystep=false`: `saveat` already defines the output grid, and
     # storing every accepted step on top of it is what made the Peaceman variant
     # blow up. Measured at Δz = 50 m over 100 h: 31,249 accepted steps for 101
@@ -533,8 +546,8 @@ function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=Tsit5(), reltol=1e-8,
     # shipped path only ever asks for on-grid times. A `profile_dt` that is not
     # a multiple of `saveat` interpolates across hour-wide gaps instead of
     # actual steps — measured at 1.3e-5 relative, negligible here but not zero.
-    sol = solve(prob, alg; reltol, abstol, saveat, save_everystep=false,
-                tstops=[m.par.t_off], kwargs...)
+    sol = solve(prob, alg; solve_kwargs...)
+    progress && finish!(prog)
     verbose && @info "integration finished" seconds = round(time() - t0, digits=1) saved = length(sol.t) steps = sol.stats.naccept retcode = sol.retcode
     return sol
 end
