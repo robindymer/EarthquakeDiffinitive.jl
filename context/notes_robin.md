@@ -15,6 +15,16 @@ instantiate
 ## Run script
 julia --project=scripts scripts/elastic_wave_2d.jl
 
+## Reuse K between runs
+export EQD_STIFFNESS_CACHE=$HOME/.cache/eqd-stiffness
+
+Set it once and every `build_model` reads/writes K there — a hit skips the
+elastic assembly and all the CG solves. Unset = no caching (that is what CI
+does). Build one offline, or list what is cached:
+
+julia --project=scripts -t auto scripts/build_stiffness_cache.jl 20 1600 1200 exact
+julia --project=scripts scripts/build_stiffness_cache.jl --list
+
 ## TODOs / thoughts
 - Order of FD used?
 - Theory of the iterative method?

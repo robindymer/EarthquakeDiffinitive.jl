@@ -17,6 +17,9 @@ using .RateStateFriction
 include("FaultResponse.jl")
 using .FaultResponse
 
+include("StiffnessCache.jl")
+using .StiffnessCache
+
 include("BP8.jl")
 using .BP8
 

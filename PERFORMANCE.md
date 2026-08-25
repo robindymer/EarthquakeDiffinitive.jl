@@ -304,6 +304,47 @@ or a far larger domain — and neither was in reach. Measured at the small domai
 only; the converged-domain repeat was cut when the project moved to
 preconditioned CG.
 
+## 4c. `K` on disk: the same build never runs twice
+
+`K` depends on exactly nine things — λ, μ, `l_f`, `Δz`, `L_fault`, `L_normal`,
+`order`, the build mode, and the CG settings — and on nothing else in the model.
+Injection variant, friction parameters, `t_f`, integrator tolerances, output
+choices: none of them touch it. So the entire cost of §4's table is paid per
+*configuration*, not per run, and `StiffnessCache` makes that literal by writing
+`K` to `$EQD_STIFFNESS_CACHE` and reading it back.
+
+**A hit skips `FaultElasticity` too, not just the solves.** The cache file
+carries the `Ω_f` axes, which is all `build_model` needed the elastic system for
+once `K` exists — so the ~15 GB, minutes-long sparse assembly at Δz = 20 m is
+skipped as well, and a cached model at any resolution builds in the time it
+takes to read the file. Measured at Δz = 100 m, `:exact`: 25.8 s cold, 0.024 s
+warm.
+
+| Δz | `Ω_f` nodes | `K` on disk |
+|---|---|---|
+| 50 m | 289 | 2.5 MB |
+| 25 m | 1,089 | 36 MB |
+| **20 m** | **1,681** | **86 MB** |
+| 10 m | 6,561 | 1.3 GB |
+
+Nothing about this changes the Δz⁻⁶·⁷ scaling of the first build. What it
+changes is the *number of first builds*: it is what makes `:exact` usable at a
+production configuration despite §4b's ~17 days at Δz = 20 m, because that price
+is paid once, offline, in its own job
+(`scripts/build_stiffness_cache.jl`) — after which every parameter study that
+does not move the grid is free.
+
+**The correctness risk is a hit that should have been a miss**, and it is silent:
+`K` looks plausible whatever configuration produced it, and nothing downstream
+would notice. The key therefore spells out all nine inputs, is stored in the
+file, and is re-compared on load — the filename hash only has to be
+unique-in-practice, since a collision produces a miss. `:exact` and `:toeplitz`
+are separate entries and are distinguishable in the filename, not merely in the
+hash.
+
+Caching is off unless `EQD_STIFFNESS_CACHE` is set, so the test suite and CI
+never read or write it.
+
 ## 6. Preconditioning: measured, and it does not pay
 
 Preconditioning was the natural alternative to §4b's Toeplitz build — it is the
@@ -392,6 +433,34 @@ largely dissolves item 1 rather than competing with it.
 
 0. **Implement the Toeplitz `K` build** (§4b). Turns `2·N_Ωf` solves into 2, at
    ~0.03% cost in `V_max`. Purely local work, no cluster needed.
+0b. **Exploit `K`'s square symmetry (`D4`) in the `:exact` build — measured to
+   hold at machine precision, and *not* an approximation.** `Ω_f` and both
+   elastic grids are square and centred, so the discretization is invariant
+   under the eight symmetries of the square. Reflecting `x2 → −x2` flips `s2`
+   and `τ2` and leaves `s3`, `τ3` alone; reflecting about the diagonal swaps
+   the two. Measured at Δz = 100 m against a full `:exact` build:
+
+   | relation | residual |
+   |---|---|
+   | `K22[R,R] = K22`, `K33[R,R] = K33` | 1.1e-16, 8.7e-17 |
+   | `K23[R,R] = −K23`, `K32[R,R] = −K32` | 2.4e-15 |
+   | `K22[S,S] = K33`, `K23[S,S] = K32` | 1.0e-16, 2.8e-15 |
+   | (for contrast) `K = Kᵀ` | **1.8e-3** |
+
+   The `D4` relations hold to *machine precision* — three orders tighter than
+   reciprocity, which carries the known interface-SAT asymmetry (§"Symmetrising
+   the reconstruction"). So they are exact discrete identities, not physical
+   near-symmetries, and using them costs nothing in accuracy.
+
+   The group acts freely on most (node, component) pairs, so the fundamental
+   domain is `2·N_Ωf / 8` — **an 8× cut in the exact build**: ~17 days → ~2 days
+   at the Δz = 20 m target, 578 → 72 solves at Δz = 50 m. Combined with §4c that
+   is a one-off two-day job for a `K` that is then reused indefinitely, which is
+   what makes the `:toeplitz` approximation avoidable for the submission rather
+   than merely defensible. Validate the same way §4b was: rebuild `K` from the
+   octant at Δz = 50 m and difference it against the full build (must agree to
+   the CG tolerance, not merely closely), then check `V_max(t)` over 30 days at
+   the converged domain.
 1. **Multi-node parallelism (the cluster blocker).** `fault_stiffness` uses
    `Threads.@spawn` only — single node. Worse, PROGRESS records threading
    scaling as sublinear (2.13× on 16 threads at production) because sparse

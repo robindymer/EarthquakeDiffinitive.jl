@@ -13,7 +13,7 @@ using ..Elasticity: elastic_blocks, traction_blocks
 
 export split_node_system, dof_index_minus, dof_index_plus, build_chi,
        reconstruct_U, fault_node_pairs,
-       CGSolver, split_node_solve, jacobi_preconditioner,
+       CGSolver, CG_DEFAULTS, split_node_solve, jacobi_preconditioner,
        solver_report, duplicate, merge_stats!
 
 # ==============================================================================
@@ -362,7 +362,18 @@ function build_preconditioner(A, precond::Symbol)
     error("precond must be :none or :jacobi, got $precond")
 end
 
-function CGSolver(A; rtol=1e-10, atol=0.0, itmax=0, precond::Symbol=:none)
+"""
+    CG_DEFAULTS
+
+The default `CGSolver` keyword values, in one place so that anything needing to
+know them — notably `StiffnessCache`, which has to fold the solver settings into
+a cache key and cannot afford to guess — reads them from here rather than
+duplicating the literals.
+"""
+const CG_DEFAULTS = (rtol=1e-10, atol=0.0, itmax=0, precond=:none)
+
+function CGSolver(A; rtol=CG_DEFAULTS.rtol, atol=CG_DEFAULTS.atol,
+                  itmax=CG_DEFAULTS.itmax, precond::Symbol=CG_DEFAULTS.precond)
     n = size(A, 2)
     M, ldiv = build_preconditioner(A, precond)
     return CGSolver(A, M, ldiv, precond, CgWorkspace(n, n, Vector{Float64}),

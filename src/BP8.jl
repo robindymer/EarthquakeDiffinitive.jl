@@ -15,6 +15,7 @@ using ..RateStateFriction
 using ..PorePressure
 using ..FaultResponse
 using ..Elasticity
+using ..StiffnessCache
 
 export BP8Params, benchmark_parameters, BP8Model, build_model, initial_state,
        run_bp8, evaluate!, write_outputs, station_locations,
@@ -148,6 +149,59 @@ struct BP8Model
     grid_info::NamedTuple
 end
 
+# `K` for one configuration, from the cache if it is there.
+#
+# Split out of `build_model` so the two paths that produce a `K` — load, and
+# build-then-maybe-save — sit next to each other, and so `FaultElasticity` is
+# constructed inside the miss branch only. That placement is the point of the
+# whole cache: assembling the split-node system is ~15 GB and minutes at the
+# Δz = 20 m target (PERFORMANCE.md §4), and a hit has no use for it.
+function stiffness_matrix(; par, Δz, L_fault, L_normal, n1, n23, order, set,
+                          stiffness, cache, cache_dir, verbose, solver_kwargs)
+    cache ∈ (:auto, :read, :refresh, :off) ||
+        error("cache must be :auto, :read, :refresh or :off, got $cache")
+
+    key = stiffness_cache_key(; λ=lame_lambda(par), μ=par.μ, l_f=par.l_f,
+                              Δz, L_fault, L_normal, order, stiffness, solver_kwargs...)
+    path = (cache === :off || cache_dir === nothing) ? nothing :
+           stiffness_cache_path(cache_dir, key)
+
+    if path !== nothing && cache !== :refresh
+        hit = load_stiffness(path, key)
+        if hit !== nothing
+            K, x2, x3 = hit
+            verbose && @info "fault stiffness: cache hit" path stiffness size = size(K)
+            return K, x2, x3
+        end
+    end
+
+    g_minus = equidistant_grid((-L_normal, -L_fault, -L_fault), (0.0, L_fault, L_fault), n1, n23, n23)
+    g_plus = equidistant_grid((0.0, -L_fault, -L_fault), (L_normal, L_fault, L_fault), n1, n23, n23)
+
+    t0 = time()
+    fe = FaultElasticity(g_minus, g_plus, lame_lambda(par), par.μ, set;
+                         l_f=par.l_f, solver_kwargs...)
+    verbose && @info "split-node system ready" seconds = round(time() - t0, digits=1)
+
+    t0 = time()
+    K = stiffness === :toeplitz ? fault_stiffness_toeplitz(fe; verbose) :
+                                  fault_stiffness(fe; verbose)
+    verbose && @info "fault stiffness built" seconds = round(time() - t0, digits=1) stiffness size = size(K) elastic_solver_report(fe)...
+
+    x2, x3 = collect.(fault_grid_axes(fe))
+    if path !== nothing && cache !== :read
+        # A failed save must not lose a build that just cost hours: warn and
+        # hand back the K we have.
+        try
+            save_stiffness(path, key, K, x2, x3)
+            verbose && @info "fault stiffness: cached" path bytes = filesize(path)
+        catch err
+            @warn "could not write the stiffness cache; continuing with the K in memory" path err
+        end
+    end
+    return K, x2, x3
+end
+
 """
     build_model(; par=benchmark_parameters(), Δz, L_fault, L_normal,
                   injection=:gaussian, order=4, verbose=false)
@@ -180,11 +234,38 @@ each solve. It is an **independent** axis from `stiffness`: `stiffness` sets how
 *many* solves are done, `precond` how each one converges, and every combination
 is valid. `:none` (default) or `:jacobi` — the latter measures 0.92×, i.e. worse
 than none, and exists so that stays visible rather than being rediscovered.
+
+## Reusing `K` from disk
+
+`K` depends only on the elastic constants, the geometry, the grid, `order`,
+`stiffness` and the CG settings — nothing that varies between runs of the same
+configuration — so it is cached. `cache_dir` defaults to
+[`stiffness_cache_dir`](@ref) (the `EQD_STIFFNESS_CACHE` environment variable);
+caching is off when that is unset. `cache` selects the mode:
+
+| `cache` | on a hit | on a miss |
+|---|---|---|
+| `:auto` (default) | load | build, then save |
+| `:read` | load | build, save nothing |
+| `:refresh` | ignored | build, then overwrite |
+| `:off` | — | build |
+
+**A hit skips `FaultElasticity` as well as the solves**, which is the bulk of
+the remaining cost: the cache file carries the `Ω_f` axes, and nothing else in
+`BP8Model` needs the elastic system once `K` exists. So a cached `:exact` model
+at a production configuration builds in seconds rather than days — which is what
+makes `:exact` usable for a sweep over the *cheap* axes (injection, friction,
+`t_f`, tolerances) where `K` does not change at all.
+
+The cache key spells out every input that reaches `K` and is verified against
+the file on load, so a changed configuration misses rather than silently
+returning the wrong `K`; see `StiffnessCache`.
 """
 function build_model(; par::BP8Params=benchmark_parameters(),
                      Δz=par.Δz, L_fault=3par.l_f, L_normal=2par.l_f,
                      injection=:gaussian, order=4, verbose=false,
                      stiffness=:toeplitz,
+                     cache=:auto, cache_dir=stiffness_cache_dir(),
                      solver_kwargs...)
     injection ∈ (:gaussian, :peaceman) ||
         error("injection must be :gaussian or :peaceman, got $injection")
@@ -202,24 +283,13 @@ function build_model(; par::BP8Params=benchmark_parameters(),
                          "Increase L_normal or decrease Δz.")
     n23 >= n_min || error("2*L_fault/Δz gives only $n23 points along the fault; " *
                           "SBP order $order needs at least $n_min.")
-    g_minus = equidistant_grid((-L_normal, -L_fault, -L_fault), (0.0, L_fault, L_fault), n1, n23, n23)
-    g_plus = equidistant_grid((0.0, -L_fault, -L_fault), (L_normal, L_fault, L_fault), n1, n23, n23)
     verbose && @info "elastic grids" points_per_side = n1 * n23^2 dofs = 6 * n1 * n23^2
 
-    t0 = time()
-    fe = FaultElasticity(g_minus, g_plus, lame_lambda(par), par.μ, set;
-                         l_f=par.l_f, solver_kwargs...)
-    verbose && @info "split-node system ready" seconds = round(time() - t0, digits=1)
-
-    t0 = time()
     stiffness ∈ (:exact, :toeplitz) ||
         error("stiffness must be :exact or :toeplitz, got $stiffness")
-    K = stiffness === :toeplitz ? fault_stiffness_toeplitz(fe; verbose) :
-                                  fault_stiffness(fe; verbose)
-    verbose && @info "fault stiffness built" seconds = round(time() - t0, digits=1) stiffness size = size(K) elastic_solver_report(fe)...
-
-    x2, x3 = fault_grid_axes(fe)
-    nf = frictional_node_count(fe)
+    K, x2, x3 = stiffness_matrix(; par, Δz, L_fault, L_normal, n1, n23, order, set,
+                                 stiffness, cache, cache_dir, verbose, solver_kwargs)
+    nf = length(x2) * length(x3)
     n2f, n3f = length(x2), length(x3)
 
     # Pore pressure on exactly the Ω_f fault nodes, so p and s share an index.
