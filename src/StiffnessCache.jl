@@ -3,7 +3,8 @@ module StiffnessCache
 using ..ElasticitySplitNode: CG_DEFAULTS
 
 export stiffness_cache_dir, stiffness_cache_key, stiffness_cache_path,
-       save_stiffness, load_stiffness, stiffness_cache_entries, stencil_digest
+       save_stiffness, load_stiffness, stiffness_cache_entries, stencil_digest,
+       save_stiffness_shard, load_stiffness_shard, merge_stiffness_shards
 
 # ==============================================================================
 # On-disk reuse of the fault stiffness `K`.
@@ -298,6 +299,141 @@ function stiffness_cache_entries(dir=stiffness_cache_dir())
         push!(out, (; name, path, bytes=filesize(path), key))
     end
     return out
+end
+
+# ==============================================================================
+# Sharding an `:exact` build across independent processes (e.g. cluster nodes).
+#
+# `fault_stiffness`'s `2·N_Ωf` columns are independent right-hand sides against
+# the same assembled `A`: no communication is needed between them, only a
+# private copy of `A` per shard (`FaultElasticity` assembly is minutes,
+# PERFORMANCE.md §4c) and a slice of the columns. That is enough to spread an
+# otherwise multi-node-days build across many single-node jobs with nothing
+# fancier than the filesystem as the coordination point — see
+# `build_stiffness_cache.jl [shard] [nshards]` and `merge_stiffness_cache.jl`.
+#
+# A shard file is smaller than the final cache entry (only its columns, not
+# the full `2N_Ωf × 2N_Ωf` matrix) and carries the *global* column indices it
+# covers, so merging does not trust a claimed `nshards` — it trusts the union
+# of `cols` actually found on disk. That is what lets a failed or re-run shard
+# job be dropped in without renumbering anything else.
+# ==============================================================================
+
+const SHARD_MAGIC = "EQDKSHD1"
+
+"""
+    save_stiffness_shard(path, key, cols, Kshard, x2, x3)
+
+Write one shard of a `K` build: the global column indices `cols` (into
+`1:2N_Ωf`) and the corresponding `2N_Ωf × length(cols)` slice `Kshard`, tagged
+with the same `key` the final assembled cache entry will carry. Same
+write-to-temp-then-`mv` safety as [`save_stiffness`](@ref).
+"""
+function save_stiffness_shard(path, key, cols::AbstractVector{<:Integer},
+                              Kshard::AbstractMatrix{Float64}, x2, x3)
+    size(Kshard, 2) == length(cols) ||
+        error("Kshard has $(size(Kshard, 2)) columns but cols has $(length(cols)) entries")
+    mkpath(dirname(path))
+    tmp = string(path, ".tmp.", getpid(), ".", rand(UInt32))
+    try
+        open(tmp, "w") do io
+            kb = codeunits(key.text)
+            npad = pad8(length(kb))
+            write(io, SHARD_MAGIC)
+            write(io, Int64(length(kb) + npad))
+            write(io, kb)
+            npad > 0 && write(io, zeros(UInt8, npad))
+            write(io, Int64(length(x2)), Int64(length(x3)))
+            write(io, Vector{Float64}(x2), Vector{Float64}(x3))
+            write(io, Int64(size(Kshard, 1)), Int64(length(cols)))
+            write(io, Vector{Int64}(cols))
+            write(io, Kshard)
+        end
+        mv(tmp, path; force=true)
+    catch
+        isfile(tmp) && rm(tmp; force=true)
+        rethrow()
+    end
+    return path
+end
+
+"""
+    load_stiffness_shard(path, key) -> (; cols, K, x2, x3) or nothing
+
+Read back one shard written by [`save_stiffness_shard`](@ref). Returns
+`nothing` — never throws — for anything that means "not a usable shard for
+this `key`": absent, truncated, wrong magic, or a key mismatch (warned, since
+that would otherwise look like a shard that silently never merges).
+"""
+function load_stiffness_shard(path, key)
+    isfile(path) || return nothing
+    try
+        return open(path, "r") do io
+            String(read(io, ncodeunits(SHARD_MAGIC))) == SHARD_MAGIC || return nothing
+            keylen = read(io, Int64)
+            0 < keylen < 1 << 20 || return nothing
+            text = rstrip(String(read(io, keylen)), '\0')
+            if text != key.text
+                @warn "stiffness shard: key mismatch, ignoring" path
+                return nothing
+            end
+            n2 = read(io, Int64)
+            n3 = read(io, Int64)
+            x2 = read!(io, Vector{Float64}(undef, n2))
+            x3 = read!(io, Vector{Float64}(undef, n3))
+            nrow = read(io, Int64)
+            ncol = read(io, Int64)
+            nrow == 2n2 * n3 ||
+                error("shard K has $nrow rows but the axes give nf = $(n2*n3)")
+            cols = read!(io, Vector{Int64}(undef, ncol))
+            K = read!(io, Matrix{Float64}(undef, nrow, ncol))
+            eof(io) || error("trailing bytes after shard K")
+            return (; cols, K, x2, x3)
+        end
+    catch err
+        @warn "stiffness shard: unreadable entry, skipping" path err
+        return nothing
+    end
+end
+
+"""
+    merge_stiffness_shards(dir, key) -> (K, x2, x3)
+
+Assemble the full `K` for `key` from shard files `<key.name>.shard*` under
+`dir`. Errors — rather than silently returning a partial matrix — if the
+union of columns found across shards is not exactly `1:2N_Ωf` with no gaps and
+no duplicates, or if no shards are found at all.
+"""
+function merge_stiffness_shards(dir, key)
+    paths = filter(p -> startswith(basename(p), key.name * ".shard"),
+                   isdir(dir) ? readdir(dir; join=true) : String[])
+    isempty(paths) && error("no shard files found for $(key.name) under $dir")
+
+    shards = filter(!isnothing, [load_stiffness_shard(p, key) for p in paths])
+    isempty(shards) && error("found $(length(paths)) file(s) matching $(key.name).shard*, " *
+                             "but none had a matching key — see warnings above")
+
+    x2, x3 = shards[1].x2, shards[1].x3
+    n2, n3 = length(x2), length(x3)
+    nf = n2 * n3
+    ncols = 2nf
+    K = fill(NaN, 2nf, ncols)
+
+    seen = falses(ncols)
+    for s in shards
+        s.x2 == x2 && s.x3 == x3 ||
+            error("shard axes disagree with another shard for the same key — corrupt cache dir?")
+        for (pos, col) in enumerate(s.cols)
+            1 <= col <= ncols || error("shard column index $col out of range 1:$ncols")
+            seen[col] && error("column $col is covered by more than one shard")
+            seen[col] = true
+            K[:, col] .= @view s.K[:, pos]
+        end
+    end
+    all(seen) ||
+        error("shards cover $(count(seen))/$ncols columns — missing: ", findall(!, seen))
+
+    return K, x2, x3
 end
 
 end # module StiffnessCache

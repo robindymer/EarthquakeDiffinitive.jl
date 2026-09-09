@@ -30,3 +30,12 @@ julia --project=scripts scripts/build_stiffness_cache.jl --list
 - Theory of the iterative method?
 - CG indirect method, used to solve large Ax=b systems
 - Cholesky is a direct method, probably not viable for full scale problem
+
+## Running on UPPMAX
+module load Julia/1.11.3-linux-x86_64
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
+julia --project=scripts -e 'using Pkg; Pkg.instantiate()'
+julia --project=. -e 'using EarthquakeDiffinitive; println("ok")'
+
+./scripts/submit_bp8.sh 20
+./scripts/submit_bp8.sh 10

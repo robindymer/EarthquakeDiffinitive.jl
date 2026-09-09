@@ -134,7 +134,11 @@ stand.
    - **It is local.** A per-node **3×3** block-diagonal (`s2,s3,ϕ`, using only
      `diag(K)`) reproduces the stiff eigenvalue to ratio **1.0000**. The dense
      `K` off-diagonals contribute nothing, and the pressure block is *not*
-     stiff (-2.1e-4).
+     stiff (-2.1e-4). *(2026-09-09: that -2.1e-4 excluded the Peaceman well
+     coupling — with it the pressure block is -5.9e-4 at Δz = 50 m and 10×
+     diffusion at Δz = 100 m. Still ~2800× below the friction mode, so this
+     conclusion stands. Pressure is no longer integrated with the elastic
+     system at all; see `PROGRESS.md` "Pore pressure is integrated separately".)*
    - **So the fix is IMEX, not JFNK** — `nf` independent 3×3 solves, no Krylov,
      no preconditioner, no dense factorization. JFNK is overkill.
 
@@ -150,7 +154,9 @@ stand.
          `evaluate!`'s cache mutation (`Vprev`, `floor_hits`, `σ̄_lowest`,
          `floor_nodes`) must not accumulate on off-trajectory evaluations.
    - [ ] **Then the 3×3 IMEX split.** Not started — deferred, since BP8-GS is
-         not stiffness-bound (405 steps) and is the next run.
+         not stiffness-bound (405 steps) and is the next run. Note the explicit
+         part is now `K`'s off-diagonals only: pressure left the coupled state
+         on 2026-09-09.
 
    **Do not benchmark this at Δz = 50 m.** Tsit5 does 100 h in 15.8 s there and
    no implicit method will beat it at `N` = 1157. Validate correctness at 50 m;

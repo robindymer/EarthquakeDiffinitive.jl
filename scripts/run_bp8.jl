@@ -1,10 +1,17 @@
 # Runs SEAS BP8-QD and writes the §4 benchmark output files.
 #
-#   julia --project=. scripts/run_bp8.jl [gs|pw] [Δz] [L_fault] [L_normal]
+#   julia --project=. scripts/run_bp8.jl [gs|pw] [Δz] [L_fault] [L_normal] [stiffness]
 #
-# Defaults to the largest configuration that fits in memory on a 13 GB
-# machine. The binding constraint is fill-in in the sparse LU of the 3D
-# elastic system, not the grid size itself — see PROGRESS.md.
+# `stiffness` is `exact` (default here — the submission route, matching
+# `build_stiffness_cache.jl`) or `toeplitz`. Pass `exact` only once `K` for
+# this configuration is already sitting in `$EQD_STIFFNESS_CACHE` (built
+# separately with `build_stiffness_cache.jl`, which is sized for a standalone
+# cluster job) — otherwise this run pays the `:exact` build cost inline.
+#
+# Δz = 20 m, L_fault = 1600 m, L_normal = 1200 m is the coarsest grid that
+# resolves the process zone (`L_b/Δz ≥ 3`) at the domain size the §6 study
+# found necessary; see PERFORMANCE.md §4 and PROGRESS.md "Domain requirement
+# relaxes with resolution". Those are also this script's defaults below.
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.BP8
 using Printf
@@ -12,21 +19,22 @@ using Printf
 const MODELER = get(ENV, "BP8_MODELER", "Robin Dymér")
 
 injection = length(ARGS) >= 1 ? Symbol(lowercase(ARGS[1]) == "pw" ? :peaceman : :gaussian) : :gaussian
-# TODO: Check that below is true
-# When Δz = 20, set L_fault = 1600 and L_normal = 1200 for domain-convergence
-# If Δz = 10, should get away with 1200 for both
-Δz = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 50.0
-L_fault = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 800.0
-L_normal = length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 400.0
+Δz = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 20.0
+L_fault = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 1600.0
+L_normal = length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 1200.0
+stiffness = length(ARGS) >= 5 ? Symbol(ARGS[5]) : :exact
+stiffness ∈ (:exact, :toeplitz) ||
+    error("stiffness must be exact or toeplitz, got $stiffness")
 
 tag = injection === :gaussian ? "GS" : "PW"
-outdir = joinpath(@__DIR__, "..", "output", "BP8-QD-$(tag)_dz$(Int(Δz))_Lf$(Int(L_fault))_Ln$(Int(L_normal))")
+outdir = joinpath(@__DIR__, "..", "output",
+                  "BP8-QD-$(tag)_dz$(Int(Δz))_Lf$(Int(L_fault))_Ln$(Int(L_normal))_$(stiffness)")
 
-@info "BP8-QD-$tag" Δz L_fault L_normal outdir
+@info "BP8-QD-$tag" Δz L_fault L_normal stiffness outdir
 flush(stdout)
 
 t0 = time()
-m = build_model(; Δz, L_fault, L_normal, injection, verbose=true)
+m = build_model(; Δz, L_fault, L_normal, injection, stiffness, verbose=true)
 @info "model built" seconds = round(time() - t0, digits=1) frictional_nodes = m.nf
 flush(stdout)
 
@@ -47,7 +55,7 @@ function summarize(m, sol)
         c = evaluate!(m, sol.u[j], t)
         v = maximum(c.Vmag)
         v > Vpeak && (Vpeak = v; tpeak = t)
-        ppeak = max(ppeak, sol.u[j][3nf+ic])
+        ppeak = max(ppeak, pressure_at!(m, t)[ic])
     end
     uend = sol.u[end]
     @printf("\npeak slip rate      %.4E m/s at t = %.3f days\n", Vpeak, tpeak / 86400)

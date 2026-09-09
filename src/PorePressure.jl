@@ -11,7 +11,7 @@ using LinearAlgebra: mul!
 export pore_pressure_operator, gaussian_source, injection_rate,
        solve_pore_pressure, darcy_operators, well_index, well_cell_index,
        SBP4_RE_FACTOR,
-       peaceman_cell_volume
+       peaceman_cell_volume, well_coupled_operator
 
 """
     pore_pressure_operator(l_f, Δz, α, stencil_set) -> (g, A)
@@ -136,6 +136,53 @@ Volume `V_e = Δz²·L_fwid` of the well cell, used for its storage
 `S_e = V_e·φ·β` in BP8-QD eq. 23.
 """
 peaceman_cell_volume(Δz, L_fwid) = Δz^2 * L_fwid
+
+"""
+    well_coupled_operator(Ap, well_cell, WI, S_e, S_well) -> J
+
+The Peaceman variant's pressure subsystem (BP8-QD eq. 22-23) as one constant
+sparse operator on the stacked unknown `[p; p_well]`, so that
+
+    d/dt [p; p_well] = J * [p; p_well] + [0; q_inj(t)/S_well].
+
+This is the benchmark's **option 2** from §2.1.2's closing note: the well
+pressure is carried as one additional unknown in the same linear system, rather
+than operator-split (option 1) or eliminated by a step of Gaussian elimination
+(option 3).
+
+The well exchange `WI*(p_well - p[well_cell])` enters the well cell's storage
+`S_e` and the well bore's storage `S_well` with opposite signs, which puts a
+2x2 block at `(well_cell, end)` on top of the diffusion operator `Ap`.
+
+**That block, not diffusion, is the stiffest part of the pressure subsystem.**
+Its relaxation eigenvalue is `-WI*(1/S_well + 1/S_e)`, which is constant — it
+depends on neither `σ̄` nor the friction state. Measured against a dense
+eigendecomposition of `J`:
+
+| Δz | λ(`Ap` alone) | λ(`J`) | `-WI(1/S_well + 1/S_e)` |
+|---|---|---|---|
+| 100 m | -5.15e-5 | **-5.05e-4** | -5.05e-4 |
+| 50 m | -2.11e-4 | -5.89e-4 | -5.84e-4 |
+| 25 m | -8.51e-4 | -9.02e-4 | -7.44e-4 |
+
+At Δz = 100 m the well coupling is **10x stiffer than diffusion**, and
+-5.05e-4 is the constant eigenvalue `PROGRESS.md` recorded there as "belonging
+to some other mode, which `K_ww/D` does not predict". That mode is this block.
+It is why `p` is integrated implicitly and separately (`BP8.solve_pressure_history`)
+rather than carried explicitly in the coupled state.
+
+Note this is *not* the stiffness that dominates BP8-PW once the `σ̄_min` floor
+binds — that one is `K_ww/D` at ≈ -1.7, three orders larger. See
+`scripts/bp8_stiffness_spectrum.jl`.
+"""
+function well_coupled_operator(Ap, well_cell, WI, S_e, S_well)
+    nf = size(Ap, 1)
+    J = [Ap spzeros(nf, 1); spzeros(1, nf + 1)]
+    return J + sparse([well_cell, well_cell, nf + 1, nf + 1],
+                      [well_cell, nf + 1, well_cell, nf + 1],
+                      [-WI / S_e, WI / S_e, WI / S_well, -WI / S_well],
+                      nf + 1, nf + 1)
+end
 
 """
     gaussian_source(g, L_gauss)

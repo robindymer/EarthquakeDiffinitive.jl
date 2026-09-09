@@ -99,7 +99,7 @@ function sweep(Δzs)
                             K_self=m.K[ic, ic],
                             slip_centre=sol.u[end][ic],
                             Vmax=maximum(c.Vmag),
-                            p_centre=sol.u[end][3nf+ic]))
+                            p_centre=pressure_at!(m, sol.t[end])[ic]))
             r = results[end]
             @printf("DONE Δz=%.0f dofs=%d build=%.1fs K_self=%.5E slip=%.5E Vmax=%.5E p=%.4f MPa\n",
                     r.Δz, r.dofs, r.t_build, r.K_self, r.slip_centre, r.Vmax, r.p_centre / 1e6)

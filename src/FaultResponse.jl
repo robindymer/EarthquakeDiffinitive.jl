@@ -211,7 +211,7 @@ function shear_traction!(Δτ2, Δτ3, fe::FaultElasticity, s2, s3, χ, solver=f
 end
 
 """
-    fault_stiffness(fe; verbose=false) -> K
+    fault_stiffness(fe; verbose=false, cols=nothing) -> K
 
 The dense fault stiffness `K` mapping stacked slip `[s2; s3]` on `Ω_f` to
 stacked traction change `[Δτ2; Δτ3]`, built one column at a time from unit
@@ -225,15 +225,27 @@ the stress driving it — `K[i,i] < 0`.
 The columns are independent, so this build is **embarrassingly parallel** and
 threads across `Threads.nthreads()` by default (start Julia with `-t auto`).
 Pass `threaded=false` to force the serial path.
+
+`cols` restricts the build to a subset of the `1:2*N_Ωf` column indices —
+`nothing` (default) builds all of them and returns the usual `2N_Ωf × 2N_Ωf`
+matrix. Passing a range or vector instead returns a `2N_Ωf × length(cols)`
+matrix holding just those columns, in the order given — this is what makes
+the build shardable across independent processes (`build_stiffness_cache.jl`
+`[shard] [nshards]`) at a resolution where a single node's worth of solves is
+not tractable: each shard rebuilds `fe` (cheap — minutes, PERFORMANCE.md §4)
+and computes only its slice of columns, since the columns need no
+communication with each other.
 """
 function fault_stiffness(fe::FaultElasticity; verbose=false,
-                         threaded=Threads.nthreads() > 1)
+                         threaded=Threads.nthreads() > 1, cols=nothing)
     nf = frictional_node_count(fe)
-    K = Matrix{Float64}(undef, 2nf, 2nf)
-    ncols = 2nf
+    cols = cols === nothing ? (1:2nf) : cols
+    ncols = length(cols)
+    K = Matrix{Float64}(undef, 2nf, ncols)
     t0 = time()
 
-    # Fills `cols` of K using `solver`, with buffers private to this call.
+    # Fills the assigned (position, column) pairs of K using `solver`, with
+    # buffers private to this call.
     #
     # This MUST be a function rather than a `begin` block inside the spawn:
     # `if`/`else` and `begin` do not introduce scope in Julia, so buffers
@@ -241,27 +253,28 @@ function fault_stiffness(fe::FaultElasticity; verbose=false,
     # share the same `χ`/`s2`/`Δτ` arrays. A function body is a real scope, so
     # each invocation gets its own. (Learned the hard way — the threaded `K`
     # came out 2.35 relative off before this was a function.)
-    function run_columns!(cols, solver; progress=false)
+    function run_columns!(items, solver; progress=false)
         s2, s3 = zeros(nf), zeros(nf)
         Δτ2, Δτ3 = zeros(nf), zeros(nf)
         χ = zeros(fe.Ntot)
         done = 0
-        for col in cols
+        for (pos, col) in items
             fill!(s2, 0.0)
             fill!(s3, 0.0)
             col <= nf ? (s2[col] = 1.0) : (s3[col-nf] = 1.0)
             shear_traction!(Δτ2, Δτ3, fe, s2, s3, χ, solver)
-            K[1:nf, col] .= Δτ2
-            K[nf+1:2nf, col] .= Δτ3
+            K[1:nf, pos] .= Δτ2
+            K[nf+1:2nf, pos] .= Δτ3
             done += 1
-            if progress && (done % 50 == 0 || done == length(cols))
+            if progress && (done % 50 == 0 || done == length(items))
                 el = time() - t0
-                @info "fault_stiffness: column $done/$(length(cols))" elapsed = round(el, digits=1) eta = round(el * (length(cols) - done) / done, digits=1)
+                @info "fault_stiffness: column $done/$(length(items))" elapsed = round(el, digits=1) eta = round(el * (length(items) - done) / done, digits=1)
             end
         end
         return solver
     end
 
+    indexed = collect(enumerate(cols))
     if threaded
         nt = min(Threads.nthreads(), ncols)
         verbose && @info "fault_stiffness: threaded build" columns = ncols threads = nt
@@ -273,14 +286,14 @@ function fault_stiffness(fe::FaultElasticity; verbose=false,
         # time for one to finish IS the time for all of them. Without this the
         # progress reporting only worked on the serial path, which is the one
         # nobody runs at production size — a 2.1 h build with no visible progress.
-        tasks = [Threads.@spawn run_columns!(t:nt:ncols, duplicate(fe.rs);
+        tasks = [Threads.@spawn run_columns!(indexed[t:nt:end], duplicate(fe.rs);
                                              progress=(verbose && t == 1)) for t in 1:nt]
         # Fold each worker's counters back so `solver_report` totals the build.
         for task in tasks
             merge_stats!(fe.rs, fetch(task))
         end
     else
-        run_columns!(1:ncols, fe.rs; progress=verbose)
+        run_columns!(indexed, fe.rs; progress=verbose)
     end
     verbose && @info "fault_stiffness: done" seconds = round(time() - t0, digits=1)
     return K

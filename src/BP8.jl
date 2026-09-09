@@ -20,8 +20,10 @@ using ..StiffnessCache
 
 export BP8Params, benchmark_parameters, BP8Model, build_model, initial_state,
        run_bp8, evaluate!, write_outputs, station_locations,
+       solve_pressure_history, set_pressure_history!, pressure_at!,
+       pressure_operator, pressure_length, well_pressure,
        effective_stress_report, analytic_pressure_gaussian, analytic_pressure_point,
-       resolution_report, process_zone
+       resolution_report, process_zone, fault_grid_sizes, build_fault_elasticity
 
 # ==============================================================================
 # SEAS BP8-QD-GS / -PW: the coupled problem.
@@ -118,9 +120,34 @@ mutable struct Cache
     # integrator's step count and says nothing about how much of the fault is
     # affected — the question a reader of the limitation actually has.
     floor_nodes::BitVector
+    # Pore pressure at the current `t`, interpolated out of the separately
+    # integrated pressure history (`solve_pressure_history`). `pbuf` is the
+    # raw subsystem state — length `nf`, or `nf+1` for the Peaceman variant,
+    # whose last entry is the well-bore pressure — and `pres` views its first
+    # `nf` entries, the fault field itself. Interpolating in place keeps the
+    # right-hand side allocation-free.
+    pbuf::Vector{Float64}
+    pres::SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true}
 end
-Cache(nf) = Cache(zeros(2nf), zeros(nf), zeros(nf), zeros(nf), zeros(nf), zeros(nf),
-                  fill(1e-12, nf), Inf, 0, falses(nf))
+function Cache(nf, plen)
+    pbuf = zeros(plen)
+    return Cache(zeros(2nf), zeros(nf), zeros(nf), zeros(nf), zeros(nf), zeros(nf),
+                 fill(1e-12, nf), Inf, 0, falses(nf), pbuf, view(pbuf, 1:nf))
+end
+
+"""
+    PressureHistory
+
+Holds the separately integrated pore-pressure solution, or `nothing` before
+one has been computed. Mutable so `run_bp8` can attach a history to an
+otherwise immutable `BP8Model`; `sol` is deliberately untyped, and every read
+of it goes through the `pressure_at!` function barrier.
+"""
+mutable struct PressureHistory
+    sol::Any
+    tspan::Tuple{Float64,Float64}
+end
+PressureHistory() = PressureHistory(nothing, (0.0, 0.0))
 
 """
     BP8Model
@@ -128,6 +155,9 @@ Cache(nf) = Cache(zeros(2nf), zeros(nf), zeros(nf), zeros(nf), zeros(nf), zeros(
 Everything needed to evaluate the coupled right-hand side: the precomputed
 fault stiffness, the pore-pressure operator and source, the Darcy operators
 for output, the `Ω_f` quadrature weights, and the locked-edge mask.
+
+Pore pressure is **not** part of the integrated state — it is solved on its own
+beforehand and stored in `pressure`. See [`solve_pressure_history`](@ref).
 """
 struct BP8Model
     par::BP8Params
@@ -147,7 +177,63 @@ struct BP8Model
     WI::Float64
     S_e::Float64
     cache::Cache
+    pressure::PressureHistory
     grid_info::NamedTuple
+end
+
+"""
+    fault_grid_sizes(par, Δz, L_fault, L_normal, order) -> (; n1, n23)
+
+Validates a configuration and computes the elastic grid point counts
+`build_model` uses. Factored out so external tooling — currently
+`build_stiffness_cache.jl`'s sharding path — can reproduce exactly the `n1`,
+`n23` `build_model` would use for the same configuration, which a sharded
+`:exact` build depends on to actually match the single-process one.
+"""
+function fault_grid_sizes(par::BP8Params, Δz, L_fault, L_normal, order)
+    isapprox(par.l_f / Δz, round(par.l_f / Δz); atol=1e-9) ||
+        error("Δz=$Δz must divide l_f=$(par.l_f) so the grid has nodes on ±l_f")
+    L_fault >= par.l_f || error("L_fault=$L_fault must be at least l_f=$(par.l_f)")
+
+    n1 = round(Int, L_normal / Δz) + 1
+    n23 = round(Int, 2L_fault / Δz) + 1
+    # SBP closures need more than two closure widths of points per dimension.
+    n_min = 2order + 1
+    n1 >= n_min || error("L_normal/Δz gives only $n1 points across the fault-normal " *
+                         "direction; SBP order $order needs at least $n_min. " *
+                         "Increase L_normal or decrease Δz.")
+    n23 >= n_min || error("2*L_fault/Δz gives only $n23 points along the fault; " *
+                          "SBP order $order needs at least $n_min.")
+    return (; n1, n23)
+end
+
+"""
+    build_fault_elasticity(; par, Δz, L_fault, L_normal, n1, n23, set, verbose=false,
+                           solver_kwargs...) -> FaultElasticity
+
+Assembles the split-node elastic system `fault_stiffness` solves against, for
+the grids `build_model` has already sized and validated via
+[`fault_grid_sizes`](@ref). Factored out of the cache-miss path below so a `K`
+build can be **sharded across independent processes**: each shard calls this
+— minutes, not the bottleneck, PERFORMANCE.md §4c — and then
+`fault_stiffness(fe; cols=..., ...)` for its own slice of the `2·N_Ωf`
+columns, with no communication needed between shards (the columns are
+independent right-hand sides against the same `A`). `build_model` itself goes
+through this same function on every cache miss, so there is exactly one
+definition of "the elastic system for this configuration" — what makes it
+safe to assemble a `K` from shards built in separate processes and merge them
+into one cache entry (`merge_stiffness_cache.jl`).
+"""
+function build_fault_elasticity(; par::BP8Params, Δz, L_fault, L_normal, n1, n23, set,
+                                verbose=false, solver_kwargs...)
+    g_minus = equidistant_grid((-L_normal, -L_fault, -L_fault), (0.0, L_fault, L_fault), n1, n23, n23)
+    g_plus = equidistant_grid((0.0, -L_fault, -L_fault), (L_normal, L_fault, L_fault), n1, n23, n23)
+
+    t0 = time()
+    fe = FaultElasticity(g_minus, g_plus, lame_lambda(par), par.μ, set;
+                         l_f=par.l_f, solver_kwargs...)
+    verbose && @info "split-node system ready" seconds = round(time() - t0, digits=1)
+    return fe
 end
 
 # `K` for one configuration, from the cache if it is there.
@@ -177,13 +263,8 @@ function stiffness_matrix(; par, Δz, L_fault, L_normal, n1, n23, order, set,
         end
     end
 
-    g_minus = equidistant_grid((-L_normal, -L_fault, -L_fault), (0.0, L_fault, L_fault), n1, n23, n23)
-    g_plus = equidistant_grid((0.0, -L_fault, -L_fault), (L_normal, L_fault, L_fault), n1, n23, n23)
-
-    t0 = time()
-    fe = FaultElasticity(g_minus, g_plus, lame_lambda(par), par.μ, set;
-                         l_f=par.l_f, solver_kwargs...)
-    verbose && @info "split-node system ready" seconds = round(time() - t0, digits=1)
+    fe = build_fault_elasticity(; par, Δz, L_fault, L_normal, n1, n23, set,
+                                verbose, solver_kwargs...)
 
     t0 = time()
     K = stiffness === :toeplitz ? fault_stiffness_toeplitz(fe; verbose) :
@@ -268,23 +349,17 @@ function build_model(; par::BP8Params=benchmark_parameters(),
                      injection=:gaussian, order=4, verbose=false,
                      stiffness=:toeplitz,
                      cache=:auto, cache_dir=stiffness_cache_dir(),
+                     pressure=true, pressure_kwargs=(;),
                      solver_kwargs...)
     injection ∈ (:gaussian, :peaceman) ||
         error("injection must be :gaussian or :peaceman, got $injection")
-    isapprox(par.l_f / Δz, round(par.l_f / Δz); atol=1e-9) ||
-        error("Δz=$Δz must divide l_f=$(par.l_f) so the grid has nodes on ±l_f")
-    L_fault >= par.l_f || error("L_fault=$L_fault must be at least l_f=$(par.l_f)")
 
     set = read_stencil_set(SbpOperators.sbp_operators_path() * "standard_diagonal.toml"; order)
-    n1 = round(Int, L_normal / Δz) + 1
-    n23 = round(Int, 2L_fault / Δz) + 1
-    # SBP closures need more than two closure widths of points per dimension.
+    n1, n23 = fault_grid_sizes(par, Δz, L_fault, L_normal, order)
+    # SBP closures need more than two closure widths of points per dimension —
+    # also used below for the pore-pressure grid, which fault_grid_sizes does
+    # not know about.
     n_min = 2order + 1
-    n1 >= n_min || error("L_normal/Δz gives only $n1 points across the fault-normal " *
-                         "direction; SBP order $order needs at least $n_min. " *
-                         "Increase L_normal or decrease Δz.")
-    n23 >= n_min || error("2*L_fault/Δz gives only $n23 points along the fault; " *
-                          "SBP order $order needs at least $n_min.")
     verbose && @info "elastic grids" points_per_side = n1 * n23^2 dofs = 6 * n1 * n23^2
 
     stiffness ∈ (:exact, :toeplitz) ||
@@ -323,15 +398,33 @@ function build_model(; par::BP8Params=benchmark_parameters(),
                     Δz, r_well=par.r_well) : 0.0
     S_e = peaceman_cell_volume(Δz, par.L_fwid) * par.φ * par.β
 
-    return BP8Model(par, K, Ap, source, Q2, Q3, weights, active, collect(x2), collect(x3),
-                    nf, τ0, injection, well_cell_index(g_p), WI, S_e, Cache(nf),
-                    (; Δz, L_fault, L_normal, n1, n23, order,
-                       elastic_dofs=6 * n1 * n23^2, n2f, n3f))
+    plen = nf + (injection === :peaceman ? 1 : 0)
+    m = BP8Model(par, K, Ap, source, Q2, Q3, weights, active, collect(x2), collect(x3),
+                 nf, τ0, injection, well_cell_index(g_p), WI, S_e, Cache(nf, plen),
+                 PressureHistory(),
+                 (; Δz, L_fault, L_normal, n1, n23, order,
+                    elastic_dofs=6 * n1 * n23^2, n2f, n3f))
+
+    # Solve the pressure history up front, over the full benchmark duration, so
+    # the model is complete: `evaluate!` works immediately and any `run_bp8`
+    # sub-interval reuses it. Seconds, against hours for `K`. `pressure=false`
+    # skips it for callers that only want `K` (the cache builder, say).
+    if pressure
+        tspan = (0.0, par.t_f)
+        set_pressure_history!(m, solve_pressure_history(m; tspan, verbose, pressure_kwargs...),
+                              tspan)
+    end
+    return m
 end
 
 # ------------------------------------------------------------------------------
 
-state_length(m::BP8Model) = 4m.nf + (m.injection === :peaceman ? 1 : 0)
+# Slip (2·nf), ln θ (nf). Pore pressure is integrated separately and is
+# deliberately absent — see `solve_pressure_history`.
+state_length(m::BP8Model) = 3m.nf
+
+"Length of the *pressure* subsystem's own state: `nf`, plus `p_well` for BP8-PW."
+pressure_length(m::BP8Model) = m.nf + (m.injection === :peaceman ? 1 : 0)
 
 """
     effective_stress_report(m) -> NamedTuple
@@ -397,6 +490,155 @@ function resolution_report(m::BP8Model)
             converged=Lb0 / Δz >= 3)
 end
 
+# ==============================================================================
+# Pore pressure: integrated separately, implicitly, once.
+#
+# The pressure subsystem is *autonomous* — its right-hand side reads only `p`,
+# `p_well` and `t`, never slip or state (eq. 17-23; the coupling to elasticity
+# is one-way, through `σ̄ = σ - p`). So it does not belong in the coupled state
+# vector at all: it can be integrated on its own, with a method suited to it,
+# and the elastic integration then interpolates the result.
+#
+# Measured at Δz = 10 m over the full 30 days, `Rodas5P` with the analytic
+# Jacobian below: 180 steps (Gaussian) / 283 steps (Peaceman), ~6 s, and the
+# step count is **resolution-independent** (94/88/95 at Δz = 50/25/10 m).
+# Carrying `p` explicitly in the coupled system instead cost `nf` of `4nf+1`
+# state entries and needed the loosened per-block `abstol` that used to sit in
+# `run_bp8`.
+# ==============================================================================
+
+"""
+    pressure_operator(m) -> J
+
+The constant sparse operator of the pressure subsystem: `Ap` alone for the
+Gaussian source, and [`well_coupled_operator`](@ref)'s `[p; p_well]` system for
+the Peaceman well — the benchmark's **option 2**, one additional unknown in the
+same linear system.
+"""
+pressure_operator(m::BP8Model) =
+    m.injection === :peaceman ?
+    well_coupled_operator(m.Ap, m.well_cell, m.WI, m.S_e, m.par.S_well) : m.Ap
+
+"""
+    solve_pressure_history(m; tspan, alg=Rodas5P(), reltol=1e-8, abstol=1e-3, verbose=false)
+
+Integrates the autonomous pore-pressure subsystem over `tspan` and returns the
+`ODESolution`, whose dense output is what `evaluate!` later interpolates.
+
+The subsystem is *linear*, so its Jacobian is exactly the constant `J` from
+[`pressure_operator`](@ref); supplying it explicitly is what makes the implicit
+solve cheap (and avoids a dense Jacobian being built by finite differences —
+that alone was 400 s and 1 GB at Δz = 10 m in testing).
+
+**`save_everystep=true` is the point, not an oversight.** The solve needs only
+~180-280 steps for the whole benchmark, so the full dense output is 57 MB
+(Gaussian) / 79 MB (Peaceman) at Δz = 10 m — small enough to keep in memory,
+and the solver's own interpolant is far better than storing levels on a fixed
+grid and interpolating linearly between them. Measured against a `reltol=1e-11`
+reference at Δz = 10 m:
+
+| interpolation | max error | induced error in `V` |
+|---|---|---|
+| **dense output (this)** | **4.4 Pa** | **0.003 %** |
+| linear, hourly levels | 10.8 kPa | 7.1 % |
+| linear, 300 s levels | 85 Pa | 0.05 % |
+
+Linear interpolation is second-order and converges, but `V ~ exp(τ/(aσ̄))`
+amplifies pressure error exponentially, and the error concentrates entirely at
+the two kinks in the forcing (`t = 0` and `t_off`) — exactly where an adaptive
+solver puts steps and a fixed grid does not.
+"""
+function solve_pressure_history(m::BP8Model; tspan=(0.0, m.par.t_f), alg=Rodas5P(),
+                                reltol=1e-8, abstol=1e-3, verbose=false)
+    par = m.par
+    J = pressure_operator(m)
+    n = size(J, 1)
+
+    # Both variants force through the same eq. 20 on/off switch, so the whole
+    # time dependence is one scalar times a fixed vector: the Gaussian source
+    # spread over the fault (eq. 19), or the injection rate into the well bore's
+    # storage (eq. 23).
+    b = zeros(n)
+    if m.injection === :gaussian
+        b .= (q0_per_thickness(par) / (par.β * par.φ)) .* m.source
+    else
+        b[end] = par.Q0 / par.S_well
+    end
+
+    function f!(du, u, _, t)
+        mul!(du, J, u)
+        du .+= injection_rate(t; q0=1.0, t_off=par.t_off) .* b
+        return nothing
+    end
+    jac!(Jout, u, _, t) = copyto!(Jout, J)
+
+    F = ODEFunction(f!; jac=jac!, jac_prototype=J)
+    prob = ODEProblem(F, zeros(n), tspan)   # eq. 27: zero pressure change at t = 0
+    t0 = time()
+    sol = solve(prob, alg; reltol, abstol, tstops=[par.t_off], save_everystep=true)
+    verbose && @info "pressure history integrated" seconds = round(time() - t0, digits=1) steps = length(sol.t) retcode = sol.retcode
+    return sol
+end
+
+"""
+    set_pressure_history!(m, sol, tspan) -> m
+
+Attaches a pressure solution to the model so `evaluate!` can interpolate it.
+"""
+function set_pressure_history!(m::BP8Model, sol, tspan)
+    m.pressure.sol = sol
+    m.pressure.tspan = (Float64(tspan[1]), Float64(tspan[2]))
+    return m
+end
+
+# Interpolation happens behind a function barrier because `PressureHistory.sol`
+# is untyped: everything inside `_interp_pressure!` specializes on the concrete
+# solution type, so the per-call cost is one dynamic dispatch, not a
+# type-unstable inner loop.
+_interp_pressure!(dest, sol, t) = (sol(dest, t); dest)
+
+"""
+    well_pressure(m, t)
+
+The Peaceman well-bore pressure `p_well` at time `t` (BP8-QD eq. 23), the extra
+unknown carried by [`well_coupled_operator`](@ref). Errors for the Gaussian
+variant, which has no well.
+
+It is not a §4 reported output — it is an internal unknown — but it is what the
+injected-volume balance and the eq. 25 point-source check need. After the
+initial transient it sits at `p[well_cell] + Q0/WI`; measured at `t_off`, that
+offset is 53.4 MPa at Δz = 50 m and 38.0 MPa at Δz = 10 m, against `Q0/WI` of
+53.4 and 38.0.
+"""
+function well_pressure(m::BP8Model, t)
+    m.injection === :peaceman ||
+        error("well_pressure is only defined for the Peaceman variant (injection=:peaceman)")
+    pressure_at!(m, t)          # fills the cache buffer, bounds-checks `t`
+    return m.cache.pbuf[end]
+end
+
+"""
+    pressure_at!(m, t) -> p
+
+Pore pressure on the fault at time `t`, interpolated from the stored history
+into the model cache (no allocation). Errors rather than extrapolating if `t`
+lies outside the history — silently extrapolating a diffusion solution past its
+integration window would be a quiet source of wrong answers.
+"""
+function pressure_at!(m::BP8Model, t)
+    ph = m.pressure
+    ph.sol === nothing &&
+        error("this model has no pressure history; call `solve_pressure_history` and " *
+              "`set_pressure_history!` first (`run_bp8` does both)")
+    t0, t1 = ph.tspan
+    tol = 1e-6 * max(one(t1), abs(t1))
+    (t0 - tol <= t <= t1 + tol) ||
+        error("t=$t is outside the pressure history's tspan $((t0, t1)); " *
+              "re-solve the pressure over the interval you mean to integrate")
+    _interp_pressure!(m.cache.pbuf, ph.sol, t)
+    return m.cache.pres
+end
+
 """
     initial_state(m) -> u
 
@@ -433,7 +675,7 @@ function evaluate!(m::BP8Model, u, t)
 
     slip = @view u[1:2nf]
     ϕ = @view u[2nf+1:3nf]
-    pres = @view u[3nf+1:4nf]
+    pres = pressure_at!(m, t)
 
     mul!(c.Δτ, m.K, slip)
 
@@ -470,7 +712,9 @@ end
 """
     rhs!(du, u, m, t)
 
-The coupled right-hand side (eq. 5, 11, 17/19-23).
+Slip and state (eq. 5, 11). Pore pressure is **not** here: it is autonomous, so
+it is integrated separately by [`solve_pressure_history`](@ref) and enters only
+through `evaluate!`'s `σ̄ = σ - p`.
 """
 function rhs!(du, u, m::BP8Model, t)
     p = m.par
@@ -483,46 +727,40 @@ function rhs!(du, u, m::BP8Model, t)
         # aging law in ϕ = ln θ:  dϕ/dt = e^{-ϕ} - V/D_RS
         du[2nf+i] = exp(-u[2nf+i]) - c.Vmag[i] / p.D_RS
     end
-
-    dp = @view du[3nf+1:4nf]
-    pres = @view u[3nf+1:4nf]
-    mul!(dp, m.Ap, pres)
-
-    if m.injection === :gaussian
-        q = injection_rate(t; q0=q0_per_thickness(p), t_off=p.t_off)
-        @inbounds for i in 1:nf
-            dp[i] += q / (p.β * p.φ) * m.source[i]
-        end
-    else
-        # Peaceman well, eq. 22-23.
-        p_well = u[end]
-        transfer = m.WI * (p_well - pres[m.well_cell])
-        dp[m.well_cell] += transfer / m.S_e
-        Qinj = t < p.t_off ? p.Q0 : 0.0
-        du[end] = (Qinj - transfer) / p.S_well
-    end
     return nothing
 end
 
 """
     run_bp8(m; tspan=(0.0, m.par.t_f), alg=Tsit5(), reltol=1e-8,
-              saveat=3600.0, verbose=false, kwargs...)
+              saveat=3600.0, verbose=false, pressure_kwargs=(;), kwargs...)
 
-Integrates the coupled system. Absolute tolerances are set per block (slip,
-ln θ, pressure) because they live on wildly different scales.
+Integrates slip and state. Absolute tolerances are set per block (slip, ln θ)
+because they live on wildly different scales.
+
+**Pore pressure is solved first, separately and implicitly**
+([`solve_pressure_history`](@ref)), and attached to `m`; the slip integration
+then interpolates it. That costs a few seconds and removes `p` from the
+explicitly integrated state entirely. Pass `pressure_kwargs` to override that
+solve (`alg`, `reltol`, `abstol`). An already-attached history *covering* `tspan`
+is reused — `build_model` attaches one over the full `par.t_f` by default, so
+sub-interval runs and parameter sweeps over elastic settings pay for it once.
 
 `progress` (defaults to `verbose`) shows a `ProgressMeter` bar tracking `t/tspan[2]`,
 updated on every accepted step (ProgressMeter throttles the redraws itself).
 """
 function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=Tsit5(), reltol=1e-8,
-                 saveat=3600.0, verbose=false, progress=verbose, kwargs...)
+                 saveat=3600.0, verbose=false, progress=verbose,
+                 pressure_kwargs=(;), kwargs...)
+    covers = m.pressure.sol !== nothing &&
+             m.pressure.tspan[1] <= tspan[1] && tspan[2] <= m.pressure.tspan[2]
+    covers || set_pressure_history!(m,
+                  solve_pressure_history(m; tspan, verbose, pressure_kwargs...), tspan)
+
     u0 = initial_state(m)
     nf = m.nf
     abstol = similar(u0)
     abstol[1:2nf] .= 1e-14        # slip, m
     abstol[2nf+1:3nf] .= 1e-10    # ln θ
-    abstol[3nf+1:4nf] .= 1e-3     # pressure, Pa
-    m.injection === :peaceman && (abstol[end] = 1e-3)
 
     prob = ODEProblem(rhs!, u0, tspan, m)
     t0 = time()
@@ -695,7 +933,7 @@ function write_outputs(m::BP8Model, sol, dir; modeler="", profile_dt=3600.0)
     ns = length(times)
     V2 = Matrix{Float64}(undef, nf, ns)
     V3 = similar(V2); τ2 = similar(V2); τ3 = similar(V2)
-    q2 = similar(V2); q3 = similar(V2)
+    q2 = similar(V2); q3 = similar(V2); pr = similar(V2)
     Vmax = Vector{Float64}(undef, ns)
     moment_rate = Vector{Float64}(undef, ns)
 
@@ -706,7 +944,9 @@ function write_outputs(m::BP8Model, sol, dir; modeler="", profile_dt=3600.0)
         V3[:, j] .= c.V3
         τ2[:, j] .= c.τ2
         τ3[:, j] .= c.τ3
-        pres = @view u[3nf+1:4nf]
+        # `evaluate!` has just interpolated the pressure history at `t`.
+        pres = c.pres
+        pr[:, j] .= pres
         mul!(view(q2, :, j), m.Q2, pres)
         mul!(view(q3, :, j), m.Q3, pres)
         Vmax[j] = maximum(c.Vmag)
@@ -719,13 +959,13 @@ function write_outputs(m::BP8Model, sol, dir; modeler="", profile_dt=3600.0)
         @sprintf("# maximum_time_step=%.3E", maximum(dts)),
         "# num_time_steps=$(ns)"]
 
-    write_time_series(m, sol, dir, times, V2, V3, τ2, τ3, q2, q3, step_lines, modeler)
+    write_time_series(m, sol, dir, times, V2, V3, τ2, τ3, q2, q3, pr, step_lines, modeler)
     write_global(m, dir, times, Vmax, moment_rate, step_lines, modeler)
     write_profiles(m, sol, dir, profile_dt, modeler)
     return dir
 end
 
-function write_time_series(m, sol, dir, times, V2, V3, τ2, τ3, q2, q3, step_lines, modeler)
+function write_time_series(m, sol, dir, times, V2, V3, τ2, τ3, q2, q3, pr, step_lines, modeler)
     nf = m.nf
     lin = LinearIndices((length(m.x2), length(m.x3)))
     for (name, sx2, sx3) in station_locations()
@@ -752,7 +992,7 @@ function write_time_series(m, sol, dir, times, V2, V3, τ2, τ3, q2, q3, step_li
                         t, u[idx], u[nf+idx],
                         safelog10(V2[idx, n]), safelog10(V3[idx, n]),
                         τ2[idx, n] / 1e6, τ3[idx, n] / 1e6,
-                        u[3nf+idx] / 1e6, q2[idx, n], q3[idx, n],
+                        pr[idx, n] / 1e6, q2[idx, n], q3[idx, n],
                         u[2nf+idx] / log(10))
             end
         end
@@ -802,7 +1042,7 @@ function write_profiles(m, sol, dir, profile_dt, modeler)
     states = [sol(t) for t in ts]
     caches = [begin
                   c = evaluate!(m, u, t)
-                  (; τ2=copy(c.τ2), τ3=copy(c.τ3), Vmax=maximum(c.Vmag))
+                  (; τ2=copy(c.τ2), τ3=copy(c.τ3), p=copy(c.pres), Vmax=maximum(c.Vmag))
               end for (u, t) in zip(states, ts)]
 
     quantities = ["slip_2" => ((u, c, k) -> u[k], "Horizontal slip (Slip_2) (m)"),
@@ -811,7 +1051,7 @@ function write_profiles(m, sol, dir, profile_dt, modeler)
                                        "Horizontal shear stress (Shear_stress_2) (MPa)"),
                   "shear_stress_3" => ((u, c, k) -> c.τ3[k] / 1e6,
                                        "Vertical shear stress (Shear_stress_3) (MPa)"),
-                  "pore_pressure" => ((u, c, k) -> u[3nf+k] / 1e6,
+                  "pore_pressure" => ((u, c, k) -> c.p[k] / 1e6,
                                       "Pore pressure (Pore_pressure) (MPa)")]
 
     lf = m.par.l_f

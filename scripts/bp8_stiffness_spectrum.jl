@@ -6,11 +6,20 @@
 #
 #   1. what is the stiff eigenvalue, and does `K_ww/D` predict it?
 #   2. is it local — does a per-node 3x3 block-diagonal reproduce it?
-#   3. is the pore-pressure diffusion block stiff? (no)
+#   3. is the pore-pressure subsystem stiff, and which part of it?
 #
-# Only affordable because the ODE state is small: N = 4*nf+1 is 1157 at
-# Δz = 50 m, so a full eigendecomposition is seconds. It is a diagnostic, not
-# something the solver path uses.
+# Only affordable because the ODE state is small: N = 3*nf is 867 at Δz = 50 m,
+# so a full eigendecomposition is seconds. It is a diagnostic, not something the
+# solver path uses.
+#
+# **Question 3 was measured wrongly before.** Pore pressure used to live in the
+# coupled state, and this script sliced `J[3nf+1:4nf, 3nf+1:4nf]` for it — a
+# range that stops one short of `p_well`, so the Peaceman well coupling was
+# silently excluded and the answer came out "not stiff" on the diffusion
+# operator alone. Pressure is now integrated separately (`solve_pressure_history`)
+# and the block is measured on its own operator, well coupling included. The
+# well exchange is ~10x stiffer than diffusion at Δz = 100 m; see the last
+# section.
 #
 # Run: julia --project=scripts scripts/bp8_stiffness_spectrum.jl [Δz]
 
@@ -21,7 +30,7 @@ using LinearAlgebra, Printf
 Δz = length(ARGS) >= 1 ? parse(Float64, ARGS[1]) : 50.0
 
 m = build_model(; Δz, injection=:peaceman, verbose=true)
-nf = m.nf; p = m.par; w = m.well_cell; N = 4nf + 1
+nf = m.nf; p = m.par; w = m.well_cell; N = BP8.state_length(m)   # 3nf
 fp = BP8.friction_params(p); η = BP8.damping(p)
 @printf("\nnf=%d  N=%d  well_cell=%d  K[w,w]=%.4e Pa/m  eta=%.4e  a=%.4g\n",
         nf, N, w, m.K[w, w], η, fp.a)
@@ -30,11 +39,12 @@ sol = run_bp8(m; tspan=(0.0, 100 * 3600.0), saveat=1800.0)
 @printf("Tsit5 over 100 h: %d accepted steps\n\n", sol.stats.naccept)
 
 """Dense Jacobian of `rhs!` at `(u,t)`, by one-sided differences with
-per-block step sizes (slip, ln θ and pressure live on very different scales)."""
+per-block step sizes (slip and ln θ live on very different scales). Pressure is
+not in this Jacobian at all any more — it is not part of the integrated state."""
 function jacobian(u, t)
     f0 = similar(u); BP8.rhs!(f0, u, m, t)
     J = zeros(N, N); fp_ = similar(u); up = similar(u)
-    h = [fill(1e-9, 2nf); fill(1e-6, nf); fill(1e2, nf); 1e2]
+    h = [fill(1e-9, 2nf); fill(1e-6, nf)]
     for j in 1:N
         copyto!(up, u); up[j] += h[j]
         BP8.rhs!(fp_, up, m, t)
@@ -50,8 +60,9 @@ end
 @printf("  t[h] | floored | sigmabar[Pa] |     V_w    |   D=dg/dV   |  K_ww/D    | lambda(J)   | ratio\n")
 for th in (60.0, 75.0, 85.0, 95.0, 99.5)
     t = th * 3600; u = Array(sol(t))
-    σ̄ = max(p.σ0 - u[3nf+w], p.σ̄_min)
-    nfl = count(<(p.σ̄_min), p.σ0 .- u[3nf+1:4nf])
+    pres = pressure_at!(m, t)
+    σ̄ = max(p.σ0 - pres[w], p.σ̄_min)
+    nfl = count(<(p.σ̄_min), p.σ0 .- pres)
     V = BP8.evaluate!(m, u, t).Vmag[w]
     θ = exp(u[2nf+w])
 
@@ -78,11 +89,24 @@ for i in 1:nf
         Jb[a, b] = J[a, b]
     end
 end
-Jb[3nf+1:4nf, 3nf+1:4nf] .= J[3nf+1:4nf, 3nf+1:4nf]   # pressure block untouched
-Jb[end, end] = J[end, end]
 λblk = minimum(real.(eigvals(Jb)))
-λp = minimum(real.(eigvals(J[3nf+1:4nf, 3nf+1:4nf])))
 
 @printf("\nfull J stiffest eigenvalue         : %.6e\n", λfull)
 @printf("per-node 3x3 block-diagonal only   : %.6e   ratio=%.4f\n", λblk, λblk / λfull)
-@printf("pressure block alone (Ap)          : %.6e   (not stiff)\n", λp)
+
+# --- the pressure subsystem, measured on its own operator ---
+#
+# `pressure_operator(m)` is `Ap` for the Gaussian source and, for Peaceman,
+# `Ap` plus the 2x2 well-exchange block coupling `p[well_cell]` to `p_well`.
+# That block — not diffusion — is the stiff part, and its eigenvalue
+# `-WI(1/S_well + 1/S_e)` is constant: it depends on neither σ̄ nor the
+# friction state, which is why `PROGRESS.md` saw it as a constant -5.05e-4 at
+# Δz = 100 m that `K_ww/D` could not predict.
+λdiff = minimum(real.(eigvals(Matrix(m.Ap))))
+λpress = minimum(real.(eigvals(Matrix(pressure_operator(m)))))
+pred = -m.WI * (1 / p.S_well + 1 / m.S_e)
+@printf("pressure: diffusion `Ap` alone      : %.6e\n", λdiff)
+@printf("pressure: with well coupling        : %.6e\n", λpress)
+@printf("          predicted -WI(1/Sw+1/Se)  : %.6e   ratio=%.4f\n", pred, pred / λpress)
+@printf("\nstiffest overall = %.6e (friction), vs %.6e (pressure): ratio %.1f\n",
+        λfull, λpress, λfull / λpress)

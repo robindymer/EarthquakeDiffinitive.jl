@@ -170,4 +170,56 @@ using Test
         plain = build_model(; cfg..., cache=:auto, cache_dir=nothing)
         @test plain.K ≈ cold.K
     end
+
+    # A sharded build exists so an `:exact` K too large for one node's
+    # wall-clock can be spread over independent jobs. Its failure mode is the
+    # dangerous kind: a K assembled from incomplete shards is the right SHAPE
+    # and full of plausible numbers, so it would produce a wrong submission
+    # rather than an error. Hence the emphasis below is less on "the happy path
+    # works" than on "every way of not covering the columns exactly is fatal".
+    @testset "a sharded K build reassembles the unsharded one exactly" begin
+        cfg = (; Δz=100.0, L_fault=800.0, L_normal=800.0, stiffness=:exact)
+        dir = mktempdir()
+        whole = build_model(; cfg..., cache=:off, cache_dir=nothing)
+        key = stiffness_cache_key(; λ=EarthquakeDiffinitive.BP8.lame_lambda(
+                                        benchmark_parameters()),
+                                  μ=benchmark_parameters().μ, l_f=400.0,
+                                  cfg..., order=4, stencil=ops(4))
+
+        nf = whole.nf
+        ncols = 2nf
+        nshards = 3
+        for sh in 1:nshards
+            cols = collect(sh:nshards:ncols)
+            save_stiffness_shard(joinpath(dir, key.name * ".shard$sh"), key, cols,
+                                 whole.K[:, cols], whole.x2, whole.x3)
+        end
+
+        K, x2, x3 = merge_stiffness_shards(dir, key)
+        # Bit-for-bit, not `≈`: merging is pure data movement, so any tolerance
+        # here would be hiding a column landing in the wrong place.
+        @test K == whole.K
+        @test x2 == whole.x2 && x3 == whole.x3
+
+        # A missing shard must error, not return a partially-filled K.
+        rm(joinpath(dir, key.name * ".shard2"))
+        @test_throws ErrorException merge_stiffness_shards(dir, key)
+
+        # Two shards claiming the same column must error too — that is what a
+        # re-run job writing under a different shard number would look like.
+        cols1 = collect(1:nshards:ncols)
+        save_stiffness_shard(joinpath(dir, key.name * ".shard2"), key, cols1,
+                             whole.K[:, cols1], whole.x2, whole.x3)
+        @test_throws ErrorException merge_stiffness_shards(dir, key)
+
+        # A shard from a different configuration must be ignored, not merged:
+        # its key does not match, and silently accepting it would splice two
+        # different physics problems into one K.
+        other_key = stiffness_cache_key(; λ=1.0e10, μ=1.0e10, l_f=400.0, cfg...,
+                                        order=4, stencil=ops(4))
+        @test load_stiffness_shard(joinpath(dir, key.name * ".shard1"), other_key) === nothing
+
+        # No shards at all is an error rather than an empty K.
+        @test_throws ErrorException merge_stiffness_shards(mktempdir(), key)
+    end
 end

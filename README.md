@@ -28,19 +28,50 @@ before the time loop starts — which is why setup costs minutes and the
 4. Repeat `2·N_Ωf` times → dense fault stiffness `K : [s₂;s₃] ↦ [Δτ₂;Δτ₃]`.
 5. Assemble the fault-plane diffusion operator `A_p` and the injection source
    on the *same* nodes.
+6. Integrate pore pressure over the whole 30 days, on its own, **implicitly**
+   (`Rodas5P`, analytic Jacobian) — ~180 steps and a few seconds, independent
+   of resolution. Pressure is autonomous (nothing feeds back into eq. 17), so
+   it need not be in the coupled state at all; the time loop interpolates this
+   solution's dense output. See "Pore pressure is solved separately".
 
-**Time loop** (ODE state `[s₂; s₃; lnθ; p]`, 30 days, ~3 s)
+**Time loop** (ODE state `[s₂; s₃; lnθ]`, 30 days, ~3 s)
 
-6. `Δτ = K·s` — one dense mat-vec, no PDE solve.
-7. `σ̄ = σ₀ - p` per node.
-8. Solve `‖τ⁰+Δτ‖ - η|V| = σ̄f(|V|,θ)` for `|V|` (Newton in `ln V`); direction
+7. `Δτ = K·s` — one dense mat-vec, no PDE solve.
+8. `p(t)` by interpolation from step 6; `σ̄ = σ₀ - p` per node.
+9. Solve `‖τ⁰+Δτ‖ - η|V| = σ̄f(|V|,θ)` for `|V|` (Newton in `ln V`); direction
    inherited from `τ⁰+Δτ`.
-9. RHS: `ṡ = V`, `ϕ̇ = e^{-ϕ} - |V|/D_RS`, `ṗ = A_p p + source(t)`.
-10. Advance with `Tsit5`, per-block tolerances. Repeat from 6.
+10. RHS: `ṡ = V`, `ϕ̇ = e^{-ϕ} - |V|/D_RS`.
+11. Advance with `Tsit5`, per-block tolerances. Repeat from 7.
 
 **Output**
 
-11. Write the §4 files (nine stations, `global.dat`, ten profiles).
+12. Write the §4 files (nine stations, `global.dat`, ten profiles).
+
+## Pore pressure is solved separately
+
+The pressure subsystem's right-hand side reads only `p`, `p_well` and `t` — the
+coupling to elasticity is one-way, through `σ̄ = σ - p`. So it is integrated on
+its own before the time loop (`solve_pressure_history`), with a stiff solver and
+the analytic Jacobian the linear system makes available, and the elastic
+integration interpolates the result. `build_model` does this by default; a
+`run_bp8` over any sub-interval reuses it.
+
+Two reasons it is worth the separation:
+
+- **It removes `p` from the explicitly integrated state**, along with the
+  loosened per-block `abstol` that used to be needed to stop an explicit method
+  from tripping over a parabolic operator.
+- **The Peaceman well coupling is genuinely stiff** — its eigenvalue
+  `-WI(1/S_well + 1/S_e)` is ~10x diffusion's at Δz = 100 m — and an explicit
+  treatment pays for it. Solved implicitly, the step count is
+  resolution-independent (~180 Gaussian / ~280 Peaceman, for the full 30 days,
+  at any Δz measured).
+
+The dense output is kept in memory rather than resampled onto a fixed grid:
+57-79 MB at Δz = 10 m, and its interpolant is accurate to 4.4 Pa against a
+tight reference, where linear interpolation between hourly levels is 10.8 kPa.
+That distinction matters because `V ~ exp(τ/(aσ̄))` turns a sub-percent pressure
+error into a several-percent slip-rate error.
 
 ## Running
 

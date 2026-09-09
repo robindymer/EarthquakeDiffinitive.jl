@@ -18,7 +18,7 @@ function check(injection, Δz)
     m = build_model(; Δz, L_fault=800.0, L_normal=8Δz, injection, stiffness=:exact)
     sol = run_bp8(m; tspan=(0.0, T_CHECK), saveat=T_CHECK)
     nf = m.nf
-    p = sol.u[end][3nf+1:4nf]
+    p = pressure_at!(m, sol.t[end])
     n2 = length(m.x2)
     i0, j0 = argmin(abs.(m.x2)), argmin(abs.(m.x3))
     rows = NamedTuple[]

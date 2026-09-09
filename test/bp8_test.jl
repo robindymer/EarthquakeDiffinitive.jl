@@ -46,9 +46,12 @@ const M_GS = build_model(; Δz=100.0, L_fault=800.0, L_normal=800.0)
         @test all(≈(p.V_zero; rtol=1e-8), c.V3[act])
         # Uniform initial shear traction of magnitude τ_init.
         @test all(≈(p.τ_init; rtol=1e-8), hypot.(c.τ2[act], c.τ3[act]))
-        # Zero slip and zero pressure change (eq. 26).
+        # Zero slip (eq. 26). Pressure is no longer part of the integrated
+        # state — it lives in the separately solved history — so eq. 27's zero
+        # initial pressure change is checked there instead.
         @test all(iszero, u0[1:2M_GS.nf])
-        @test all(iszero, u0[3M_GS.nf+1:4M_GS.nf])
+        @test length(u0) == 3M_GS.nf
+        @test all(iszero, pressure_at!(M_GS, 0.0))
     end
 
     @testset "eq. 13: locked outside the frictional domain" begin
@@ -104,9 +107,8 @@ const M_GS = build_model(; Δz=100.0, L_fault=800.0, L_normal=800.0)
         # is off; away from both the source and the no-flux edges it should
         # still track the unbounded analytic solution.
         t = 50 * 3600.0
-        sol = run_bp8(M_GS; tspan=(0.0, t), saveat=t)
-        nf = M_GS.nf
-        p = sol.u[end][3nf+1:4nf]
+        run_bp8(M_GS; tspan=(0.0, t), saveat=t)
+        p = pressure_at!(M_GS, t)
         n2 = length(M_GS.x2)
         j0 = argmin(abs.(M_GS.x3))
         checked = 0
@@ -122,21 +124,22 @@ const M_GS = build_model(; Δz=100.0, L_fault=800.0, L_normal=800.0)
     @testset "Peaceman well conserves injected volume" begin
         m = build_model(; Δz=100.0, L_fault=800.0, L_normal=800.0, injection=:peaceman)
         t = 20 * 3600.0
-        sol = run_bp8(m; tspan=(0.0, t), saveat=t)
-        nf = m.nf
-        p = sol.u[end][3nf+1:4nf]
+        run_bp8(m; tspan=(0.0, t), saveat=t)
+        p = pressure_at!(m, t)
         # Fluid stored in the fault plus fluid stored in the well must equal
-        # the total injected volume: no-flux edges let nothing escape.
+        # the total injected volume: no-flux edges let nothing escape. This is
+        # the conservation check on the `[p; p_well]` subsystem that
+        # `solve_pressure_history` now integrates on its own, so it also pins
+        # that the split did not drop the well coupling.
         in_fault = sum(m.weights .* p) * m.par.L_fwid * m.par.φ * m.par.β
-        in_well = m.par.S_well * sol.u[end][end]
+        in_well = m.par.S_well * well_pressure(m, t)
         @test in_fault + in_well ≈ m.par.Q0 * t rtol = 1e-3
     end
 
     @testset "Gaussian source conserves injected volume" begin
         t = 20 * 3600.0
-        sol = run_bp8(M_GS; tspan=(0.0, t), saveat=t)
-        nf = M_GS.nf
-        p = sol.u[end][3nf+1:4nf]
+        run_bp8(M_GS; tspan=(0.0, t), saveat=t)
+        p = pressure_at!(M_GS, t)
         par = M_GS.par
         stored = sum(M_GS.weights .* p) * par.L_fwid * par.φ * par.β
 
@@ -162,7 +165,7 @@ const M_GS = build_model(; Δz=100.0, L_fault=800.0, L_normal=800.0)
         # direction of τ⁰).
         @test maximum(c.Vmag) > 1e-10
         @test sol.u[end][argmax(c.Vmag)] > 0
-        @test maximum(sol.u[end][3M_GS.nf+1:4M_GS.nf]) > 1e6
+        @test maximum(pressure_at!(M_GS, t)) > 1e6
     end
 
     @testset "resolution report flags the under-resolved process zone" begin

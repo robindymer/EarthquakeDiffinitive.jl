@@ -78,7 +78,7 @@ function sweep(configs, Δz; stiffness=:exact)
                             slip_centre=sol.u[end][ic],
                             Vmax=maximum(c.Vmag),
                             moment_rate=m.par.μ * sum(m.weights .* c.Vmag),
-                            p_centre=sol.u[end][3nf+ic]))
+                            p_centre=pressure_at!(m, sol.t[end])[ic]))
             r = results[end]
             @printf("DONE L_fault=%.0f L_normal=%.0f dofs=%d build=%.1fs K_self=%.5E slip=%.5E Vmax=%.5E p=%.4f MPa\n",
                     r.L_fault, r.L_normal, r.dofs, r.t_build, r.K_self, r.slip_centre,

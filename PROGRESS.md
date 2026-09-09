@@ -73,6 +73,11 @@ feeds elasticity one way, through `σ̄ = σ - p`; nothing flows back.
   `darcy_vel_2`/`darcy_vel_3` output columns.
 - `solve_pore_pressure`: implicit (`OrdinaryDiffEq`) time integration of the
   standalone problem; the operator matrix is constant, so it's built once.
+- `well_coupled_operator`: the Peaceman `[p; p_well]` system as one constant
+  sparse operator — the benchmark's **option 2** (§2.1.2's closing note), the
+  well pressure carried as one additional unknown rather than operator-split or
+  eliminated. Its docstring carries the eigenvalue measurement showing this
+  block, not diffusion, is the stiff part of the pressure subsystem.
 - Validated in `test/pore_pressure_test.jl` against the closed-form
   analytic solution (PDF eq. 21) and via grid-refinement convergence, and
   again inside the coupled model — see "Results".
@@ -829,6 +834,82 @@ perturbation to a submitted quantity, in a place where the benchmark is *silent*
 rather than permissive. Worth raising with the organizers rather than only
 documenting.
 
+## Pore pressure is integrated separately and implicitly (2026-09-09)
+
+Pressure used to sit in the coupled state vector (`[s2; s3; lnθ; p]`, plus
+`p_well` for BP8-PW) and be advanced explicitly by `Tsit5` alongside slip, with
+a loosened per-block `abstol` of 1e-3 Pa keeping it from dictating the step.
+That tolerance was the visible symptom; the structural point is that **the
+pressure subsystem is autonomous** — its right-hand side reads only `p`,
+`p_well` and `t`, never slip or state, because the coupling to elasticity is
+one-way through `σ̄ = σ - p`.
+
+So it is now solved on its own, before the elastic integration
+(`BP8.solve_pressure_history`), with `Rodas5P` and the analytic Jacobian the
+linear system provides; `evaluate!` interpolates the dense output. `build_model`
+does this by default over the full `par.t_f`, and any `run_bp8` sub-interval
+reuses it. The state vector is `3nf`, and the per-block `abstol` for pressure
+is gone.
+
+### What it costs
+
+Measured over the full 30 days, `Rodas5P` with the analytic Jacobian:
+
+| Δz | Gaussian | Peaceman |
+|---|---|---|
+| 50 m | 177 steps | 260 steps |
+| 25 m | 172 steps | 264 steps |
+| 10 m | 179 steps, 3.5 s, 57 MB | 283 steps, 5.8 s, 79 MB |
+
+**The step count is resolution-independent** — the whole benchmark's pressure
+history is a few seconds at any resolution, and reusable across runs like `K`.
+Supplying the Jacobian explicitly matters: without it Rodas5P builds a dense one
+by finite differences, which measured 400 s and 1 GB at Δz = 10 m.
+
+### Why the dense output, and not stored levels plus linear interpolation
+
+The original plan was to store `p` on a fixed time grid and interpolate
+linearly (second-order, "more than sufficient"). Measured at Δz = 10 m against a
+`reltol=1e-11` reference, worst case over interval midpoints:
+
+| interpolation | max error | induced error in `V` |
+|---|---|---|
+| **solver dense output** | **4.4 Pa** | **0.003 %** |
+| linear, hourly levels | 10.8 kPa | 7.1 % |
+| linear, 1800 s levels | 2.9 kPa | 1.8 % |
+| linear, 600 s levels | 336 Pa | 0.21 % |
+| linear, 300 s levels | 85 Pa | 0.05 % |
+
+Linear interpolation is second-order and converges cleanly (the ratios are 3.7×,
+8.6×, 4.0× for successive halvings), but `V ~ exp(τ/(aσ̄))` amplifies pressure
+error, so hourly storage costs 7 % in peak slip rate. The error is concentrated
+**entirely at the two kinks in the forcing** — the worst intervals are t = 0.5 h
+and t = 100.5 h, i.e. injection switch-on and `t_off` — which is exactly where
+an adaptive solver puts steps and a uniform grid does not. Since the implicit
+solve needs only ~180-280 steps, keeping its full dense output costs less memory
+than 300 s linear storage (57 MB against 453 MB) and is 20× more accurate.
+
+The RAM concern that motivated writing levels to disk does not arise: the fault
+grid is 81×81 at Δz = 10 m, so one level is 52 KB.
+
+### Validation
+
+Old-vs-new at Δz = 100 m over 100 h, both variants, comparing slip, ln θ, `V`,
+τ and `p` at every hour:
+
+| | max rel. difference |
+|---|---|
+| Gaussian: `p` / slip / `V_max` | 6.0e-7 / 5.9e-8 / 3.3e-5 |
+| Peaceman: `p` / slip / `V_max` | 2.1e-12 / 2.4e-10 / 4.3e-8 |
+
+All at integrator-tolerance level. The Gaussian `V` figure is the largest
+because that comparison lands on `t_off` itself, where the exponential
+sensitivity amplifies a 6e-7 pressure difference. Step counts moved slightly
+(GS 547 → 539, PW 613 → 588) since pressure no longer participates in error
+control. `test/bp8_test.jl`'s injected-volume balance — fault storage plus well
+storage equals `Q0·t` — is what pins that the split did not drop the well
+coupling.
+
 ## BP8-PW stiffness: what the stiff eigenvalue is (2026-08-21)
 
 The section above establishes *that* the floor causes the stiffness and what
@@ -886,12 +967,36 @@ the 4th decimal. Two consequences:
   part. `PorePressure.jl`'s standalone use of a Rosenbrock solver is about the
   pressure-only problem, and does not indicate where the coupled stiffness is.
 
+> **Correction (2026-09-09): the last row measured the wrong thing.** The
+> script sliced `J[3nf+1:4nf, 3nf+1:4nf]`, which stops one index short of
+> `p_well` — so the Peaceman **well coupling was excluded** and the row reports
+> the diffusion operator alone. Measured on the pressure subsystem's own
+> operator, well coupling included:
+>
+> | Δz | λ(`Ap` alone) | λ(`Ap` + well) | `-WI(1/S_well + 1/S_e)` |
+> |---|---|---|---|
+> | 100 m | -5.15e-5 | **-5.05e-4** | -5.05e-4 |
+> | 50 m | -2.11e-4 | -5.89e-4 | -5.84e-4 |
+> | 25 m | -8.51e-4 | -9.02e-4 | -7.44e-4 |
+>
+> The well exchange is **10× stiffer than diffusion** at Δz = 100 m. And
+> -5.05e-4 is exactly the "constant eigenvalue belonging to some other mode,
+> which `K_ww/D` does not predict" recorded below for Δz = 100 m — **that mode
+> is this block**. It is constant in time because `-WI(1/S_well + 1/S_e)`
+> depends on neither σ̄ nor the friction state.
+>
+> The section's conclusion is unaffected: -9e-4 is still ~2800× smaller than
+> the friction mode's -1.67, so IMEX on 3×3 friction blocks remains the right
+> fix. But "the pressure block is not stiff" was too strong, and pressure is
+> now integrated separately and implicitly for this reason (see below).
+
 ### So the fix is IMEX, not JFNK
 
 The implicit part is `nf` independent **3×3** solves — no Krylov, no
-preconditioner, no dense factorization. Explicit part: `K`'s off-diagonals and
-pressure. JFNK (the fallback recorded in `TODO.md`) is overkill by a wide
-margin.
+preconditioner, no dense factorization. Explicit part: `K`'s off-diagonals.
+(Pressure used to be listed here too; it is no longer integrated with the
+elastic system at all.) JFNK (the fallback recorded in `TODO.md`) is overkill by
+a wide margin.
 
 **Why the earlier `Rosenbrock23` probe looked hopeless was Jacobian
 *construction*, not implicit integration.** Measured at Δz = 50 m:
