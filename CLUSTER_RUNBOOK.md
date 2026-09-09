@@ -69,18 +69,49 @@ there is no other pin to fall back on — a 1.10 instantiate resolves Diffinitiv
 from the registry and fails to compile with `invalid subtyping in definition of
 IsotropicElasticOperator`. All 440 array tasks would fail identically.
 
-One-time setup:
+### Add the Diffinitive registry first
+
+`Diffinitive` and `Tokens` are **not in the General registry** — they come from
+`https://github.com/Diffinitive/diffinitive_registry`. Your laptop has it
+added already, so this is invisible locally, but a fresh depot on Pelle does
+not, and `instantiate` fails with:
+
+```
+ERROR: expected package `Tokens [040c2ec2]` to be registered
+```
+
+Registries are per-depot, so adding it once covers every project on Pelle.
+(`context/notes_robin.md`'s "registry up" assumes it is already there.)
+
+The `scripts/` environment additionally needs `EarthquakeDiffinitive` itself,
+which is in no registry at all, **and** the Diffinitive revision pinned rather
+than the registry's tagged `0.1.8` — those are different git trees, and the
+tagged one does not compile. Both are now pinned in a `[sources]` block in
+`scripts/Project.toml`, so a plain `instantiate` is all you need. If you ever
+bump the Diffinitive revision in the root `Project.toml`, change it there too —
+the root's `[sources]` does not propagate to `scripts/`.
+
+### One-time setup
 
 ```bash
 module load Julia/1.11.3-linux-x86_64
 cd /path/to/EarthquakeDiffinitive.jl
+
+# 1. the custom registry — HTTPS, not the SSH URL in its own Registry.toml
+julia -e 'using Pkg
+          Pkg.Registry.add(RegistrySpec(
+              url="https://github.com/Diffinitive/diffinitive_registry"))'
+
+# 2. then the environments
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 julia --project=scripts -e 'using Pkg; Pkg.instantiate()'
 
-# both must print ok before you submit anything
+# 3. both must print ok before you submit anything
 julia --project=. -e 'using EarthquakeDiffinitive; println("ok")'
 julia --project=scripts -e 'using EarthquakeDiffinitive; println("ok")'
 ```
+
+If step 1 says the registry already exists, `Pkg.Registry.update()` instead.
 
 ### Partitions and memory
 

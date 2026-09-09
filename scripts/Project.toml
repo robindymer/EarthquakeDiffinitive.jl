@@ -2,3 +2,20 @@
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 Diffinitive = "5a373a26-915f-4769-bcab-bf03835de17b"
 EarthquakeDiffinitive = "9fa83511-5388-4054-9589-4ce011e12b61"
+
+# `Diffinitive` and `EarthquakeDiffinitive` cannot be resolved from a registry
+# alone, so a fresh clone needs them pinned here — without this block
+# `Pkg.instantiate()` in this environment fails with "expected package
+# EarthquakeDiffinitive [9fa83511] to be registered", and pinning only
+# Diffinitive is not enough either: the diffinitive_registry's tagged 0.1.8 is a
+# *different git tree* from the revision the root project pins, and it does not
+# compile (`invalid subtyping in definition of IsotropicElasticOperator`).
+#
+# The root `Project.toml`'s own `[sources]` does not propagate here — it applies
+# when EarthquakeDiffinitive is the active project, not when it is a dependency
+# — so the revision is repeated. **Keep it in sync with the root file.**
+#
+# Requires Julia >= 1.11; 1.10 ignores `[sources]` silently.
+[sources]
+Diffinitive = {rev = "92d842cf1b9a137aa4952b59ad959abf588ba855", url = "https://github.com/Diffinitive/Diffinitive"}
+EarthquakeDiffinitive = {path = ".."}

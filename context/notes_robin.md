@@ -32,6 +32,10 @@ julia --project=scripts scripts/build_stiffness_cache.jl --list
 - Cholesky is a direct method, probably not viable for full scale problem
 
 ## Running on UPPMAX
+julia -e 'using Pkg
+          Pkg.Registry.add(RegistrySpec(
+              url="https://github.com/Diffinitive/diffinitive_registry"))'
+
 module load Julia/1.11.3-linux-x86_64
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 julia --project=scripts -e 'using Pkg; Pkg.instantiate()'
