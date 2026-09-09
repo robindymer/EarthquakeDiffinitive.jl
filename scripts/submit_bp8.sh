@@ -107,8 +107,7 @@ JID_K=$(sbatch --parsable "${MAILOPT[@]}" \
   -o "$REPO/logs/K_${TAG}_%A_%a.out" <<EOF
 #!/bin/bash -l
 $PREAMBLE
-julia --project=scripts scripts/build_stiffness_cache.jl \\
-      $DZ $L_FAULT $L_NORMAL exact \$SLURM_ARRAY_TASK_ID $NSHARDS
+julia --project=scripts scripts/build_stiffness_cache.jl $DZ $L_FAULT $L_NORMAL exact \$SLURM_ARRAY_TASK_ID $NSHARDS
 EOF
 )
 echo "  [1] K shards      job $JID_K  (array 1-$NSHARDS)"
