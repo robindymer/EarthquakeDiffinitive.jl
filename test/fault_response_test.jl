@@ -111,6 +111,55 @@ const FE_K = fault_stiffness(FE)
         @test solver_report(fe_thr.rs).iterations == solver_report(fe_ser.rs).iterations
     end
 
+    # `symmetry=true` (PERFORMANCE.md §5 item 0b) is an EXACT discrete identity,
+    # not an approximation like Toeplitz — so unlike the Toeplitz test below,
+    # this must agree with the plain build to solver tolerance, not to a loose
+    # norm bound. FE_GM/FE_GP/FE (l_f=0.6 on a 13-node cube) give a square,
+    # centred 7×7 Ω_f, exactly what the symmetry needs.
+    @testset "D4 symmetry build agrees with the plain exact build" begin
+        set = fr_stencil_set()
+        gm, gp = fr_grids(13; L=1.2)
+        fe_plain = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.6)
+        fe_sym = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.6)
+        K_plain = fault_stiffness(fe_plain; threaded=false)
+        K_sym = fault_stiffness(fe_sym; symmetry=true, threaded=false)
+
+        @test size(K_sym) == size(K_plain)
+        @test K_sym ≈ K_plain rtol = 1e-8
+
+        # The whole point: far fewer CG solves for the same matrix. A 7×7 Ω_f
+        # has 98 columns; D4 must cut that well below half.
+        @test solver_report(fe_sym.rs).solves < solver_report(fe_plain.rs).solves ÷ 2
+        @test all(<(0), diag(K_sym))
+    end
+
+    @testset "D4 symmetry build: threaded matches serial" begin
+        Threads.nthreads() == 1 &&
+            @info "only 1 thread: the threaded D4 test cannot detect a data race here"
+        set = fr_stencil_set()
+        gm, gp = fr_grids(13; L=1.2)
+        fe_ser = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.6)
+        fe_thr = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.6)
+        K_ser = fault_stiffness(fe_ser; symmetry=true, threaded=false)
+        K_thr = fault_stiffness(fe_thr; symmetry=true, threaded=true)
+        @test K_thr == K_ser
+        @test solver_report(fe_thr.rs).solves == solver_report(fe_ser.rs).solves
+    end
+
+    @testset "D4 symmetry build rejects incompatible configurations" begin
+        set = fr_stencil_set()
+        gm, gp = fr_grids(13; L=1.2)
+        fe = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.6)
+        @test_throws ErrorException fault_stiffness(fe; symmetry=true, cols=1:2)
+
+        # A non-square Ω_f (different spacing on x2 vs x3, so different node
+        # counts) must be rejected rather than silently mis-symmetrised.
+        g_minus_rect = equidistant_grid((-1.2, -1.2, -1.5), (0.0, 1.2, 1.5), 13, 13, 11)
+        g_plus_rect = equidistant_grid((0.0, -1.2, -1.5), (1.2, 1.2, 1.5), 13, 13, 11)
+        fe_rect = FaultElasticity(g_minus_rect, g_plus_rect, λ_fr, μ_fr, set; l_f=0.6)
+        @test_throws ErrorException fault_stiffness(fe_rect; symmetry=true)
+    end
+
     # `fault_stiffness_toeplitz` rebuilds K from FIVE sources (10 solves) instead
     # of 2*N_Ωf, using the whole-space kernel's translation invariance. It is now
     # `build_model`'s DEFAULT, so this guards what ships. It pins two things:

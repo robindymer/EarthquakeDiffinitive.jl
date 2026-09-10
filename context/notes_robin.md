@@ -41,8 +41,8 @@ julia --project=. -e 'using Pkg; Pkg.instantiate()'
 julia --project=scripts -e 'using Pkg; Pkg.instantiate()'
 julia --project=. -e 'using EarthquakeDiffinitive; println("ok")'
 
-./scripts/submit_bp8.sh 20
-./scripts/submit_bp8.sh 10 1200 1200 880
+./submit_bp8.sh 20
+./submit_bp8.sh 10 1200 1200 880
 
 ## Misc
 [robind@pelle1 scripts]$ ./submit_bp8.sh 20
@@ -55,13 +55,13 @@ BP8-QD-GS submission chain
   account      uppmax2026-1-45   partition pelle
 sbatch: --mail-user is not supported on Pelle
 sbatch: Mail will be sent to your e-mail address in SUPR
-  [1] K shards      job 6678514  (array 1-32)
+  [1] K shards      job 6680606  (array 1-32)
 sbatch: --mail-user is not supported on Pelle
 sbatch: Mail will be sent to your e-mail address in SUPR
-  [2] merge         job 6678515  (after 6678514)
+  [2] merge         job 6680607  (after 6680606)
 sbatch: --mail-user is not supported on Pelle
 sbatch: Mail will be sent to your e-mail address in SUPR
-  [3] run + outputs job 6678516  (after 6678515)
+  [3] run + outputs job 6680608  (after 6680607)
 
 Submitted. Watch with:  squeue -u $USER
 Outputs will appear in: /proj/efficient_elastic/efficient_elastic/nobackup/EarthquakeDiffinitive.jl/output/BP8-QD-GS_dz20_Lf1600_Ln1200_exact/
@@ -76,13 +76,13 @@ BP8-QD-GS submission chain
   account      uppmax2026-1-45   partition pelle
 sbatch: --mail-user is not supported on Pelle
 sbatch: Mail will be sent to your e-mail address in SUPR
-  [1] K shards      job 6678517  (array 1-880)
+  [1] K shards      job 6680609  (array 1-880)
 sbatch: --mail-user is not supported on Pelle
 sbatch: Mail will be sent to your e-mail address in SUPR
-  [2] merge         job 6678518  (after 6678517)
+  [2] merge         job 6680610  (after 6680609)
 sbatch: --mail-user is not supported on Pelle
 sbatch: Mail will be sent to your e-mail address in SUPR
-  [3] run + outputs job 6678519  (after 6678518)
+  [3] run + outputs job 6680611  (after 6680610)
 
 Submitted. Watch with:  squeue -u $USER
 Outputs will appear in: /proj/efficient_elastic/efficient_elastic/nobackup/EarthquakeDiffinitive.jl/output/BP8-QD-GS_dz10_Lf1200_Ln1200_exact/

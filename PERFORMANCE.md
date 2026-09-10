@@ -437,7 +437,14 @@ largely dissolves item 1 rather than competing with it.
 0. **Implement the Toeplitz `K` build** (§4b). Turns `2·N_Ωf` solves into 2, at
    ~0.03% cost in `V_max`. Purely local work, no cluster needed.
 0b. **Exploit `K`'s square symmetry (`D4`) in the `:exact` build — an exact
-   discrete identity, not an approximation.** `Ω_f` and the elastic grids are
+   discrete identity, not an approximation.** **Implemented** —
+   `fault_stiffness(fe; symmetry=true)` (`src/FaultResponse.jl`), and it is
+   what `build_model`'s `:exact` path uses by default now (`stiffness_matrix`
+   in `src/BP8.jl`), since the domain it builds is always square and centred.
+   Verified against the plain build on a 7×7 `Ω_f`: agrees to `rtol=1e-8`
+   (solver tolerance), 16 solves instead of 98
+   (`test/fault_response_test.jl` "D4 symmetry build agrees with the plain
+   exact build"). `Ω_f` and the elastic grids are
    square and centred in the two fault-parallel directions, the medium is
    homogeneous, and all four fault-parallel far-field faces carry the same
    `u=0` condition. So the whole discretization is invariant under the eight

@@ -24,6 +24,13 @@ ceiling. `K` is built by `:toeplitz` (10 solves) by default, with `:exact`
 validation behind that default. Preconditioning was measured and rejected
 (§6): Jacobi 0.92×, AMG break-even at best.
 
+**`:exact` itself got faster this session (2026-09-10).** `fault_stiffness(fe;
+symmetry=true)` exploits `K`'s `D4` square symmetry — an exact identity, not
+an approximation — cutting the reference build's CG solves by 6.5-7.8×
+(`PERFORMANCE.md` §5 item 0b). `stiffness_matrix`'s `:exact` branch uses it
+unconditionally now, since `build_fault_elasticity` always produces a square,
+centred domain.
+
 **The remaining blocker is memory for `A` itself at Δz = 20 m (~15 GB), not
 compute and not the `K` build.** With `:toeplitz` the target run is ~3 h on one
 node. Full suite green at **200/200**.

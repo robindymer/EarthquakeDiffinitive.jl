@@ -267,8 +267,12 @@ function stiffness_matrix(; par, Δz, L_fault, L_normal, n1, n23, order, set,
                                 verbose, solver_kwargs...)
 
     t0 = time()
+    # `symmetry=true` is safe unconditionally here: `build_fault_elasticity`
+    # always gives both fault-parallel directions the same `L_fault`/`n23`
+    # about a centre at 0, which is exactly `fault_stiffness`'s D4 precondition
+    # (PERFORMANCE.md §5 item 0b). Same K, 6.5-7.8× fewer CG solves.
     K = stiffness === :toeplitz ? fault_stiffness_toeplitz(fe; verbose) :
-                                  fault_stiffness(fe; verbose)
+                                  fault_stiffness(fe; verbose, symmetry=true)
     verbose && @info "fault stiffness built" seconds = round(time() - t0, digits=1) stiffness size = size(K) elastic_solver_report(fe)...
 
     x2, x3 = collect.(fault_grid_axes(fe))
