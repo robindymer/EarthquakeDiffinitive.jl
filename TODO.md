@@ -390,15 +390,15 @@ Costs from `PERFORMANCE.md` §4 (extrapolated ±2×):
 `PROGRESS.md` limitation 2's "Δz = 50 m is the ceiling" is **stale** — that was
 the removed direct solver's fill-in. Memory is no longer what binds.
 
-- [ ] **Multi-node parallelism — the cluster blocker, and now item 2's top
-      priority.** `fault_stiffness` uses `Threads.@spawn` only, so it cannot
-      leave one node, and within a node the sparse mat-vec is
-      memory-bandwidth-bound (2.13× on 16 threads, per PROGRESS). The `2·N_Ωf`
-      columns are independent RHSs against a shared `A` — the ideal shape for
-      distribution: one copy of `A` per node, a slice of the columns each,
-      near-linear because each node has its own bandwidth. Needs
-      `Distributed`/MPI; neither is present. Δz = 10 m is unreachable without
-      it and comfortable with it.
+- [x] **Multi-node parallelism.** **Stale as written** — done via independent
+      processes + a shared directory, not `Distributed`/MPI (never needed):
+      `build_stiffness_cache.jl [shard] [nshards]` + `merge_stiffness_cache.jl`.
+      Since (2026-09-10) it composes with D4 symmetry
+      (`PERFORMANCE.md` §5 item 0b) via `fault_stiffness_d4_shard`, which
+      splits D4 orbit representatives — not raw columns — across shards, so
+      sharding does not give up item 0b's ~7.8×. At Δz = 10 m that takes
+      `:exact` from ~934 node-days (raw columns) to ~120 (with D4), i.e.
+      ~12-15 nodes for ~10 days instead of ~100.
 - [x] **Test whether `K` is near-block-Toeplitz.** **Yes, and decisively.**
       `scripts/k_toeplitz_structure.jl` + `k_toeplitz_validate.jl`. A `K` rebuilt
       from **5 sources (10 CG solves)** reproduces `V_max(t)` to **0.41%** over

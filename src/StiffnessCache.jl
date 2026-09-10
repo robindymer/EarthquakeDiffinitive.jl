@@ -317,6 +317,16 @@ end
 # covers, so merging does not trust a claimed `nshards` — it trusts the union
 # of `cols` actually found on disk. That is what lets a failed or re-run shard
 # job be dropped in without renumbering anything else.
+#
+# This format is agnostic to *how* a shard picked its columns, which is what
+# lets `FaultResponse.fault_stiffness_d4_shard` (PERFORMANCE.md §5 item 0b)
+# reuse it unchanged: it splits D4 orbit *representatives* rather than raw
+# columns across shards, so each solve fixes up to 8 columns instead of 1, and
+# hands back whichever global columns that turned out to cover. The coverage
+# check below only cares that the union across shards is exactly `1:2N_Ωf`
+# with no gaps or duplicates — true either way, since `column_orbits`
+# partitions that whole range regardless of how the representatives
+# themselves are split.
 # ==============================================================================
 
 const SHARD_MAGIC = "EQDKSHD1"

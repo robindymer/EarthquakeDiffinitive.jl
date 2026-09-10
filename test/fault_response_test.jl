@@ -160,6 +160,42 @@ const FE_K = fault_stiffness(FE)
         @test_throws ErrorException fault_stiffness(fe_rect; symmetry=true)
     end
 
+    # `fault_stiffness_d4_shard` is what makes D4 symmetry and cross-node
+    # sharding compose instead of forcing a choice (PERFORMANCE.md §5 item 0b,
+    # for Δz where even the D4-reduced solve count doesn't fit one node).
+    # This pins the property the whole design leans on: splitting the orbit
+    # REPRESENTATIVES across shards still gives exactly one owner per global
+    # column, with no gaps or double-counting, regardless of shard count.
+    @testset "D4 sharded build reassembles the symmetric build exactly" begin
+        set = fr_stencil_set()
+        gm, gp = fr_grids(13; L=1.2)
+        fe_full = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.6)
+        K_full = fault_stiffness(fe_full; symmetry=true, threaded=false)
+        ncols = size(K_full, 2)
+
+        nshards = 3
+        K_assembled = fill(NaN, size(K_full))
+        allcols = Int[]
+        total_solves = 0
+        for shard in 1:nshards
+            fe = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.6)
+            cols, Kc = fault_stiffness_d4_shard(fe, shard, nshards; threaded=false)
+            @test size(Kc) == (ncols, length(cols))
+            append!(allcols, cols)
+            K_assembled[:, cols] .= Kc
+            total_solves += solver_report(fe.rs).solves
+        end
+
+        @test sort(allcols) == collect(1:ncols)   # every column, exactly once
+        @test K_assembled ≈ K_full rtol = 1e-8
+        # The whole point: sharding must not give up D4's solve reduction.
+        @test total_solves == solver_report(fe_full.rs).solves
+        @test total_solves < ncols ÷ 2
+
+        @test_throws ErrorException fault_stiffness_d4_shard(fe_full, 0, nshards)
+        @test_throws ErrorException fault_stiffness_d4_shard(fe_full, nshards + 1, nshards)
+    end
+
     # `fault_stiffness_toeplitz` rebuilds K from FIVE sources (10 solves) instead
     # of 2*N_Ωf, using the whole-space kernel's translation invariance. It is now
     # `build_model`'s DEFAULT, so this guards what ships. It pins two things:

@@ -14,7 +14,7 @@ using ..ElasticitySplitNode: split_node_system, CGSolver,
 
 export FaultElasticity, fault_grid_axes, frictional_node_count,
        shear_traction, shear_traction!, fault_stiffness, fault_stiffness_toeplitz,
-       elastic_solver_report
+       fault_stiffness_d4_shard, elastic_solver_report
 
 # ==============================================================================
 # The slip → shear-traction map on the fault.
@@ -387,27 +387,36 @@ function fault_stiffness(fe::FaultElasticity; verbose=false,
     return K
 end
 
+# Common precondition check + orbit setup for both `symmetry=true` entry
+# points (`fault_stiffness_d4`, `fault_stiffness_d4_shard`): a square, centred
+# `Ω_f`, and the D4 group/orbit tables for its side length. `caller` names the
+# public function in error messages.
+function d4_setup(fe::FaultElasticity, caller)
+    n2, n3 = length(fe.x2f), length(fe.x3f)
+    n2 == n3 ||
+        error("$caller: symmetry=true needs a square Ω_f (n2 == n3); " *
+              "got $n2 × $n3 — see PERFORMANCE.md §5 item 0b")
+    n = n2
+    atol = 1e-9 * max(maximum(abs, fe.x2f), 1.0)
+    isapprox(fe.x2f, fe.x3f; atol) ||
+        error("$caller: symmetry=true needs identical x2/x3 grids on Ω_f " *
+              "(the elastic domain must be square in both fault-parallel directions)")
+    all(a -> isapprox(fe.x2f[a], -fe.x2f[n+1-a]; atol), 1:n) ||
+        error("$caller: symmetry=true needs Ω_f centred about 0 on both axes")
+
+    perms, Qs = square_symmetry_group(n)
+    reps, targets = column_orbits(n, perms, Qs)
+    return perms, Qs, reps, targets
+end
+
 # The `symmetry=true` path of `fault_stiffness`: one CG solve pair per D4
 # orbit representative, propagated to the rest of the orbit by symmetry
 # instead of solved for. See that docstring and PERFORMANCE.md §5 item 0b for
 # the identity this implements and its preconditions.
 function fault_stiffness_d4(fe::FaultElasticity; verbose=false,
                             threaded=Threads.nthreads() > 1)
-    n2, n3 = length(fe.x2f), length(fe.x3f)
     nf = frictional_node_count(fe)
-    n2 == n3 ||
-        error("fault_stiffness: symmetry=true needs a square Ω_f (n2 == n3); " *
-              "got $n2 × $n3 — see PERFORMANCE.md §5 item 0b")
-    n = n2
-    atol = 1e-9 * max(maximum(abs, fe.x2f), 1.0)
-    isapprox(fe.x2f, fe.x3f; atol) ||
-        error("fault_stiffness: symmetry=true needs identical x2/x3 grids on Ω_f " *
-              "(the elastic domain must be square in both fault-parallel directions)")
-    all(a -> isapprox(fe.x2f[a], -fe.x2f[n+1-a]; atol), 1:n) ||
-        error("fault_stiffness: symmetry=true needs Ω_f centred about 0 on both axes")
-
-    perms, Qs = square_symmetry_group(n)
-    reps, targets = column_orbits(n, perms, Qs)
+    perms, Qs, reps, targets = d4_setup(fe, "fault_stiffness")
     ncols = 2nf
     K = zeros(ncols, ncols)
     t0 = time()
@@ -465,6 +474,107 @@ function fault_stiffness_d4(fe::FaultElasticity; verbose=false,
     end
     verbose && @info "fault_stiffness (D4 symmetry): done" seconds = round(time() - t0, digits=1) representatives = length(reps) columns = ncols
     return K
+end
+
+"""
+    fault_stiffness_d4_shard(fe, shard, nshards; verbose=false,
+                             threaded=Threads.nthreads() > 1) -> (cols, Kshard)
+
+D4 symmetry (`fault_stiffness(fe; symmetry=true)`, PERFORMANCE.md §5 item 0b)
+combined with cross-node sharding, for a resolution where even the
+symmetry-reduced solve count does not fit one node's wall-clock budget (e.g.
+Δz = 10 m: `:exact` needs `2·N_Ωf` solves, D4 cuts that ~6.5-7.8×, and that
+can still be node-days). Splits the D4 orbit **representatives** — not the
+raw columns — `shard:nshards:end` across `nshards` independent processes;
+`shard` is 1-based.
+
+Returns `(cols, Kshard)`: the *global* column indices (into `1:2·N_Ωf`) this
+shard's representatives determine, and the corresponding `2·N_Ωf ×
+length(cols)` slice. This is deliberately the same shape
+[`save_stiffness_shard`](@ref) takes for the plain (non-symmetric) shard
+build, so a shard from this function drops straight into the existing
+`merge_stiffness_shards` with no format change — each representative's single
+solve fixes up to 8 columns of its symmetry orbit, so unlike a raw-column
+shard, which columns a shard covers isn't known until after the orbit tables
+are built, which is why it's returned rather than passed in.
+
+`column_orbits` partitions the *whole* `1:2·N_Ωf` range across representatives
+regardless of how those representatives are split across shards, so the union
+of `cols` across all `nshards` shards is still exactly `1:2·N_Ωf` with no gaps
+or duplicates — `merge_stiffness_shards`'s coverage check is unaffected by
+switching to this builder.
+
+Same square, centred `Ω_f` precondition as `fault_stiffness(fe; symmetry=true)`
+(checked; throws otherwise).
+"""
+function fault_stiffness_d4_shard(fe::FaultElasticity, shard::Integer, nshards::Integer;
+                                  verbose=false, threaded=Threads.nthreads() > 1)
+    1 <= shard <= nshards ||
+        error("fault_stiffness_d4_shard: shard must be in 1:nshards, got " *
+              "shard=$shard nshards=$nshards")
+    nf = frictional_node_count(fe)
+    perms, Qs, reps, targets = d4_setup(fe, "fault_stiffness_d4_shard")
+    myreps = collect(shard:nshards:length(reps))
+
+    mycols = Int[]
+    for pos in myreps, (_, tcol) in targets[pos]
+        push!(mycols, tcol)
+    end
+    colpos = Dict(c => i for (i, c) in enumerate(mycols))
+    Kshard = zeros(2nf, length(mycols))
+    t0 = time()
+
+    # Same private-buffers-via-function-scope requirement as `run_columns!`/
+    # `run_reps!` above (see the comment on `run_columns!`): `if`/`else` and
+    # `begin` are not scopes in Julia.
+    function run_reps!(items, solver; progress=false)
+        s2, s3 = zeros(nf), zeros(nf)
+        Δτ2, Δτ3 = zeros(nf), zeros(nf)
+        χ = zeros(fe.Ntot)
+        done = 0
+        for pos in items
+            col = reps[pos]
+            node = col <= nf ? col : col - nf
+            comp = col <= nf ? 1 : 2
+            fill!(s2, 0.0)
+            fill!(s3, 0.0)
+            comp == 1 ? (s2[node] = 1.0) : (s3[node] = 1.0)
+            shear_traction!(Δτ2, Δτ3, fe, s2, s3, χ, solver)
+            @inbounds for (g, tcol) in targets[pos]
+                Q = Qs[g]
+                perm = perms[g]
+                σ = Q[1, comp] != 0 ? Q[1, comp] : Q[2, comp]
+                out = colpos[tcol]
+                for i in 1:nf
+                    v1 = Q[1, 1] * Δτ2[i] + Q[1, 2] * Δτ3[i]
+                    v2 = Q[2, 1] * Δτ2[i] + Q[2, 2] * Δτ3[i]
+                    ti = perm[i]
+                    Kshard[ti, out] = σ * v1
+                    Kshard[nf+ti, out] = σ * v2
+                end
+            end
+            done += 1
+            if progress && (done % 20 == 0 || done == length(items))
+                el = time() - t0
+                @info "fault_stiffness_d4_shard: representative $done/$(length(items))" elapsed = round(el, digits=1) eta = round(el * (length(items) - done) / done, digits=1)
+            end
+        end
+        return solver
+    end
+
+    if threaded
+        nt = min(Threads.nthreads(), length(myreps))
+        verbose && @info "fault_stiffness_d4_shard: threaded build" shard nshards representatives = length(myreps) columns = length(mycols) threads = nt
+        tasks = [Threads.@spawn run_reps!(myreps[t:nt:end], duplicate(fe.rs);
+                                          progress=(verbose && t == 1)) for t in 1:nt]
+        for task in tasks
+            merge_stats!(fe.rs, fetch(task))
+        end
+    else
+        run_reps!(myreps, fe.rs; progress=verbose)
+    end
+    verbose && @info "fault_stiffness_d4_shard: done" seconds = round(time() - t0, digits=1) shard nshards representatives = length(myreps) columns = length(mycols)
+    return mycols, Kshard
 end
 
 """

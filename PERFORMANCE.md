@@ -148,6 +148,14 @@ of nodes for days. Δz = 10 m needs ~120 GB **per node** (each node holds its ow
 copy of `A`) and ~934 node-days of 12-core work — so ~100 nodes for ~10 days,
 or ~500 for ~2 days.
 
+**These `:exact` node-day figures predate §5 item 0b (D4 symmetry) and are now
+~7.8× pessimistic.** With `fault_stiffness_d4_shard` (§5 item 0b) the Δz = 10 m
+`:exact` build is ~120 node-days, not ~934 — so ~12-15 nodes for ~10 days, or
+~60-75 for ~2 days, at the same per-node memory. The `K` columns figures in
+the table above are unchanged (they are `2·N_Ωf`, the count `:exact` would
+need *without* D4); §5 item 0b's own table gives the D4-reduced solve counts
+per Δz.
+
 **Do not convert these to core-hours.** Threading efficiency is ~15% (7.02 s per
 column on 12 cores against ~13 s serial-equivalent), because the sparse mat-vec
 is memory-bandwidth bound. Cores within a node are nearly free of benefit past a
@@ -514,15 +522,20 @@ largely dissolves item 1 rather than competing with it.
    rather than BP8's whole space) would break the depth reflection and leave
    2×; that is the change most likely to cost this.
 
-1. **Multi-node parallelism (the cluster blocker).** `fault_stiffness` uses
-   `Threads.@spawn` only — single node. Worse, PROGRESS records threading
-   scaling as sublinear (2.13× on 16 threads at production) because sparse
-   mat-vec is **memory-bandwidth bound**, so piling on cores within a node buys
-   little. The columns are independent right-hand sides against a shared `A`,
-   which is exactly the shape that distributes well: give each node its own copy
-   of `A` and a slice of the columns, and scaling is near-linear because each
-   node has its own memory bandwidth. Needs `Distributed`/MPI; neither is
-   present. **This is what stands between the cluster and Δz = 10 m.**
+1. **Multi-node parallelism — implemented, and now composes with item 0b.**
+   `fault_stiffness`'s columns (or, with item 0b, its D4 orbit representatives)
+   are independent right-hand sides against a shared `A`, which distributes
+   without `Distributed`/MPI: each node rebuilds its own copy of `A` (minutes,
+   §4c) and takes a slice of the work, coordinating through nothing fancier
+   than a shared directory — `build_stiffness_cache.jl [shard] [nshards]` +
+   `merge_stiffness_cache.jl`, backed by `fault_stiffness_d4_shard` so sharding
+   splits *representatives* rather than raw columns and does not give up item
+   0b's ~7.8× (see that function's docstring for why the shard-file format
+   needed no change to support this). Within a node, threading is still only
+   sublinear (2.13× on 16 threads at production, PROGRESS.md) because the
+   sparse mat-vec is **memory-bandwidth bound** — independent **nodes**, each
+   with their own bandwidth, are what scales, which is why this axis matters at
+   all even after item 0b's per-node win.
 2. **Exploit structure in `K` (untested, potentially the largest win).** In a
    homogeneous medium `K[i,j]` should depend mainly on the separation
    `x_i − x_j`, making `K` near-block-Toeplitz — one solve could populate most
