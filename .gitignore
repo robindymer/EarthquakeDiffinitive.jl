@@ -10,3 +10,7 @@
 /scripts/*.png
 # Benchmark output written by scripts/run_bp8.jl — regenerable, ~100 MB
 /output/
+
+# Cluster-specific CUDA toolkit pin (CUDA.set_runtime_version!) — per-machine,
+# not per-repo. See CLUSTER_RUNBOOK.md "CUDA.jl was precompiled without a driver".
+LocalPreferences.toml

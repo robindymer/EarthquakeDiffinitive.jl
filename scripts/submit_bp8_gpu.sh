@@ -157,6 +157,58 @@ cd $REPO
 export EQD_STIFFNESS_CACHE=$EQD_STIFFNESS_CACHE
 export JULIA_NUM_THREADS=\$SLURM_CPUS_PER_TASK"
 
+# --- CUDA.jl provisioning preflight, run *on the allocated node* -------------
+#
+# WHY THIS EXISTS. `Pkg.instantiate()` is normally run on the login node, which
+# has no NVIDIA driver. CUDA.jl selects its CUDA toolkit *artifact* by asking
+# the driver which version it supports **at precompile time**, so a login-node
+# precompile bakes "no runtime found" into `CUDA_Runtime_jll`'s cache. Landing
+# on a GPU node afterwards does not fix it: nothing in the *environment*
+# changed, only the hardware, so Julia reuses the stale cache and CUDA.jl
+# reports
+#
+#     CUDA.jl could not find an appropriate CUDA runtime to use.
+#     CUDA.jl's JLLs were precompiled without an NVIDIA driver present.
+#
+# and `CUDA.functional()` is false — on a node that has a perfectly good card.
+# The durable fix is to pin the toolkit version so the choice no longer depends
+# on a driver being visible (CLUSTER_RUNBOOK.md "CUDA.jl was precompiled
+# without a driver"); this block is the in-job safety net for when that has not
+# been done, and it distinguishes the two failure modes that produce the same
+# symptom.
+GPU_PREFLIGHT=$(cat <<'PRE'
+if ! nvidia-smi -L >/dev/null 2>&1; then
+    echo "error: no NVIDIA driver visible on $(hostname)." >&2
+    echo "       This allocation has no GPU — check that --gpus survived sbatch." >&2
+    exit 1
+fi
+nvidia-smi -L
+
+# One cheap load to see whether the JLLs are usable here. If they are not, they
+# were precompiled somewhere without a driver: recompile them on this node and
+# let a fresh process pick them up. ALL of `CUDA_*_jll` and not just
+# `CUDA_Runtime_jll`, because the runtime and the compiler are separate
+# artifacts that go stale independently — fixing only the runtime gets you as
+# far as `UndefVarError: ptxas not defined in CUDA_Compiler_jll`, and a missing
+# `libnvJitLink` from the same JLL is what makes CUDA.jl fall back to
+# /usr/local/cuda and warn about a system path.
+#
+# This can take ~45 min if it cascades into a full CUDA.jl precompile, which is
+# why the runbook asks you to do it once in an interactive allocation instead.
+if ! julia --project=scripts -e 'using CUDA; exit(CUDA.functional() ? 0 : 1)' >/dev/null 2>&1; then
+    echo "CUDA.jl not functional on first load — recompiling CUDA JLLs on $(hostname)"
+    julia --project=scripts -e '
+        using Pkg
+        for (uuid, e) in Pkg.Types.Context().env.manifest
+            startswith(e.name, "CUDA_") && endswith(e.name, "_jll") || continue
+            @info "recompiling $(e.name)"
+            Base.compilecache(Base.PkgId(uuid, e.name))
+        end'
+    julia --project=scripts scripts/gpu_smoke_test.jl
+fi
+PRE
+)
+
 # --- 1. build K on the GPU ----------------------------------------------------
 # Threads still matter even though the solves are on the device: the host
 # assembles A and HP_DSAT, and forms every right-hand side.
@@ -166,6 +218,7 @@ JID_K=$(sbatch --parsable \
   -o "$REPO/logs/Kgpu_${TAG}_%j.out" <<EOF
 #!/bin/bash -l
 $PREAMBLE
+$GPU_PREFLIGHT
 julia --project=scripts scripts/build_stiffness_cache_gpu.jl $DZ $L_FAULT $L_NORMAL
 EOF
 )

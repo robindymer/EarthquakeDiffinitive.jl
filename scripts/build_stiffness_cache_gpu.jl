@@ -46,15 +46,57 @@ using SparseArrays
 using Printf
 using CUDA
 
+include(joinpath(@__DIR__, "gpu_vram.jl"))
+
 const DEFAULT_Δz = 20.0
 const DEFAULT_L_FAULT = 1600.0
 const DEFAULT_L_NORMAL = 1200.0
 
-CUDA.functional() || error("""
-    no functional CUDA device — this script is the GPU build path.
-    On SLURM that usually means the job was submitted without `--gpus`;
-    use `scripts/submit_bp8_gpu.sh`, or run the CPU path
-    (`scripts/build_stiffness_cache.jl`) instead.""")
+# TWO DIFFERENT FAULTS LOOK IDENTICAL HERE, and saying only "no GPU" sent one
+# debugging session down the wrong path entirely. `CUDA.functional()` is false
+# both when the allocation has no device and when it has one that CUDA.jl
+# cannot use. `nvidia-smi` separates them, because the *driver* is the half
+# that comes from the node while the *runtime* is the half that was chosen at
+# precompile time — deliberately a shell probe rather than a Julia one, since
+# the Julia side is exactly what is broken in the second case.
+if !CUDA.functional()
+    driver_present = try
+        success(pipeline(`nvidia-smi -L`; stdout=devnull, stderr=devnull))
+    catch
+        false
+    end
+    if !driver_present
+        error("""
+            no functional CUDA device and no NVIDIA driver on this node — this
+            script is the GPU build path. On SLURM that usually means the job
+            was submitted without `--gpus`; use `scripts/submit_bp8_gpu.sh`, or
+            run the CPU path (`scripts/build_stiffness_cache.jl`) instead.""")
+    else
+        error("""
+            this node has a GPU driver but CUDA.jl has no usable CUDA runtime,
+            so it cannot touch the card. This is a *precompilation* fault, not
+            a SLURM one: CUDA.jl picks its toolkit artifact by asking the
+            driver at precompile time, so a `Pkg.instantiate()` run on a login
+            node bakes in "no runtime found", and Julia will not invalidate
+            that cache merely because the hardware changed.
+
+            Fix it once, from a node that has a driver — re-run the artifact
+            selection *there*, then freeze what it picked:
+
+                julia --project=scripts -e 'pkg = Base.PkgId(Base.UUID(
+                    "76a88914-d11a-5bdc-97e0-2f5a05c973a2"), "CUDA_Runtime_jll")
+                    Base.compilecache(pkg)'
+                julia --project=scripts -e 'using CUDA; CUDA.versioninfo()'
+                julia --project=scripts -e 'using CUDA; CUDA.set_runtime_version!(v"X.Y")'
+
+            with `X.Y` the `CUDA runtime` line the second command prints — not
+            the version in `nvidia-smi`'s header, which is the newest the
+            driver *could* support and may have no CUDA.jl artifact. The last
+            command writes `scripts/LocalPreferences.toml`, so later precompiles
+            no longer need a driver present. See CLUSTER_RUNBOOK.md "CUDA.jl was
+            precompiled without a driver".""")
+    end
+end
 
 dir = stiffness_cache_dir()
 dir === nothing && error("""
@@ -85,8 +127,8 @@ grid        %d x %d x %d per side, %d DOF
 device      %s, %.1f GB total, %.1f GB free
 cache       %s
 """, Δz, L_fault, L_normal, n1, n23, n23, Ntot, nf, 2nf, 2nf, (2nf)^2 * 8 / 2^20,
-     CUDA.name(CUDA.device()), CUDA.total_memory() / 2^30,
-     CUDA.available_memory() / 2^30, path)
+     CUDA.name(CUDA.device()), vram_total() / 2^30,
+     vram_free() / 2^30, path)
 
 if isfile(path)
     println("\nalready cached — nothing to do (delete the file to rebuild it)")
@@ -104,7 +146,7 @@ est_nnz_row(n) = 48.52 - 349.0 / n
 est_nnzA = Ntot * est_nnz_row(n23)
 est_Ti = est_nnzA <= typemax(Int32) - 1 ? 4 : 8
 est_need = est_nnzA * (8 + est_Ti) * 1.03 + 9 * Ntot * 8   # +3% for P, T2, T3
-free0 = CUDA.available_memory()
+free0 = vram_free()
 @printf("estimate    nnz(A) ~%.2fe9 (%s), VRAM ~%.0f GB needed, %.0f GB free\n",
         est_nnzA / 1e9, est_Ti == 4 ? "Int32" : "Int64", est_need / 2^30, free0 / 2^30)
 est_need < free0 || error("""
@@ -129,7 +171,7 @@ resident = csr_bytes(fe.rs.A) + csr_bytes(fe.P) + csr_bytes(fe.T2) + csr_bytes(f
 # Krylov's CG workspace plus the rhs/solution vectors this build keeps live.
 vectors = 9 * fe.Ntot * 8
 need = resident + vectors
-free = CUDA.available_memory()
+free = vram_free()
 @printf("""
 A           %d nonzeros (%.2f per row)
 VRAM        %.1f GB matrices + %.1f GB vectors = %.1f GB needed, %.1f GB free

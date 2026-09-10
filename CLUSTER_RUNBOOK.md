@@ -174,20 +174,104 @@ julia --project=scripts -e 'using Pkg; Pkg.instantiate()'
 `CUDA` is a weakdep of the root project, so the environment that wants the
 extension has to depend on it directly; it is now in `scripts/Project.toml`.
 
-**Do not `module load CUDA/...` for the Julia jobs.** CUDA.jl ships its own
-toolkit as an artifact and matches it to the driver. Loading the system module
-puts it on `LD_LIBRARY_PATH`, CUDA.jl loads *those* libraries instead and warns
-(`CUDA runtime library libcusparse.so.12 was loaded from a system path`), with
-a real chance of a version mismatch. The GPU *driver* comes from the node, so
-nothing is missing. This is the one place the Julia GPU workflow differs from
-the CUDA/C++ one.
+**Then provision CUDA.jl's runtime from inside a GPU allocation.** This is not
+optional on Pelle, and skipping it is the single most likely way for the GPU
+chain to fail:
+
+```bash
+interactive -A uppmax2026-1-45 -p gpu --gpus=l40s:1 -c 4 -t 01:00:00
+module load Julia/1.11.3-linux-x86_64
+cd /proj/efficient_elastic/efficient_elastic/nobackup/EarthquakeDiffinitive.jl
+nvidia-smi                       # confirm a card and a driver are actually here
+
+# 1. Recompile the CUDA JLLs *on this node*, where the driver is visible, so
+#    CUDA.jl re-runs its artifact selection against a real driver. All of
+#    them, not just the runtime — see below.
+julia --project=scripts -e '
+    using Pkg
+    for (uuid, e) in Pkg.Types.Context().env.manifest
+        startswith(e.name, "CUDA_") && endswith(e.name, "_jll") || continue
+        @info "recompiling $(e.name)"
+        Base.compilecache(Base.PkgId(uuid, e.name))
+    end'
+
+# 2. Fresh process — the JLLs are read at load time. This is also the CUDA.jl
+#    precompile; do it here, not in a batch job you are paying for.
+julia --project=scripts scripts/gpu_smoke_test.jl
+
+# 3. Read the runtime version the smoke test printed and pin it, so the next
+#    login-node `Pkg.instantiate()` cannot undo any of this.
+julia --project=scripts -e 'using CUDA; CUDA.set_runtime_version!(v"X.Y")'
+
+# 4. Re-run the smoke test *before releasing the allocation*. Step 3 changes a
+#    Preferences entry, which invalidates every CUDA precompile cache that
+#    depends on it — so the next `using CUDA` recompiles. Spend that here, in
+#    an allocation you are already holding, rather than inside a batch job on
+#    GPU walltime. It also confirms the pinned version actually resolves.
+julia --project=scripts scripts/gpu_smoke_test.jl
+```
+
+After step 4 passes, **everything else happens from the login node.**
+`submit_bp8_gpu.sh` only calls `sbatch`; it needs no GPU, and running it from
+inside an interactive allocation just burns the allocation waiting on a queue.
+Exit the interactive session first.
+
+**Recompile every `CUDA_*_jll`, not only `CUDA_Runtime_jll`.** The CUDA.jl
+error message names only the runtime, and following it literally gets you a
+node that reports `runtime 13.3.0, artifact installation` and then dies with
+
+```
+ERROR: UndefVarError: `ptxas` not defined in `CUDA_Compiler_jll`
+```
+
+The runtime and the *compiler* are separate artifacts resolved by separate
+JLLs, and both were precompiled without a driver, so both are stale. The same
+missing `CUDA_Compiler_jll` is why CUDA.jl warns
+
+```
+CUDA runtime library `libnvJitLink.so.13` was loaded from a system path,
+`/usr/local/cuda/targets/x86_64-linux/lib/libnvJitLink.so.13`
+```
+
+— nvJitLink ships in that JLL, so when it is unavailable CUDA.jl falls back to
+Pelle's `/usr/local/cuda`. That warning is a *symptom* of the stale compiler
+JLL, not the separate "do not `module load CUDA`" problem below, and it should
+disappear once step 1 covers every `CUDA_*_jll`. If it survives step 1, then it
+is a genuine `LD_LIBRARY_PATH` leak and worth chasing.
+
+**Why recompile rather than pin a version straight away.** The instantiate
+above ran on a login node, which has no NVIDIA driver. CUDA.jl chooses its CUDA
+toolkit *artifact* by asking the driver what it supports **at precompile
+time**, so that instantiate recorded "no runtime found" — and Julia will not
+invalidate the cache when you later land on a GPU node, because nothing in the
+*environment* changed, only the hardware. `compilecache` re-runs that selection
+here, where the driver is real, and so needs no version from you. Step 3 then
+freezes whatever it picked into `scripts/LocalPreferences.toml`, turning the
+choice into a stated preference rather than a driver query, which is what makes
+it survive the next login-node precompile.
+
+Do not try to read the version out of `nvidia-smi` and pin *that*. Pelle's
+header reads `CUDA UMD Version: 13.3`, not the `CUDA Version: 13.3` that every
+scripted extraction expects, so the obvious `sed` silently yields an empty
+string; and the number is in any case a *ceiling* — the newest runtime the
+driver can support — rather than one CUDA.jl is guaranteed to ship an artifact
+for. Let step 1 choose and pin only what it chose.
+
+If step 2 reports no runtime at all, CUDA.jl could not match the driver — pin
+the newest toolkit it ships instead (`v"12.9"`, then `v"12.6"`); a CUDA 13
+driver runs a CUDA 12 runtime fine, the compatibility only fails the other way.
+
+**Observed on Pelle, 2026-09-10:** driver 610.57.04 / CUDA 13.3 on an L40S
+(46068 MiB, i.e. ~45 GiB usable, not the 48 GB the sizing tables round to);
+step 1 selected `runtime 13.3.0, artifact installation`.
 
 ### Run them in this order
 
 ```bash
 # 0. smoke test, in an interactive allocation — this is where CUDA.jl
-#    precompiles (~45 min), better here than inside a batch job
-julia --project=scripts -e 'using CUDA; CUDA.versioninfo(); @show CUDA.functional()'
+#    precompiles, better here than inside a batch job. It compiles a kernel
+#    and runs a cuSPARSE spmv, which `CUDA.versioninfo()` does not.
+julia --project=scripts scripts/gpu_smoke_test.jl
 
 ./scripts/submit_bp8_gpu.sh 20              # ~1 h on an L40S — do this first
 ./scripts/submit_bp8_gpu.sh 10              # relaxed (1200,1200), H100
@@ -336,6 +420,23 @@ compliant either way.
 ---
 
 ## If something fails
+
+**CUDA.jl was precompiled without a driver.** The job dies immediately with
+
+```
+CUDA.jl could not find an appropriate CUDA runtime to use.
+CUDA.jl's JLLs were precompiled without an NVIDIA driver present.
+...
+ERROR: LoadError: no functional CUDA device
+```
+
+This is **not** a missing `--gpus`, even though the older error text said so —
+`submit_bp8_gpu.sh` always passes `--gpus`, and the build script now probes
+`nvidia-smi` to tell the two apart. It is the login-node precompile described
+under "One-time setup" above: run `CUDA.set_runtime_version!` from a GPU
+allocation and resubmit. The submit script also carries an in-job fallback that
+recompiles `CUDA_Runtime_jll` on the allocated node, but that can cost ~45 min
+of a walltime you paid for, so pin the version instead of relying on it.
 
 **A shard times out or dies.** Resubmit just the array — a shard whose file
 already exists exits immediately, so only the missing ones rebuild:
