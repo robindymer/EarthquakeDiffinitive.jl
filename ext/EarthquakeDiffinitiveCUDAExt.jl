@@ -1,0 +1,91 @@
+module EarthquakeDiffinitiveCUDAExt
+
+# Adds `EarthquakeDiffinitive.FaultResponse.fault_stiffness_gpu` — see that
+# function's docstring for the design (D4 symmetry, no sharding, sequential
+# solves) and its validation status (measured only at small scale on
+# consumer hardware; not yet measured at production scale or on
+# Hopper/Ada-class GPUs).
+
+using EarthquakeDiffinitive
+using EarthquakeDiffinitive.FaultResponse: FaultElasticity, frictional_node_count,
+                                           d4_setup, build_chi!
+using CUDA
+using CUDA.CUSPARSE: CuSparseMatrixCSR
+using Krylov: CgWorkspace, cg!
+using SparseArrays
+
+function EarthquakeDiffinitive.FaultResponse.fault_stiffness_gpu(fe::FaultElasticity; verbose=false)
+    rs = fe.rs
+    rs.precond === :none ||
+        error("fault_stiffness_gpu: only precond=:none is supported (the CPU " *
+              "preconditioners are untested on GPU-resident arrays); rebuild " *
+              "`fe` without a `precond` keyword")
+
+    nf = frictional_node_count(fe)
+    perms, Qs, reps, targets = d4_setup(fe, "fault_stiffness_gpu")
+    ncols = 2nf
+    Ntot = fe.Ntot
+
+    verbose && @info "fault_stiffness_gpu: moving A, P, T2, T3 to the GPU" device = CUDA.name(CUDA.device())
+    A_gpu = CuSparseMatrixCSR(rs.A)
+    P_gpu = CuSparseMatrixCSR(fe.P)
+    T2_gpu = CuSparseMatrixCSR(fe.T2)
+    T3_gpu = CuSparseMatrixCSR(fe.T3)
+
+    K = zeros(ncols, ncols)
+    ws = CgWorkspace(Ntot, Ntot, CuVector{Float64})
+    s2, s3 = zeros(nf), zeros(nf)
+    χ = zeros(Ntot)
+    t0 = time()
+
+    for (pos, col) in enumerate(reps)
+        node = col <= nf ? col : col - nf
+        comp = col <= nf ? 1 : 2
+        fill!(s2, 0.0)
+        fill!(s3, 0.0)
+        comp == 1 ? (s2[node] = 1.0) : (s3[node] = 1.0)
+        build_chi!(χ, fe, s2, s3)
+        rhs_gpu = CuVector(fe.HP_DSAT * χ)
+
+        cg!(ws, A_gpu, rhs_gpu; M=rs.M, ldiv=rs.ldiv, rtol=rs.rtol, atol=rs.atol, itmax=rs.itmax)
+        st = ws.stats
+        rs.stats.solves += 1
+        rs.stats.iterations += st.niter
+        rs.stats.max_iterations = max(rs.stats.max_iterations, st.niter)
+        if !st.solved
+            rs.stats.unconverged += 1
+            rs.stats.unconverged == 1 && @warn """
+                CG did not converge on a GPU split-node solve (status "$(st.status)") \
+                after $(st.niter) iterations. The returned displacement is not a \
+                solution, and fault_stiffness_gpu would fold it into K silently. \
+                Raise itmax or loosen rtol.""" rtol = rs.rtol itmax = rs.itmax
+        end
+
+        U_gpu = P_gpu * ws.x .+ CuVector(χ)
+        τ2 = Array(T2_gpu * U_gpu)[fe.omega]
+        τ3 = Array(T3_gpu * U_gpu)[fe.omega]
+
+        @inbounds for (g, tcol) in targets[pos]
+            Q = Qs[g]
+            perm = perms[g]
+            σ = Q[1, comp] != 0 ? Q[1, comp] : Q[2, comp]
+            for i in 1:nf
+                v1 = Q[1, 1] * τ2[i] + Q[1, 2] * τ3[i]
+                v2 = Q[2, 1] * τ2[i] + Q[2, 2] * τ3[i]
+                ti = perm[i]
+                K[ti, tcol] = σ * v1
+                K[nf+ti, tcol] = σ * v2
+            end
+        end
+
+        if verbose && (pos % 20 == 0 || pos == length(reps))
+            el = time() - t0
+            @info "fault_stiffness_gpu: representative $pos/$(length(reps))" elapsed = round(el, digits=1) eta = round(el * (length(reps) - pos) / pos, digits=1)
+        end
+    end
+
+    verbose && @info "fault_stiffness_gpu: done" seconds = round(time() - t0, digits=1) representatives = length(reps) columns = ncols
+    return K
+end
+
+end # module EarthquakeDiffinitiveCUDAExt

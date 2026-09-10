@@ -15,10 +15,17 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Tokens = "040c2ec2-8d69-4aca-bf03-7d3a7092f2f6"
 
+[weakdeps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+
 [sources]
 Diffinitive = {rev = "92d842cf1b9a137aa4952b59ad959abf588ba855", url = "https://github.com/Diffinitive/Diffinitive"}
 
+[extensions]
+EarthquakeDiffinitiveCUDAExt = "CUDA"
+
 [compat]
+CUDA = "5, 6"
 Dates = "1.11.0"
 Diffinitive = "0.1.8"
 ForwardDiff = "1.4.5"
@@ -34,9 +41,10 @@ Tokens = "0.1.1"
 julia = "1.10"
 
 [extras]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["ForwardDiff", "SpecialFunctions", "Test"]
+test = ["CUDA", "ForwardDiff", "SpecialFunctions", "Test"]

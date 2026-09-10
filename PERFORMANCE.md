@@ -522,6 +522,108 @@ largely dissolves item 1 rather than competing with it.
    rather than BP8's whole space) would break the depth reflection and leave
    2×; that is the change most likely to cost this.
 
+0c. **GPU offload for the CG solve itself — implemented (2026-09-10),
+   measured positive at small scale, extrapolated beyond it.** Every other
+   speedup in this section attacks the *number* of solves; this attacks the
+   cost of *each* solve, and composes with 0b (same D4 reduction, GPU instead
+   of CPU threads underneath). `fault_stiffness_gpu`
+   (`EarthquakeDiffinitiveCUDAExt`, loaded by `using CUDA`) holds `A`, `P`,
+   `T2`, `T3` resident on one GPU for the whole build and runs the D4
+   representatives' CG solves against it sequentially — sequentially, not
+   concurrently, because the whole premise is a single bandwidth budget: two
+   solves at once would contend for it rather than add to it, unlike CPU
+   threads with their own caches. **No sharding** — the whole `A` must fit in
+   one GPU's memory.
+
+   **Measured**, on a consumer RTX 2060 (Turing, 336 GB/s, correctness
+   checked against the CPU D4 build each time, agreement at CG-tolerance
+   level ~1e-13 – 1e-12, not merely close):
+
+   | n | DOF | CPU | GPU | speedup |
+   |---|---|---|---|---|
+   | 11 | 7,986 | 0.019 s | 0.010 s | 1.89× |
+   | 15 | 20,250 | 0.070 s | 0.017 s | 4.13× |
+   | 21 | 55,566 | 0.296 s | 0.035 s | 8.43× |
+
+   The speedup **grows with problem size**, consistent with the
+   memory-bandwidth-bound mechanism this whole document is built around (§1):
+   a GPU's raw bandwidth advantage over a CPU compounds once the working set
+   exceeds CPU cache. Production DOF is 100-1000× larger than n=21.
+
+   **What is and is not validated.** Correctness is real and checked, at
+   every size tested, on this hardware — that is not extrapolated. The
+   *speedup number* at production DOF counts, and on any datacenter GPU
+   (Hopper/Ada, not the Turing card measured), **is** extrapolated — from the
+   observed size trend and from the two architectures' bandwidth ratio, not
+   measured directly. cuSPARSE kernel behaviour does not necessarily scale
+   linearly with raw bandwidth across architecture generations. Re-measure on
+   the actual target GPU before relying on a specific number; `verbose=true`
+   reports per-representative timing for exactly that purpose.
+
+   **Fit against UPPMAX Pelle's GPUs**, using this section's own `A`+`HP_DSAT`
+   memory figures (§4: ~15 GB at Δz = 20 m, ~65 GB at Δz = 10 m at the
+   currently-targeted relaxed domain, ~116 GB at the nominal spec domain):
+
+   | GPU | VRAM | bandwidth | fits Δz=10m (~65 GB)? | fits Δz=10m (~116 GB)? |
+   |---|---|---|---|---|
+   | H100 NVL | 94 GB | 3,900 GB/s | **yes**, ~29 GB headroom | no |
+   | L40S | 48 GB | 864 GB/s | no | no |
+   | T4 | 16 GB | 300 GB/s | no (same ballpark as the 15 GB workstation limit) | no |
+
+   The H100 NVL is the only one of the three that holds the whole Δz = 10 m
+   `A` at the relaxed domain on one card — which is what makes "GPU without
+   sharding" a real option there rather than needing multi-GPU matrix
+   splitting on top of everything else in this section.
+
+   **Not built**: multi-GPU matrix splitting (for the ~116 GB nominal-spec
+   domain, or for L40S/T4-class cards) — would need `A` itself divided across
+   devices, a materially bigger project than the column-sharding this
+   document already covers, and not attempted since the relaxed-domain H100
+   case doesn't need it.
+
+### Also tried on the `:exact` CG solve, and rejected (2026-09-10)
+
+Kept here so none of these get re-proposed from first principles. All
+measured on the real assembled `A`, not reasoned about in the abstract.
+
+- **Mixed precision** (Float32 CG + Float64 iterative refinement): **0.59×**
+  (slower), and did not reach `rtol=1e-10` in 10 refinement rounds. This
+  matrix's conditioning hits Float32's roundoff floor too early for
+  refinement rounds to amortize.
+- **Block Krylov methods** (`Krylov.block_minres`, solving several columns as
+  one block — no `block_cg` exists in Krylov.jl): returns **all-NaN** while
+  reporting `solved=true` — a silent wrong answer, not a slow one. Confirmed
+  the cause is `A`'s ~40% null space (`P`'s far-field/tangential-pair
+  structure) by running the identical call on a non-singular test matrix,
+  where it works correctly. Also slower even ignoring correctness: 126 block
+  iterations cost 2.5× the wall-clock of 913 total single-column iterations,
+  since each block iteration is far more expensive here.
+- **Matrix reordering** (hand-rolled RCM, no fill-reducing/bandwidth-reducing
+  package was already a dependency): **~1.0×**, no effect, despite cutting
+  nominal bandwidth 17,314→2,361. A first pass showed 7×, which was a Julia
+  JIT-compilation timing artifact from not warming up the timed call before
+  measuring — corrected and reproduced at ~1.0× on both raw `mul!` throughput
+  and full CG solve time. The SBP+SAT sparsity pattern on a structured grid
+  already has enough locality that bandwidth-reducing reordering has nothing
+  left to gain.
+- **Warm-starting CG** from a neighbouring column's converged solution:
+  **~1.0×**, no iteration reduction, on realistic `Ω_f`-node columns (an
+  earlier pass showed apparent iteration blowup and huge disagreement, but
+  that traced to a degenerate all-zero RHS in the synthetic test, not a real
+  hazard for genuine columns). Even the null result isn't worth taking: warm
+  starting forces columns to solve sequentially, which would forfeit the
+  existing embarrassingly-parallel CPU threading for a measured ~0% gain.
+- **Exact dimension reduction** (drop far-field DOFs and merge tangential
+  pairs into one unknown before CG, via the same congruence transform the
+  removed `factorize_reduced` used — but skipping its Cholesky factorization,
+  which is what was actually rejected before, not the reduction itself):
+  mathematically exact and verified (`P*u` agrees with the full-system CG
+  answer), cuts the DOF count 1.48× — but **~1.0×** wall-clock. Far-field
+  rows were already all-zero (0 stored nonzeros — nothing to save by dropping
+  them), and merging tangential pairs *increases* density in the surviving
+  rows enough to cancel the DOF reduction. `nnz`, not DOF count, is what
+  tracks mat-vec cost here, and `nnz` barely moved (563,882 → 498,789).
+
 1. **Multi-node parallelism — implemented, and now composes with item 0b.**
    `fault_stiffness`'s columns (or, with item 0b, its D4 orbit representatives)
    are independent right-hand sides against a shared `A`, which distributes

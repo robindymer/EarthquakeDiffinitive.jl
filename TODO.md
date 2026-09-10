@@ -4,6 +4,17 @@ Open work, in dependency order. Background for the symmetry items is in
 `SYMMETRIC_SAT.md`, for the cost items in `PERFORMANCE.md`; the rest is from
 `PROGRESS.md`'s "Known limitations".
 
+## Open (2026-09-10)
+
+- [ ] **Validate `fault_stiffness_gpu` on real Pelle hardware.** Implemented
+      and correctness-checked (`PERFORMANCE.md` §5 item 0c,
+      `test/fault_response_gpu_test.jl`, `EQD_TEST_GPU=1`), but only measured
+      on a consumer RTX 2060 up to 56k DOF. The Δz = 10 m target needs an
+      H100 NVL (94 GB — the only one of Pelle's three GPUs that fits the
+      ~65 GB `A` on one card). Run `fault_stiffness_gpu(fe; verbose=true)` on
+      an actual H100 allocation before relying on any extrapolated speedup
+      number for planning.
+
 ## Direction (2026-08-20)
 
 **Preconditioned CG was tried, measured, and does not pay. Back to finishing the

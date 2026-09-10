@@ -14,7 +14,7 @@ using ..ElasticitySplitNode: split_node_system, CGSolver,
 
 export FaultElasticity, fault_grid_axes, frictional_node_count,
        shear_traction, shear_traction!, fault_stiffness, fault_stiffness_toeplitz,
-       fault_stiffness_d4_shard, elastic_solver_report
+       fault_stiffness_d4_shard, fault_stiffness_gpu, elastic_solver_report
 
 # ==============================================================================
 # The slip → shear-traction map on the fault.
@@ -682,5 +682,42 @@ function fault_stiffness_toeplitz(fe::FaultElasticity; verbose=false)
     verbose && @info "fault_stiffness_toeplitz: done" seconds = round(time() - t0, digits=1) solves = 2length(sources) instead_of = 2nf
     return K
 end
+
+"""
+    fault_stiffness_gpu(fe; verbose=false) -> K
+
+GPU-accelerated `symmetry=true` build: same D4-orbit reduction as
+[`fault_stiffness`](@ref)`(fe; symmetry=true)` (PERFORMANCE.md §5 item 0b),
+but each orbit representative's CG solve runs on the GPU against `A`, `P`,
+`T2`, `T3` held resident there for the whole build, rather than
+CPU-threaded. **No sharding** — the whole `A` must fit in one GPU's memory
+(measured: `A`+`HP_DSAT` is ~15 GB at Δz = 20 m, ~65-116 GB at Δz = 10 m
+depending on domain, `PERFORMANCE.md` §4 — this needs a GPU with enough VRAM
+for the target resolution, e.g. an H100 80/94 GB card at Δz = 10 m).
+
+**Why sequential, not threaded like the CPU path.** A single GPU has one
+memory-bandwidth budget; the whole motivation for this path is that a
+bandwidth-bound sparse mat-vec runs faster on a GPU's much higher raw
+bandwidth (measured 1.9-8.4× on a consumer RTX 2060 at up to 56k DOF,
+*growing* with problem size — `PERFORMANCE.md` §5 item 0c). Running several
+solves concurrently on the same device would have them contend for that same
+bandwidth rather than add to it, unlike CPU threads, which each have their
+own cache and share a comparatively larger aggregate memory channel count.
+
+**Validation status — measured at small scale, extrapolated beyond it.**
+Correctness (agreement with the CPU build) is verified at problem sizes up to
+56k DOF on consumer (Turing, sm_75) hardware — see
+`test/fault_response_gpu_test.jl`, gated behind `CUDA.functional()`. The
+*speedup* at production DOF counts and on datacenter (Hopper/Ada) hardware is
+**not yet measured** — only extrapolated from the observed trend and the
+bandwidth ratio between tested and target hardware. Re-measure on the actual
+target GPU before relying on a specific speedup number.
+
+Requires `using CUDA` first (loads `EarthquakeDiffinitiveCUDAExt`); calling
+this without it loaded is a `MethodError`, not a graceful fallback, since
+falling back silently to the CPU path would hide a missing `using CUDA` that
+the caller almost certainly wants to know about.
+"""
+function fault_stiffness_gpu end
 
 end # module FaultResponse
