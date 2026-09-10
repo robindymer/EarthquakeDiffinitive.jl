@@ -157,6 +157,170 @@ tasks. At Δz = 20 m a column is ~328 s, so 32 tasks is already generous.
 
 ---
 
+## Running it on a GPU instead
+
+**One card replaces the whole job array.** `fault_stiffness_gpu`
+(`PERFORMANCE.md` §5 item 0c) holds `A` resident on one device and runs the
+same D4 orbit representatives against it, so there are no shards and no merge —
+two chained jobs instead of three, and the build writes the finished cache
+entry itself.
+
+### One-time setup, on top of the CPU setup above
+
+```bash
+julia --project=scripts -e 'using Pkg; Pkg.instantiate()'
+```
+
+`CUDA` is a weakdep of the root project, so the environment that wants the
+extension has to depend on it directly; it is now in `scripts/Project.toml`.
+
+**Do not `module load CUDA/...` for the Julia jobs.** CUDA.jl ships its own
+toolkit as an artifact and matches it to the driver. Loading the system module
+puts it on `LD_LIBRARY_PATH`, CUDA.jl loads *those* libraries instead and warns
+(`CUDA runtime library libcusparse.so.12 was loaded from a system path`), with
+a real chance of a version mismatch. The GPU *driver* comes from the node, so
+nothing is missing. This is the one place the Julia GPU workflow differs from
+the CUDA/C++ one.
+
+### Run them in this order
+
+```bash
+# 0. smoke test, in an interactive allocation — this is where CUDA.jl
+#    precompiles (~45 min), better here than inside a batch job
+julia --project=scripts -e 'using CUDA; CUDA.versioninfo(); @show CUDA.functional()'
+
+./scripts/submit_bp8_gpu.sh 20              # ~1 h on an L40S — do this first
+./scripts/submit_bp8_gpu.sh 10              # relaxed (1200,1200), H100
+./scripts/submit_bp8_gpu.sh 10 1600 1200    # converged, H100
+```
+
+Δz = 20 m first is not caution for its own sake: it exercises the entire path
+at a size any card handles, its `K` can be **diffed against the CPU build** of
+the same configuration, and it prints `assembly X.XX h`, which is the single
+most uncertain number in the estimates below.
+
+Fourth argument overrides the card (`l40s` / `h100`).
+
+### Sizing
+
+| | Δz = 20 m | Δz = 10 m relaxed (1200,1200) | Δz = 10 m converged (1600,1200) |
+|---|---|---|---|
+| DOF | 9.5 M | 42.2 M | 74.8 M |
+| `nnz(A)` | 0.44e9 | 1.99e9 (Int32, 8% margin) | **3.55e9 (forces Int64)** |
+| **VRAM** | ~7 GB | **~28 GB** | **~65 GB** |
+| host RAM, **peak** | ~29 GB | ~125 GB | **~222 GB** |
+| card | L40S | H100 (L40S: ~28 h) | **H100 only** |
+| assembly (est.) | ~2 h | ~16 h | ~36 h |
+| solve (est.) | ~1 h | ~7 h | ~20 h |
+
+`sinfo` on Pelle gives ten 48 GB L40S and only **two** H100, both on 386 GB
+nodes — so card choice is partly a queue-time decision, which is why Δz = 20 m
+defaults to an L40S.
+
+**Host RAM is the peak during assembly, ~2x the final matrix, not 1x.**
+Measured at four sizes (92 k – 2.77 M DOF), `peak = 2.03 * final + 1.6 GB` fits
+to within 0.3 GB everywhere. Sizing the request from the *final* `A`+`HP_DSAT`
+figure under-requests by half and OOMs during assembly, hours before the GPU is
+touched. `submit_bp8_gpu.sh` sizes from the peak.
+
+**The device figure is not the host figure, and §5 item 0c's fit table
+conflated them.** That table rules the converged domain out at "~116 GB", but
+that is the *host* CSC/Int64 footprint of `A` **plus** `HP_DSAT`. `HP_DSAT`
+never goes to the device — the right-hand side is formed on the host — so the
+device holds only `A`, `P`, `T2`, `T3`. The converged domain is a one-GPU job.
+
+### Assembly, not the solve, is now the bottleneck
+
+Measured, single build, warm JIT, **single-threaded** (100% of one core — extra
+cores do nothing for this phase):
+
+| DOF | assemble | local exponent |
+|---|---|---|
+| 92 k | 24.9 s | — |
+| 360 k | 99.8 s | 1.02 |
+| 692 k | 216.4 s | 1.19 |
+| 2.77 M | 1435 s | **1.37** |
+
+Superlinear with a **rising** exponent. This contradicts `PERFORMANCE.md`
+§4c's "minutes-long sparse assembly at Δz = 20 m" — that is an extrapolation
+in the doc from a Δz = 100 m measurement, and it is off by roughly two orders
+of magnitude.
+
+The extrapolations in the sizing table are therefore **lower bounds**, and they
+are 27x beyond the largest measured point on different hardware. If they hold
+on Pelle, the converged Δz = 10 m job is ~36 h assembly + ~20 h solve = **over
+the 2-day GPU limit**. Do not submit it until Δz = 20 m has reported its real
+`assembly` figure.
+
+**This also bears on the CPU path.** Every shard re-assembles `A`, so an
+880-shard Δz = 10 m array spends the overwhelming majority of its allocation on
+redundant assembly rather than on solving — roughly 90% at these rates. Far
+fewer shards (~120) still fit a 24 h walltime and are several times cheaper.
+
+### Nothing gets overwritten
+
+`run_bp8.jl` appends `$BP8_OUTPUT_SUFFIX` to the output directory, and
+`submit_bp8_gpu.sh` sets it to `gpu`:
+
+```
+CPU chain   output/BP8-QD-GS_dz20_Lf1600_Ln1200_exact/
+GPU chain   output/BP8-QD-GS_dz20_Lf1600_Ln1200_exact_gpu/
+```
+
+The **`K` cache is deliberately still shared** — same key, both paths. They
+produce the same matrix, so re-keying it would force a redundant multi-hour
+rebuild of something already on disk. If the CPU chain finishes a configuration
+first, the GPU build sees the entry and exits in seconds.
+
+Note the GPU outputs carry **12,961 rows against an older CPU run's 8,641**,
+because `saveat` was corrected from 300 s to 200 s (§4.1 requires 1e4–1e5;
+saveat=300 gives 8,641, which violates it). That is the fix, not a discrepancy.
+
+### Two things that had to be fixed to make the converged domain fit
+
+1. **The upload used to peak at ~122 GB** on a 94 GB card.
+   `CuSparseMatrixCSR(::SparseMatrixCSC)` expands to
+   `CuSparseMatrixCSR(CuSparseMatrixCSC(M))` — it uploads CSC, then converts
+   to CSR *on the device*, so both plus a cuSPARSE scratch buffer are resident
+   at once. `to_csr` now skips the conversion for a matrix that is its own
+   transpose (`A` is, to 6.4e-17; `P` exactly), since CSC arrays read as CSR
+   are already the transpose. Checked at runtime, values as well as pattern —
+   `P` is structurally symmetric, so a pattern-only test would wave through a
+   silent `Pᵀ`.
+2. **`nnz` crosses `typemax(Int32)`.** The converged `A` has ~3.55e9
+   nonzeros; a 32-bit CSR row pointer cannot hold that and would overflow
+   silently. `to_csr` picks the width from `nnz`. The relaxed domain is under
+   the limit by only ~8%, so this is not a margin to spend.
+
+### How the solve estimate was made, and how much to trust it
+
+A **bandwidth model, not a measurement** — `TODO.md`'s open item is exactly
+this, and achieved cuSPARSE bandwidth on an H100 is the unverified input.
+
+CG iterations were measured at Δz = 50/40/25 m (293, 358, 551) and fit
+`~n23^0.93`, close to the `O(h⁻¹)` theory for unpreconditioned CG, giving
+~1,280 iterations at Δz = 10 m relaxed and ~1,670 converged. Cost per iteration
+is `bytes(A)/bandwidth` at 70% of 3.9 TB/s.
+
+The cross-check: running the model *backwards* through the two documented CPU
+per-solve times (2730 s relaxed, 6150 s converged) implies effective CPU
+bandwidth of **15.0 and 15.6 GB/s** — two independent configurations agreeing
+to 4%, and consistent with a laptop measurement of 13.2 GB/s and with §4's
+"threading efficiency ~15%".
+
+The implied speedup is ~150-180x, far above the 8.4x measured on an RTX 2060 at
+56k DOF. Mechanically consistent — at 56k DOF the CPU works out of cache, at
+production it does not — but a large extrapolation.
+
+### Known inefficiency, not yet fixed
+
+`rhs = fe.HP_DSAT * χ` traverses the entire ~59 GB matrix while `χ` has exactly
+**two** nonzeros. On CPU that is 0.06% of a 6150 s solve and invisible; on GPU
+it is ~4 s against a ~39 s solve, i.e. ~10% of solve time, and it is a few
+lines to fix by slicing the two columns.
+
+---
+
 ## Note on §4.3 profile spacing
 
 `write_profiles` emits the profile at the **computational grid** spacing: at

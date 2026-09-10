@@ -1,4 +1,5 @@
 [deps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 Diffinitive = "5a373a26-915f-4769-bcab-bf03835de17b"
 EarthquakeDiffinitive = "9fa83511-5388-4054-9589-4ce011e12b61"
@@ -19,3 +20,11 @@ EarthquakeDiffinitive = "9fa83511-5388-4054-9589-4ce011e12b61"
 [sources]
 Diffinitive = {rev = "92d842cf1b9a137aa4952b59ad959abf588ba855", url = "https://github.com/Diffinitive/Diffinitive"}
 EarthquakeDiffinitive = {path = ".."}
+
+# `CUDA` is here only so `build_stiffness_cache_gpu.jl` can `using CUDA` and
+# thereby load `EarthquakeDiffinitiveCUDAExt`. It is a weakdep of the root
+# project, so it has to be a real dep of whatever environment wants the
+# extension. Nothing else in `scripts/` touches it, and the CPU path
+# (`build_stiffness_cache.jl`) never loads it.
+[compat]
+CUDA = "5, 6"
