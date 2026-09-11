@@ -26,6 +26,13 @@ PorePressure → Elasticity → ElasticitySplitNode → RateStateFriction → Fa
 carry "why this assertion, why this tolerance" comments that explain design decisions the source
 doesn't.
 
+## Answering style
+
+**Short, TLDR-first.** Lead with the answer, then only what is needed to act on
+it. No recaps of what was just done, no restating the question, no summarising
+tables the user already has. Numbers and commands over prose. Caveats only when
+they change a decision — one line each, not a section.
+
 ## Dev workflow
 
 - **Do not commit. Robin commits all code himself.** Leave finished work staged
