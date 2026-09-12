@@ -41,7 +41,8 @@ before the time loop starts — which is why setup costs minutes and the
 9. Solve `‖τ⁰+Δτ‖ - η|V| = σ̄f(|V|,θ)` for `|V|` (Newton in `ln V`); direction
    inherited from `τ⁰+Δτ`.
 10. RHS: `ṡ = V`, `ϕ̇ = e^{-ϕ} - |V|/D_RS`.
-11. Advance with `Tsit5`, per-block tolerances. Repeat from 7.
+11. Advance with per-block tolerances: explicit `Tsit5` for the Gaussian
+    source, implicit `QNDF` for the Peaceman well (see below). Repeat from 7.
 
 **Output**
 
@@ -72,6 +73,26 @@ The dense output is kept in memory rather than resampled onto a fixed grid:
 tight reference, where linear interpolation between hourly levels is 10.8 kPa.
 That distinction matters because `V ~ exp(τ/(aσ̄))` turns a sub-percent pressure
 error into a several-percent slip-rate error.
+
+## The Peaceman well is integrated implicitly
+
+Once injection drives the well cell's effective normal stress to the `σ̄_min`
+floor, that node's slip rate `V ~ exp(τ/(aσ̄))` responds to its own traction on
+a sub-second time scale and an explicit integrator's step count grows as
+`Δz⁻⁴` — 488,788 steps at Δz = 25 m for 100 h, extrapolating to weeks at the
+benchmark's 10 m. The Gaussian variant never reaches the floor and takes ~400.
+
+`run_bp8` therefore defaults BP8-PW to `QNDF`, fed an analytic **block-diagonal
+Jacobian**: each node's own 3×3 `(s2, s3, ϕ)` block from `diag(K)` and the
+implicit-function derivatives of the force balance, with the elastic coupling
+between nodes deliberately dropped. That block carries the stiff eigenvalue to
+four digits (the mode is local), and the method's Newton iteration absorbs the
+missing off-diagonals — so the converged step is the true implicit solution,
+at the cost of `nf` independent 3×3 solves rather than a dense factorisation.
+Measured: 1,105 steps / 20 s at Δz = 25 m, resolution-independent, agreeing
+with the explicit reference to the requested tolerance. The `σ̄_min` floor
+itself is a numerical guard this code adds (the benchmark does not specify
+one) and stays at 1 kPa.
 
 ## Running
 

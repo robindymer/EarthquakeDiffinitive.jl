@@ -26,7 +26,7 @@ SLURM_PARTITION_GPU="gpu"            # confirmed present: l40s:10 and h100:2
 SLURM_PARTITION_SMALL="pelle"        # the run: a few cores, minutes
 
 # CHECK: same storage as submit_bp8.sh. NOT $HOME.
-EQD_STIFFNESS_CACHE="/proj/efficient_elastic/efficient_elastic/nobackup/EarthquakeDiffinitive.jl/eqd-stiffness"
+EQD_STIFFNESS_CACHE="/proj/efficient_elastic/efficient_elastic/nobackup/temp/EarthquakeDiffinitive.jl/eqd-stiffness"
 
 JULIA_MODULE="Julia/1.11.3-linux-x86_64"
 BP8_MODELER="Robin Dymér"

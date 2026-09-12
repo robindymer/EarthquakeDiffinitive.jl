@@ -775,7 +775,13 @@ quantity that binds. The trend is toward *less* sensitivity at finer Δz, so
 `(1200, 1200)` should be safe at 10 m — but that is an extrapolation from two
 resolutions, not a measurement, and `(1200, 800)` was never tested.
 
-## BP8-PW stiffness: σ̄_min as a regularization (2026-08-20, in progress)
+## BP8-PW stiffness: σ̄_min as a regularization (2026-08-20, superseded)
+
+**Not adopted.** The floor is a numerical guard this code added — the benchmark
+description never mentions one — and raising it is a physics perturbation to a
+submitted quantity. The implicit integrator (2026-09-12, below) removes the
+stiffness cost at the specified 1 kPa, so this route is closed. Kept as the
+measurement record.
 
 Limitation 3's runtime cost (`≈ Δz⁻⁴` step growth, weeks-to-months at Δz = 10 m)
 comes from the σ̄_min floor binding at the well cell. Sweeping the floor,
@@ -1060,6 +1066,73 @@ eigenvector localizes almost entirely in `ϕ` while the eigenvalue belongs to
 the *slip* direction. Eigenvector localization does not imply the eigenvalue
 sits on that diagonal.
 
+## BP8-PW stiffness: RESOLVED with an implicit integrator (2026-09-12)
+
+The plan in the section above is implemented, with one simplification: there
+is no IMEX split. `run_bp8` hands the *full* `rhs!` to an implicit method
+together with an **inexact, block-diagonal Jacobian** — each node's own 3×3
+`(s2, s3, ϕ)` block from `diag(K)` and the closed-form force-balance
+derivatives, nothing between nodes (`BP8.state_jacobian!`,
+`RateStateFriction.slip_rate_derivatives`). The method's Newton iteration
+absorbs the dropped off-diagonal blocks: they are large only in the *rows* of
+floored nodes, and a matrix whose only O(1) entries sit in a few rows has
+eigenvalues equal to those rows' diagonals, which are zero — so Newton still
+contracts, and the converged stage is the true implicit solution. `σ̄_min`
+stays at 1 kPa; nothing in the physics moved.
+
+### Measured, Δz = 50 and 25 m, (800, 400), 100 h, `reltol` 1e-8
+
+| | Δz = 50 m steps / RHS evals / wall | Δz = 25 m steps / RHS evals / wall |
+|---|---|---|
+| Tsit5 (explicit) | 29,265 / 175,695 / 13 s | 480,455 / 3,105,393 / 3,566 s |
+| **QNDF** (now the PW default) | 1,621 / 3,949 / 2.4 s | **1,105 / 3,249 / 20 s** |
+| FBDF | 2,182 / 4,750 / 2.6 s | 1,468 / 5,193 / 22 s |
+| KenCarp4 | 1,594 / 31,356 / 21 s | 1,586 / 30,168 / 105 s |
+| Rodas5P / Rosenbrock23 | 195,640 / 174,262 steps — worse than Tsit5 | not run |
+
+**The implicit step count is resolution-independent** (it *fell* from 50 to
+25 m) where the explicit one grew as `Δz⁻⁴`. At Δz = 25 m that is 250× in
+wall-clock; the Δz = 10 m PW integration goes from "weeks-to-months" to the
+same order as the GS run. RHS evals are the number that scales (dense `K`
+mat-vec + `nf` Newton solves each), and QNDF needs 44× fewer of them than
+Tsit5 already at 50 m — so the "implicit will still lose at 50 m" caveat above
+turned out wrong once the Jacobian was analytic.
+
+Rosenbrock methods fail for exactly the reason SDIRK/BDF succeed: they have no
+Newton loop, so an inexact `J` costs them order and stability rather than a
+couple of extra iterations. Do not use them with this Jacobian.
+
+Agreement with the Tsit5 reference (re-run on current code; the 25 m row is
+that re-run, 2 threads): `V_max` to 6e-7 / 4e-7 relative at Δz = 50 / 25 m,
+final slip to 3e-8 / 1e-8 relative, `ln θ` to 2e-6 / 5e-6 absolute — inside
+what a `reltol` of 1e-8 accumulated over 10⁵-10⁶ explicit steps can claim.
+Checked at 50 m in `test/bp8_test.jl`. The 25 m explicit run needed 3.1 M RHS
+evaluations against QNDF's 3,249: **955×**, 180× in wall-clock.
+
+### What had to change besides the Jacobian
+
+Both items of "Two code changes any implicit route needs first", and one more
+that the first Δz = 25 m attempt exposed:
+
+1. `solve_slip_rate(...; onfail=:nan)` returns `NaN` instead of throwing;
+   `rhs!` and `state_jacobian!` use it, output writers keep `:error`.
+2. The cache diagnostics (`floor_hits`, `σ̄_lowest`, `floor_nodes`) depend only
+   on `t`, not `u`, so off-trajectory evaluation does not corrupt them —
+   `floor_hits` was already documented as an evaluation count. `Vprev` is now
+   left alone when an evaluation fails.
+3. **The warm start had to become fallible.** A rejected trial state leaves an
+   arbitrary `Vprev` behind; Newton seeded from it then failed *at the retry
+   state too*, every retry produced `NaN`, and `dt` collapsed below eps at
+   t ≈ 21.6 h (the moment the floor first binds). `solve_slip_rate` now retries
+   once from `V_star` before declaring failure. After that all three implicit
+   methods ran clean at 25 m.
+
+The FD check of the Jacobian needs care at the floored node: with `aσ̄ = 16 Pa`
+a slip step of `1e-5·|s|` moves traction by several Pa and the difference
+quotient is dominated by curvature (it read `-66.7` against the analytic
+`-1.903`); at `1e-8` relative it converges onto the analytic value to five
+digits. The test uses `1e-8`.
+
 ## Known limitations
 
 These are properties of the current approach, not loose ends to tidy.
@@ -1144,10 +1217,15 @@ These are properties of the current approach, not loose ends to tidy.
    `effective_stress_report` now reports `nodes`, `fraction` and `radius` rather
    than only an evaluation count; the GS variant never reaches the floor.
 
-   **It also has a runtime cost that was not previously recorded, and at
-   Δz = 10 m that cost — not the `K` build — is the binding constraint for
-   BP8-PW.** The floored node makes `V ~ exp(τ/aσ̄)` stiff, and `run_bp8`'s
-   default `Tsit5` is explicit. Measured over 100 h, `L_fault` = 800,
+   **~~It also has a runtime cost~~ — RESOLVED 2026-09-12: `run_bp8` now
+   integrates BP8-PW implicitly (`QNDF` with the block-diagonal analytic
+   Jacobian), and the step count is resolution-independent: 1,105 steps / 20 s
+   at Δz = 25 m against the 488,885 / 4,901 s below. See "BP8-PW stiffness:
+   RESOLVED". The σ̄_min regularization route was *not* taken; the floor stays
+   at 1 kPa. What follows is the record of the problem as it stood.**
+
+   The floored node makes `V ~ exp(τ/aσ̄)` stiff, and `run_bp8`'s
+   former default `Tsit5` is explicit. Measured over 100 h, `L_fault` = 800,
    `L_normal` = 400:
 
    | Δz | wall | accepted steps | σ̄_lowest | unclamped |

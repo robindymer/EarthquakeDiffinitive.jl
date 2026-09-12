@@ -2,8 +2,9 @@ using EarthquakeDiffinitive
 using EarthquakeDiffinitive.BP8
 using EarthquakeDiffinitive.FaultResponse
 using EarthquakeDiffinitive.RateStateFriction
-using LinearAlgebra, StaticArrays
+using LinearAlgebra, StaticArrays, SparseArrays
 using SpecialFunctions
+using OrdinaryDiffEq: Tsit5, ReturnCode
 using Test
 
 # The coupled model is expensive to build (a 3D elastic factorization plus one
@@ -12,6 +13,16 @@ using Test
 # the coupling, conventions and file formats are right, not that the numbers
 # are benchmark-converged.
 const M_GS = build_model(; Δz=100.0, L_fault=800.0, L_normal=800.0)
+
+# The Peaceman variant at Δz = 50 m, 100 h — the configuration PROGRESS.md's
+# limitation-3 table was measured on, and the coarsest at which the well cell
+# actually reaches the σ̄ floor and makes the problem stiff. One explicit
+# (Tsit5) reference solution serves both the Jacobian check and the implicit
+# integrator comparison; it is the expensive part (~29,000 steps, ~15 s).
+const M_PW = build_model(; Δz=50.0, L_fault=800.0, L_normal=400.0, injection=:peaceman,
+                         stiffness=:toeplitz)
+const PW_TSPAN = (0.0, 100 * 3600.0)
+const PW_REF = run_bp8(M_PW; tspan=PW_TSPAN, saveat=3600.0, alg=Tsit5())
 
 @testset "BP8" begin
     @testset "derived parameters match Table 1" begin
@@ -166,6 +177,78 @@ const M_GS = build_model(; Δz=100.0, L_fault=800.0, L_normal=800.0)
         @test maximum(c.Vmag) > 1e-10
         @test sol.u[end][argmax(c.Vmag)] > 0
         @test maximum(pressure_at!(M_GS, t)) > 1e6
+    end
+
+    @testset "state_jacobian! matches finite differences of rhs!" begin
+        # The block-diagonal Jacobian is what makes an implicit integrator
+        # affordable for BP8-PW (see the comment block above `state_jacobian!`).
+        # Its promise is that every per-node 3×3 block equals the corresponding
+        # block of the true `∂rhs!/∂u` — the *off*-diagonal blocks are dropped
+        # by design and are not checked here. Taken mid-injection on the
+        # Peaceman model so a node is actually at the σ̄ floor, where `1/D` is
+        # large and the block is far from trivial.
+        #
+        # FD step: at the floored node `V ~ exp(τ/(aσ̄))` with `aσ̄ = 16 Pa`, so
+        # a slip perturbation of `1e-5·|s|` already moves traction by several
+        # Pa and the difference quotient is dominated by curvature; `1e-8`
+        # relative is where it has converged onto the analytic value.
+        m = M_PW
+        @test effective_stress_report(m).nodes ≥ 1
+        j85 = findfirst(==(85 * 3600.0), PW_REF.t)
+        u = copy(PW_REF.u[j85]); t = PW_REF.t[j85]
+        nf = m.nf; N = 3nf
+
+        J = state_jacobian_prototype(m)
+        @test size(J) == (N, N) && nnz(J) == 9nf
+        state_jacobian!(J, u, m, t)
+
+        fp = zeros(N); fm = zeros(N)
+        function fd_column!(col, j)
+            h = 1e-8 * (j <= 2nf ? max(abs(u[j]), 1e-5) : 1.0)
+            up = copy(u); up[j] += h; BP8.rhs!(fp, up, m, t)
+            um = copy(u); um[j] -= h; BP8.rhs!(fm, um, m, t)
+            col .= (fp .- fm) ./ 2h
+        end
+        col = zeros(N)
+        worst = 0.0
+        for i in 1:nf
+            idx = (i, nf + i, 2nf + i)
+            A = zeros(3, 3); B = zeros(3, 3)
+            for (c, j) in enumerate(idx)
+                fd_column!(col, j)
+                for (r, k) in enumerate(idx)
+                    A[r, c] = J[k, j]; B[r, c] = col[k]
+                end
+            end
+            scale = maximum(abs, B)
+            scale == 0 && continue
+            worst = max(worst, maximum(abs, A .- B) / scale)
+        end
+        @test worst < 1e-4
+
+        # Locked ring: only the aging law's own `-e^{-ϕ}` on the diagonal.
+        i = findfirst(!, m.active)
+        @test J[i, i] == 0 && J[nf + i, nf + i] == 0
+        @test J[2nf + i, 2nf + i] ≈ -exp(-u[2nf + i])
+    end
+
+    @testset "implicit integration of BP8-PW agrees with the explicit reference" begin
+        # The point of the Jacobian: a stiff solver takes far fewer steps than
+        # `Tsit5` on the Peaceman variant while landing on the same answer.
+        # Δz = 50 m, 100 h is the configuration PROGRESS.md's limitation-3
+        # table was measured on (Tsit5 ~29,000 steps).
+        m = M_PW
+        ref = PW_REF
+        @test default_integrator(m) isa EarthquakeDiffinitive.BP8.QNDF
+        sol = run_bp8(m; tspan=PW_TSPAN, saveat=3600.0)          # the PW default
+        @test sol.retcode == ReturnCode.Success
+        @test sol.stats.naccept < ref.stats.naccept / 5
+        nf = m.nf
+        vmax(s) = maximum(maximum(evaluate!(m, s.u[j], s.t[j]).Vmag) for j in eachindex(s.t))
+        @test isapprox(vmax(sol), vmax(ref); rtol=1e-5)
+        @test maximum(abs, sol.u[end][1:2nf] .- ref.u[end][1:2nf]) <
+              1e-6 * maximum(abs, ref.u[end][1:2nf])
+        @test maximum(abs, sol.u[end][2nf+1:end] .- ref.u[end][2nf+1:end]) < 1e-4
     end
 
     @testset "resolution report flags the under-resolved process zone" begin

@@ -7,6 +7,7 @@ using SparseArrays
 using StaticArrays
 using LinearAlgebra: mul!, norm, diag
 using OrdinaryDiffEq
+using OrdinaryDiffEqBDF: QNDF
 using ProgressMeter: Progress, update!, finish!
 using Printf
 using Dates: today
@@ -19,7 +20,8 @@ using ..Elasticity
 using ..StiffnessCache
 
 export BP8Params, benchmark_parameters, BP8Model, build_model, initial_state,
-       run_bp8, evaluate!, write_outputs, station_locations,
+       run_bp8, default_integrator, evaluate!, state_jacobian!, state_jacobian_prototype,
+       write_outputs, station_locations,
        solve_pressure_history, set_pressure_history!, pressure_at!,
        pressure_operator, pressure_length, well_pressure,
        effective_stress_report, analytic_pressure_gaussian, analytic_pressure_point,
@@ -663,14 +665,21 @@ function initial_state(m::BP8Model)
 end
 
 """
-    evaluate!(m, u, t) -> cache
+    evaluate!(m, u, t; onfail=:error) -> cache
 
 Fills the model cache with the derived fields at state `u`: the elastic
 traction change, the slip velocity from the force balance, and the total shear
 stress. Used by both the right-hand side and the output writers, so they
 cannot drift apart.
+
+`onfail` is forwarded to [`solve_slip_rate`](@ref). The right-hand side and the
+Jacobian pass `:nan`, because an implicit integrator's Newton iteration will
+evaluate them at trial states it is about to throw away, and a `NaN` there is
+the signal it needs to reject the step; the output writers keep the default
+`:error`, since they only ever see accepted states and a silent `NaN` in a
+benchmark file would be worse than an exception.
 """
-function evaluate!(m::BP8Model, u, t)
+function evaluate!(m::BP8Model, u, t; onfail::Symbol=:error)
     p = m.par
     nf = m.nf
     c = m.cache
@@ -679,6 +688,15 @@ function evaluate!(m::BP8Model, u, t)
 
     slip = @view u[1:2nf]
     ϕ = @view u[2nf+1:3nf]
+    # A non-finite `t` can only come from an integrator whose step has already
+    # gone bad (a NaN `dt`); `pressure_at!` would throw on it, and under
+    # `:nan` the contract is to hand the NaN back so the step is rejected.
+    if !isfinite(t) && onfail === :nan
+        for v in (c.Δτ, c.V2, c.V3, c.Vmag, c.τ2, c.τ3)
+            fill!(v, NaN)
+        end
+        return c
+    end
     pres = pressure_at!(m, t)
 
     mul!(c.Δτ, m.K, slip)
@@ -701,11 +719,13 @@ function evaluate!(m::BP8Model, u, t)
         σ̄ = max(σ̄_raw, p.σ̄_min)
         θ = exp(ϕ[i])
         Δτv = SVector(c.Δτ[i], c.Δτ[nf+i])
-        V = solve_slip_velocity(m.τ0, Δτv, θ, σ̄, η, fp; V0=c.Vprev[i])
+        V = solve_slip_velocity(m.τ0, Δτv, θ, σ̄, η, fp; V0=c.Vprev[i], onfail)
         c.V2[i] = V[1]
         c.V3[i] = V[2]
         c.Vmag[i] = norm(V)
-        c.Vprev[i] = max(c.Vmag[i], 1e-30)
+        # The warm start must survive a failed evaluation: `max(NaN, x)` is
+        # `NaN`, and a `NaN` seed would poison every later solve at this node.
+        isfinite(c.Vmag[i]) && (c.Vprev[i] = max(c.Vmag[i], 1e-30))
         # eq. 8: the shear stress actually acting on the fault.
         c.τ2[i] = m.τ0[1] + c.Δτ[i] - η * V[1]
         c.τ3[i] = m.τ0[2] + c.Δτ[nf+i] - η * V[2]
@@ -723,7 +743,7 @@ through `evaluate!`'s `σ̄ = σ - p`.
 function rhs!(du, u, m::BP8Model, t)
     p = m.par
     nf = m.nf
-    c = evaluate!(m, u, t)
+    c = evaluate!(m, u, t; onfail=:nan)
 
     @inbounds for i in 1:nf
         du[i] = c.V2[i]
@@ -734,12 +754,157 @@ function rhs!(du, u, m::BP8Model, t)
     return nothing
 end
 
+# ==============================================================================
+# The block-diagonal Jacobian that makes an implicit integrator affordable.
+#
+# BP8-PW is stiff (PROGRESS.md "Known limitations" 3): once fluid pressure has
+# floored σ̄ at the well cell, that node's slip rate `V ~ exp(τ/(aσ̄))` reacts
+# to its own traction on a time scale `D/K_ww` with `D ∝ σ̄`, and an explicit
+# integrator's step count grows like `Δz⁻⁴` — 75× the Gaussian variant's at
+# Δz = 50 m and weeks-to-months extrapolated to Δz = 10 m. Splitting the
+# pressure out of the state (2026-09-09) did not touch this: the mode is on the
+# friction side.
+#
+# The measured cure is implicit integration of exactly that mode, and the
+# measurement that makes it cheap (`scripts/bp8_stiffness_spectrum.jl`) is
+# that the mode is LOCAL: keeping only each node's own 3×3 block `(s2, s3, ϕ)`
+# of the full Jacobian — i.e. only `diag(K)`, no elastic coupling between
+# nodes — reproduces the stiff eigenvalue to a ratio of 1.0000. So the
+# integrator is handed this block-diagonal `J` in place of the dense one, and
+# its Newton iteration solves `nf` independent 3×3 systems per stage instead
+# of factorising a dense `3nf × 3nf` matrix.
+#
+# WHY AN INEXACT JACOBIAN IS ENOUGH. The true `J` differs from this one by the
+# off-diagonal blocks `(∂V_i/∂T)·K_ij`, which are large only in the *rows* of
+# floored nodes (`1/D` is huge there). Newton's error-propagation matrix
+# `(I - γhJ_blk)⁻¹·γh·(J - J_blk)` therefore has O(1) entries confined to those
+# few rows — and a matrix whose only large entries sit in one row has
+# eigenvalues equal to that row's *diagonal* entry, which is zero. Newton still
+# contracts; it just needs a couple more iterations than with the exact `J`.
+# Crucially the converged stage solution is the same, so this is not an
+# approximation of the answer, only of how it is found. (The alternative — a
+# full finite-difference `J` — is `3nf` right-hand-side evaluations, each a
+# dense `K` mat-vec plus `nf` nested Newton solves: ~10 min *per Jacobian* at
+# Δz = 10 m, which is what sank the `Rosenbrock23` probe recorded in TODO.md.)
+#
+# The derivatives are closed-form from the converged force balance
+# (`RateStateFriction.slip_rate_derivatives`); `test/bp8_test.jl` checks the
+# whole block against finite differences of `rhs!`.
+# ==============================================================================
+
 """
-    run_bp8(m; tspan=(0.0, m.par.t_f), alg=Tsit5(), reltol=1e-8,
+    state_jacobian_prototype(m) -> SparseMatrixCSC
+
+The sparsity pattern of [`state_jacobian!`](@ref): `nf` independent 3×3
+blocks coupling each node's `(s2, s3, ϕ)`, which in the stacked
+`[s2; s3; ϕ]` ordering land at rows and columns `(i, nf+i, 2nf+i)`. Passed
+as `jac_prototype` so the integrator's linear solver sees a sparse `W` with
+no fill — a block-diagonal system in disguise.
+"""
+function state_jacobian_prototype(m::BP8Model)
+    nf = m.nf
+    rows = Vector{Int}(undef, 9nf)
+    cols = Vector{Int}(undef, 9nf)
+    k = 0
+    for i in 1:nf
+        idx = (i, nf + i, 2nf + i)
+        for col in idx, row in idx
+            k += 1
+            rows[k] = row
+            cols[k] = col
+        end
+    end
+    return sparse(rows, cols, zeros(9nf), 3nf, 3nf)
+end
+
+"""
+    state_jacobian!(J, u, m, t)
+
+The per-node block-diagonal approximation to `∂rhs!/∂u` described above,
+written into the entries of a matrix with [`state_jacobian_prototype`](@ref)'s
+pattern. For node `i` with trial stress `T = τ⁰ + Δτ_i`, unit direction `t̂`,
+slip-rate magnitude `V` and the derivatives `∂V/∂T`, `∂V/∂ϕ`:
+
+    ∂V⃗/∂s_i = [ (∂V/∂T)·t̂t̂ᵀ + (V/|T|)·(I - t̂t̂ᵀ) ]·K_ii     (2×2)
+    ∂V⃗/∂ϕ   = (∂V/∂ϕ)·t̂
+    ∂ϕ̇/∂s_i = -(∂V/∂T)·t̂ᵀ·K_ii / D_RS
+    ∂ϕ̇/∂ϕ   = -e^{-ϕ} - (∂V/∂ϕ) / D_RS
+
+where `K_ii` is the node's own 2×2 block of `K`. The first line is the
+derivative of `V⃗ = V(|T|)·T/|T|`: the magnitude responds along `t̂`, and the
+direction rotates at rate `V/|T|` in the perpendicular. Locked nodes, nodes
+with zero trial stress and nodes whose force balance failed to converge get
+only the `-e^{-ϕ}` diagonal, which is exact for the first two and the safe
+choice for the third (the step is being rejected anyway).
+"""
+function state_jacobian!(J, u, m::BP8Model, t)
+    p = m.par
+    nf = m.nf
+    fp = friction_params(p)
+    η = damping(p)
+    K = m.K
+    c = evaluate!(m, u, t; onfail=:nan)
+    pres = c.pres
+
+    @inbounds for i in 1:nf
+        i2, i3, iϕ = i, nf + i, 2nf + i
+        ϕ = u[iϕ]
+        J[i2, i2] = J[i2, i3] = J[i2, iϕ] = 0.0
+        J[i3, i2] = J[i3, i3] = J[i3, iϕ] = 0.0
+        J[iϕ, i2] = J[iϕ, i3] = 0.0
+        J[iϕ, iϕ] = -exp(-ϕ)
+
+        m.active[i] || continue
+        T = SVector(m.τ0[1] + c.Δτ[i2], m.τ0[2] + c.Δτ[i3])
+        Tn = norm(T)
+        V = c.Vmag[i]
+        (iszero(Tn) || !isfinite(V)) && continue
+
+        σ̄ = max(p.σ0 - pres[i], p.σ̄_min)
+        d = slip_rate_derivatives(V, exp(ϕ), σ̄, η, fp)
+        that = T / Tn
+        P = that * that'
+        dVvec_dT = d.dV_dT * P + (V / Tn) * (SMatrix{2,2}(1.0, 0.0, 0.0, 1.0) - P)
+        Kii = SMatrix{2,2}(K[i2, i2], K[i3, i2], K[i2, i3], K[i3, i3])
+        dVvec_ds = dVvec_dT * Kii
+        dVmag_ds = d.dV_dT * (that' * Kii)
+
+        J[i2, i2] = dVvec_ds[1, 1]; J[i2, i3] = dVvec_ds[1, 2]; J[i2, iϕ] = d.dV_dϕ * that[1]
+        J[i3, i2] = dVvec_ds[2, 1]; J[i3, i3] = dVvec_ds[2, 2]; J[i3, iϕ] = d.dV_dϕ * that[2]
+        J[iϕ, i2] = -dVmag_ds[1] / p.D_RS
+        J[iϕ, i3] = -dVmag_ds[2] / p.D_RS
+        J[iϕ, iϕ] -= d.dV_dϕ / p.D_RS
+    end
+    return nothing
+end
+
+"""
+    default_integrator(m) -> alg
+
+`Tsit5()` for the Gaussian source, `QNDF()` for the Peaceman well; see
+[`run_bp8`](@ref) for the measurements behind the split.
+"""
+default_integrator(m::BP8Model) = m.injection === :peaceman ? QNDF() : Tsit5()
+
+"""
+    run_bp8(m; tspan=(0.0, m.par.t_f), alg=default_integrator(m), reltol=1e-8,
               saveat=3600.0, verbose=false, pressure_kwargs=(;), kwargs...)
 
 Integrates slip and state. Absolute tolerances are set per block (slip, ln θ)
 because they live on wildly different scales.
+
+**The integrator defaults per injection model** ([`default_integrator`](@ref)):
+explicit `Tsit5` for the Gaussian source, whose ~400 steps over the benchmark
+leave nothing to gain, and implicit `QNDF` with the block-diagonal
+[`state_jacobian!`](@ref) for the Peaceman well, which is stiff once the well
+cell reaches the `σ̄_min` floor. Measured over 100 h at Δz = 25 m: Tsit5
+488,788 steps / 4,901 s against QNDF 1,105 steps / 20 s, and the implicit step
+count does *not* grow under refinement (1,621 at Δz = 50 m) where the explicit
+one grew as `Δz⁻⁴`. Both land on the same solution to the tolerances asked for
+(`test/bp8_test.jl`). Pass `alg` explicitly to override — any OrdinaryDiffEq
+method works, and the Jacobian is always attached, though note Rosenbrock
+methods do *not* tolerate its dropped off-diagonal blocks (they have no Newton
+loop to absorb them and take more steps than Tsit5).
 
 **Pore pressure is solved first, separately and implicitly**
 ([`solve_pressure_history`](@ref)), and attached to `m`; the slip integration
@@ -752,7 +917,7 @@ sub-interval runs and parameter sweeps over elastic settings pay for it once.
 `progress` (defaults to `verbose`) shows a `ProgressMeter` bar tracking `t/tspan[2]`,
 updated on every accepted step (ProgressMeter throttles the redraws itself).
 """
-function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=Tsit5(), reltol=1e-8,
+function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=default_integrator(m), reltol=1e-8,
                  saveat=3600.0, verbose=false, progress=verbose,
                  pressure_kwargs=(;), kwargs...)
     covers = m.pressure.sol !== nothing &&
@@ -766,7 +931,10 @@ function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=Tsit5(), reltol=1e-8,
     abstol[1:2nf] .= 1e-14        # slip, m
     abstol[2nf+1:3nf] .= 1e-10    # ln θ
 
-    prob = ODEProblem(rhs!, u0, tspan, m)
+    # The Jacobian is attached unconditionally; explicit methods ignore it, and
+    # the prototype is 9nf entries. See the comment block above `state_jacobian!`.
+    f = ODEFunction(rhs!; jac=state_jacobian!, jac_prototype=state_jacobian_prototype(m))
+    prob = ODEProblem(f, u0, tspan, m)
     t0 = time()
     solve_kwargs = (; reltol, abstol, saveat, save_everystep=false,
                      tstops=[m.par.t_off], kwargs...)

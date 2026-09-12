@@ -91,9 +91,61 @@ const η_rs = radiation_damping_coefficient(μ_rs, c_s_rs)
     end
 
     @testset "solve_slip_rate: reports non-convergence instead of a bad root" begin
-        θ = Dc_rs / 1e-6
-        T = η_rs * 1e-6 + fault_strength(1e-6, θ, σ̄0, params)
+        # The root sits 14 e-folds below `V_star`, so one clamped Newton step
+        # (at most 5) cannot reach it from *either* seed — the warm start or
+        # the `V_star` fallback a failed warm start is retried from.
+        V_true = 1e-12
+        θ = Dc_rs / V_true
+        T = η_rs * V_true + fault_strength(V_true, θ, σ̄0, params)
         @test_throws ErrorException solve_slip_rate(T, θ, σ̄0, η_rs, params; V0=1e-20, maxiter=1)
+        # `onfail=:nan` is the implicit-integrator contract: a trial state the
+        # Newton iteration is about to discard must produce a rejectable NaN,
+        # not an exception. Non-finite inputs take the same exit.
+        @test isnan(solve_slip_rate(T, θ, σ̄0, η_rs, params; V0=1e-20, maxiter=1, onfail=:nan))
+        @test isnan(solve_slip_rate(NaN, θ, σ̄0, η_rs, params; onfail=:nan))
+        @test isnan(solve_slip_rate(T, Inf, σ̄0, η_rs, params; onfail=:nan))
+        # ...and the default still converges on the same inputs.
+        @test isapprox(solve_slip_rate(T, θ, σ̄0, η_rs, params; onfail=:nan), V_true, rtol=1e-8)
+    end
+
+    @testset "solve_slip_rate: a bad warm start is retried, not fatal" begin
+        # An implicit integrator's rejected trial states leave arbitrary seeds
+        # behind in the warm-start cache. A seed from which Newton cannot
+        # converge (here: `exp` overflow territory) must fall back to the
+        # `V_star` start and still return the root.
+        V_true = 1e-6
+        θ = Dc_rs / V_true
+        T = η_rs * V_true + fault_strength(V_true, θ, σ̄0, params)
+        for V0 in (1e300, 1e-300, Inf, NaN)
+            @test isapprox(solve_slip_rate(T, θ, σ̄0, η_rs, params; V0), V_true, rtol=1e-8)
+        end
+    end
+
+    @testset "slip_rate_derivatives match finite differences of the solve" begin
+        # Implicit differentiation of the force balance against central
+        # differences of `solve_slip_rate` itself, across the slip-rate and
+        # effective-stress range BP8 spans — including the σ̄ = 1 kPa floor
+        # where `1/D` is the stiff eigenvalue's scale (PROGRESS.md "what the
+        # stiff eigenvalue is"). Tolerance is the FD truncation error at these
+        # steps, not the formula's accuracy.
+        for (V, σ̄) in ((1e-12, 25e6), (1e-9, 5e6), (1e-6, 1e3), (1e-3, 1e3), (1.0, 25e6))
+            θ = 3Dc_rs / V
+            T = η_rs * V + fault_strength(V, θ, σ̄, params)
+            d = slip_rate_derivatives(V, θ, σ̄, η_rs, params)
+            h = 1e-6 * T
+            fd_T = (solve_slip_rate(T + h, θ, σ̄, η_rs, params; V0=V) -
+                    solve_slip_rate(T - h, θ, σ̄, η_rs, params; V0=V)) / 2h
+            hϕ = 1e-6
+            fd_ϕ = (solve_slip_rate(T, θ * exp(hϕ), σ̄, η_rs, params; V0=V) -
+                    solve_slip_rate(T, θ * exp(-hϕ), σ̄, η_rs, params; V0=V)) / 2hϕ
+            @test isapprox(d.dV_dT, fd_T; rtol=1e-7)
+            @test isapprox(d.dV_dϕ, fd_ϕ; rtol=1e-7)
+            @test d.dV_dT > 0      # stronger drive, faster slip
+            @test d.dV_dϕ < 0      # older contact (larger θ), stronger fault, slower slip
+        end
+        # `V → 0` is a legitimate input (locked nodes) and must not divide by zero.
+        d0 = slip_rate_derivatives(0.0, 1e6, σ̄0, η_rs, params)
+        @test isfinite(d0.dV_dT) && d0.dV_dϕ == 0
     end
 
     @testset "solve_slip_velocity: zero trial stress gives zero slip rate" begin

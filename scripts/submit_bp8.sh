@@ -27,7 +27,7 @@ SLURM_PARTITION_SMALL="pelle"        # merge and run (a few cores, minutes)
 # uppmax2026-1-45 is a different allocation, point this at that project's
 # /proj/<name>/nobackup instead. NOT $HOME — K is ~86 MB at Δz = 20 m but
 # ~1.3 GB at 10 m, and the shard files add the same again until the merge.
-EQD_STIFFNESS_CACHE="/proj/efficient_elastic/efficient_elastic/nobackup/EarthquakeDiffinitive.jl/eqd-stiffness"
+EQD_STIFFNESS_CACHE="/proj/efficient_elastic/efficient_elastic/nobackup/temp/EarthquakeDiffinitive.jl/eqd-stiffness"
 
 SLURM_MAIL="robin.dymer@it.uu.se"    # END/FAIL notifications; "" to disable
 

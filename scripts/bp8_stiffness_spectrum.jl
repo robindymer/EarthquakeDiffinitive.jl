@@ -35,7 +35,10 @@ fp = BP8.friction_params(p); η = BP8.damping(p)
 @printf("\nnf=%d  N=%d  well_cell=%d  K[w,w]=%.4e Pa/m  eta=%.4e  a=%.4g\n",
         nf, N, w, m.K[w, w], η, fp.a)
 
-sol = run_bp8(m; tspan=(0.0, 100 * 3600.0), saveat=1800.0)
+# Explicit on purpose: this script measures the stiffness the PW default
+# (`QNDF`, see `run_bp8`) was introduced to remove, so it has to run the
+# explicit integrator the measurement was defined on.
+sol = run_bp8(m; tspan=(0.0, 100 * 3600.0), saveat=1800.0, alg=BP8.Tsit5())
 @printf("Tsit5 over 100 h: %d accepted steps\n\n", sol.stats.naccept)
 
 """Dense Jacobian of `rhs!` at `(u,t)`, by one-sided differences with

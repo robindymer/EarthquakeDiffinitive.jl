@@ -5,7 +5,7 @@ using LinearAlgebra: norm
 
 export FrictionParams, radiation_damping_coefficient, friction_coefficient,
        fault_strength, aging_law_rhs, solve_slip_rate, solve_slip_velocity,
-       initial_state_from_strength
+       slip_rate_derivatives, initial_state_from_strength
 
 """
     FrictionParams(a, b, Dc, V_star, f_star)
@@ -71,28 +71,89 @@ decades at once and `exp(x)` overflows to `Inf`, silently returning `NaN` or
 a value wrong by many orders of magnitude. A warm start during acceleration
 always approaches from below, so this is reachable in a time loop even
 though BP8-QD-GS is velocity-strengthening and should not itself get near
-the seismic slip rates where it first appears. Throws if the iteration has
-not converged within `maxiter` steps rather than returning a bad root.
+the seismic slip rates where it first appears.
+
+If the iteration has not converged within `maxiter` steps it never returns a
+bad root: with `onfail=:error` (the default) it throws, and with
+`onfail=:nan` it returns `NaN`. The latter exists for implicit time
+integrators, whose Newton iterations evaluate the right-hand side at trial
+states that can be arbitrarily far off the trajectory — a `NaN` there makes
+the integrator reject the step and shrink it, which is the right response,
+whereas an exception would abort the whole run over a state that was never
+going to be accepted. Non-finite inputs (`T`, `θ`) fall through to the same
+path, since no iteration converges from them.
 """
-function solve_slip_rate(T, θ, σ̄, η, p::FrictionParams; V0=nothing, tol=1e-12, maxiter=50, maxstep=5.0)
+function solve_slip_rate(T, θ, σ̄, η, p::FrictionParams; V0=nothing, tol=1e-12, maxiter=50,
+                         maxstep=5.0, onfail::Symbol=:error)
     C = exp((p.f_star + p.b * log(p.V_star * θ / p.Dc)) / p.a)
-    x = log(V0 === nothing ? p.V_star : V0)
-    converged = false
+    x, converged = _newton_log_slip_rate(T, C, σ̄, η, p, log(V0 === nothing ? p.V_star : V0),
+                                         tol, maxiter, maxstep)
+    # The warm start is an optimisation, never a requirement: an implicit
+    # integrator evaluates the force balance at trial states it then rejects,
+    # and the seed those leave behind can be arbitrarily bad for the state it
+    # actually retries from. So a seeded iteration that fails is retried once
+    # from the reference rate before it counts as a failure — otherwise one
+    # rejected trial poisons every later evaluation at that node and the step
+    # size collapses (observed: `dt` driven below eps mid-injection).
+    if !converged && V0 !== nothing
+        x, converged = _newton_log_slip_rate(T, C, σ̄, η, p, log(p.V_star), tol, maxiter, maxstep)
+    end
+    if !converged
+        onfail === :nan && return NaN
+        error("solve_slip_rate failed to converge in $maxiter iterations " *
+              "(T=$T, θ=$θ, σ̄=$σ̄, η=$η, V0=$V0, last V=$(exp(x)))")
+    end
+    return exp(x)
+end
+
+# Newton on `g(x) = ηe^x + σ̄·a·asinh(e^x·C/2V*) - T` from `x0`; returns the
+# final `x` and whether `|dx| < tol` was reached.
+function _newton_log_slip_rate(T, C, σ̄, η, p::FrictionParams, x0, tol, maxiter, maxstep)
+    x = x0
+    isfinite(x) || return x, false
     for _ in 1:maxiter
         V = exp(x)
         u = V / (2p.V_star) * C
         g = η * V + σ̄ * p.a * asinh(u) - T
-        dgdx = η * V + σ̄ * p.a * u / sqrt(1 + u^2)
+        dgdx = η * V + σ̄ * p.a * u / hypot(1.0, u)
         dx = clamp(-g / dgdx, -maxstep, maxstep)
         x += dx
-        if abs(dx) < tol
-            converged = true
-            break
-        end
+        abs(dx) < tol && return x, true
+        isfinite(x) || return x, false
     end
-    converged || error("solve_slip_rate failed to converge in $maxiter iterations " *
-                       "(T=$T, θ=$θ, σ̄=$σ̄, η=$η, V0=$V0, last V=$(exp(x)))")
-    return exp(x)
+    return x, false
+end
+
+"""
+    slip_rate_derivatives(V, θ, σ̄, η, p::FrictionParams) -> (; dV_dT, dV_dϕ)
+
+Partial derivatives of the slip-rate magnitude `V` — the root of the force
+balance `g(V) = ηV + σ̄f(V,θ) - T = 0` that [`solve_slip_rate`](@ref) finds —
+with respect to the trial-stress magnitude `T` and the log state `ϕ = ln θ`,
+by implicit differentiation at an already-converged `V`:
+
+    ∂V/∂T = 1/D,   ∂V/∂ϕ = -(∂g/∂ϕ)/D,   D = ∂g/∂V = η + σ̄·a·(C/2V*)/√(1+u²)
+
+with `u = V·C/(2V*)` and `C = exp((f* + b·ln(V*θ/D_c))/a)`, so that
+`∂g/∂ϕ = σ̄·b·u/√(1+u²)`. `D` is written with `C/(2V*)` rather than `u/V` so it
+stays finite as `V → 0`.
+
+`1/D` is the quantity behind BP8-PW's stiffness: `D ∝ σ̄` for a node whose
+effective normal stress has been floored, so `K_ww/D` — the node's slip against
+its own self-stiffness — is the stiff eigenvalue (PROGRESS.md "what the stiff
+eigenvalue is"). These closed forms are what let `BP8.state_jacobian!` supply
+that eigenvalue to an implicit integrator for the cost of one pass over the
+nodes, rather than `N` right-hand-side evaluations for a finite-difference
+Jacobian.
+"""
+function slip_rate_derivatives(V, θ, σ̄, η, p::FrictionParams)
+    C = exp((p.f_star + p.b * log(p.V_star * θ / p.Dc)) / p.a)
+    u = V / (2p.V_star) * C
+    # `hypot` rather than `sqrt(1 + u^2)`: `u` can exceed 1e154 before `V` is
+    # unphysical, and `u^2` overflows there while `u/hypot(1, u) → 1` is exact.
+    h = hypot(1.0, u)
+    D = η + σ̄ * p.a * (C / (2p.V_star)) / h
+    return (; dV_dT=1 / D, dV_dϕ=-σ̄ * p.b * (u / h) / D)
 end
 
 """

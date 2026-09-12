@@ -102,15 +102,25 @@ stand.
    it. This is now the *only* blocker for BP8-GS, and it is a single-node
    requirement — `:toeplitz` removed the multi-node one. The `K` build itself is
    ~1-4 days (extrapolation spread; `DOF^1.56` vs `DOF^1.80` bracket it).
-2. **[ ] BP8-PW is stiffness-bound, and this is unsolved.** The floored well
-   cell makes the coupled integration cost `≈ Δz⁻⁴` in steps: 31,249 steps
-   (17 s) at Δz = 50 m, **488,885 steps (4,901 s)** at Δz = 25 m. Extrapolated
-   to Δz = 10 m that is **weeks-to-months** — larger than the `K` build.
-   Confirmed as stiffness by control: the Gaussian variant takes **405** steps
-   on an identical grid.
+2. **[x] BP8-PW is stiffness-bound — RESOLVED 2026-09-12.** `run_bp8` now
+   defaults BP8-PW to `QNDF` with an analytic block-diagonal Jacobian
+   (`BP8.state_jacobian!`): 1,105 steps / 20 s at Δz = 25 m against Tsit5's
+   488,788 / 4,901 s, and the implicit step count does not grow with
+   refinement. `σ̄_min` untouched at 1 kPa. `PROGRESS.md` "BP8-PW stiffness:
+   RESOLVED". Remaining: run it at Δz = 20/10 m on the cluster
+   (`scripts/submit_bp8_pw.sh`) and record the actual timings.
 
-   **Route being pursued: regularize via `σ̄_min`** (Robin's call, 2026-08-20 —
-   measure before committing to a solver project). At Δz = 50 m a 10 kPa floor
+   *Record of the problem as it stood:* the floored well cell made the coupled
+   integration cost `≈ Δz⁻⁴` in steps: 31,249 steps (17 s) at Δz = 50 m,
+   **488,885 steps (4,901 s)** at Δz = 25 m. Extrapolated to Δz = 10 m that
+   was **weeks-to-months** — larger than the `K` build. Confirmed as stiffness
+   by control: the Gaussian variant takes **405** steps on an identical grid.
+
+   **Route that was pursued first: regularize via `σ̄_min`** (2026-08-20 —
+   measure before committing to a solver project). **Dropped 2026-09-12**: the
+   floor is not in the benchmark description at all, so raising it is a
+   physics perturbation with no spec cover, and the solver route turned out to
+   be a day's work. At Δz = 50 m a 10 kPa floor
    buys **9.2× for 0.04% in `V_max`**; 100 kPa buys 38× for 0.47%. Table and
    caveats in `PROGRESS.md` "BP8-PW stiffness: σ̄_min as a regularization".
 
@@ -160,14 +170,12 @@ stand.
    from quantities `solve_slip_rate` already computes, and are verified to 6
    digits against FD.
 
-   - [ ] **Prerequisite for any implicit route:** `solve_slip_rate` must return
-         `NaN` rather than `error()` (`src/RateStateFriction.jl`), and
-         `evaluate!`'s cache mutation (`Vprev`, `floor_hits`, `σ̄_lowest`,
-         `floor_nodes`) must not accumulate on off-trajectory evaluations.
-   - [ ] **Then the 3×3 IMEX split.** Not started — deferred, since BP8-GS is
-         not stiffness-bound (405 steps) and is the next run. Note the explicit
-         part is now `K`'s off-diagonals only: pressure left the coupled state
-         on 2026-09-09.
+   - [x] **Prerequisite for any implicit route:** `solve_slip_rate(...;
+         onfail=:nan)`; a failed warm start is retried from `V_star`; `Vprev`
+         is not written on a failed evaluation.
+   - [x] **The implicit integration** — done as an inexact-Jacobian BDF rather
+         than an IMEX split: the full `rhs!` plus the 3×3 block-diagonal `J`,
+         Newton absorbs the off-diagonals. Simpler and measured to work.
 
    **Do not benchmark this at Δz = 50 m.** Tsit5 does 100 h in 15.8 s there and
    no implicit method will beat it at `N` = 1157. Validate correctness at 50 m;
