@@ -8,7 +8,9 @@ using SparseArrays
 using Tokens
 using StaticArrays
 using ..Elasticity: traction_blocks
-using ..ElasticitySplitNode: split_node_system, CGSolver,
+using ..ElasticitySplitNode: split_node_system, split_node_operator,
+                             AssembledSplitNode, SplitNodeOperator,
+                             apply_P!, hp_dsat!, CGSolver,
                              split_node_solve, solver_report,
                              duplicate, merge_stats!
 
@@ -20,9 +22,12 @@ export FaultElasticity, fault_grid_axes, frictional_node_count,
 # The slip → shear-traction map on the fault.
 #
 # `ElasticitySplitNode` solves `-HP(D+SAT)P u = HP(D+SAT)χ(s)` for a given
-# slip distribution, by CG on the assembled `A` directly (no factorization —
-# see `ElasticitySplitNode.CGSolver`). Since λ and μ are constant `A` never
-# changes as slip evolves, so this module assembles it once and then either
+# slip distribution, by CG on `A` directly (no factorization — see
+# `ElasticitySplitNode.CGSolver`). `A` is by default the matrix-free
+# `SplitNodeOperator` (Kronecker 1D operators, nothing of size `nnz(A)` ever
+# formed — `MATRIX_FREE_PLAN.md`); `representation=:assembled` builds the
+# explicit sparse matrices instead, for comparison. Since λ and μ are constant
+# `A` never changes as slip evolves, so this module builds it once and then either
 #
 #   * solves per evaluation (`shear_traction`), or
 #   * precomputes the dense fault stiffness `K : slip ↦ Δτ` once
@@ -79,9 +84,8 @@ Slip and traction vectors are indexed over the `Ω_f` nodes only, in
 column-major order (x2 fastest) over an `(n2f, n3f)` grid — the same ordering
 `PorePressure`'s grid uses, so the two couple entry-wise.
 """
-struct FaultElasticity
-    P::SparseMatrixCSC{Float64,Int}
-    HP_DSAT::SparseMatrixCSC{Float64,Int}
+struct FaultElasticity{TOp}
+    op::TOp                            # SplitNodeOperator or AssembledSplitNode; also rs.A
     rs::CGSolver
     T2::SparseMatrixCSC{Float64,Int}   # Nb × Ntot, fault-averaged σ21 extraction
     T3::SparseMatrixCSC{Float64,Int}
@@ -93,7 +97,20 @@ struct FaultElasticity
     Ntot::Int
 end
 
-function FaultElasticity(g_minus, g_plus, λ, μ, stencil_set; l_f, solver_kwargs...)
+"""
+    FaultElasticity(g_minus, g_plus, λ, μ, stencil_set; l_f,
+                    representation=:kronecker, solver_kwargs...)
+
+The elastic system behind the slip → traction map, ready to solve.
+`representation=:kronecker` (default) applies `A` matrix-free through
+[`SplitNodeOperator`](@ref) — seconds to build, a handful of vectors to
+hold; `:assembled` forms the explicit `A`, `HP_DSAT`, `P` of
+[`split_node_system`](@ref) — hours and tens of GB at production size, kept
+for validation and for the `precond=:jacobi` option, which needs `diag(A)`.
+The two give the same `K` to CG tolerance and share one cache key.
+"""
+function FaultElasticity(g_minus, g_plus, λ, μ, stencil_set; l_f,
+                         representation::Symbol=:kronecker, solver_kwargs...)
     bid_minus = CartesianBoundary{1,UpperBoundary}()
     bid_plus = CartesianBoundary{1,LowerBoundary}()
     Nm, Np = length(g_minus), length(g_plus)
@@ -125,7 +142,13 @@ function FaultElasticity(g_minus, g_plus, λ, μ, stencil_set; l_f, solver_kwarg
     lin = LinearIndices((n2, n3))
     omega = [lin[a, b] for b in i3 for a in i2]
 
-    A, HP_DSAT, P = split_node_system(g_minus, g_plus, λ, μ, stencil_set)
+    op = if representation === :kronecker
+        split_node_operator(g_minus, g_plus, λ, μ, stencil_set)
+    elseif representation === :assembled
+        AssembledSplitNode(split_node_system(g_minus, g_plus, λ, μ, stencil_set)...)
+    else
+        error("representation must be :kronecker or :assembled, got $representation")
+    end
 
     Tm = traction_blocks(g_minus, λ, μ, stencil_set, bid_minus)
     Tp = traction_blocks(g_plus, λ, μ, stencil_set, bid_plus)
@@ -139,7 +162,7 @@ function FaultElasticity(g_minus, g_plus, λ, μ, stencil_set; l_f, solver_kwarg
         chi_rows_plus[k, ci] = 3Nm + (comp - 1) * Np + sel_plus[b]
     end
 
-    return FaultElasticity(P, HP_DSAT, CGSolver(A; solver_kwargs...),
+    return FaultElasticity(op, CGSolver(op; solver_kwargs...),
                            extract(2), extract(3),
                            chi_rows, chi_rows_plus, omega,
                            collect(x2_all[i2]), collect(x3_all[i3]), Ntot)
@@ -200,7 +223,11 @@ end
 
 function shear_traction!(Δτ2, Δτ3, fe::FaultElasticity, s2, s3, χ, solver=fe.rs)
     build_chi!(χ, fe, s2, s3)
-    U = fe.P * split_node_solve(solver, fe.HP_DSAT * χ) .+ χ
+    # `solver.A`, not `fe.op`: a duplicated solver owns its own operator scratch
+    # (`duplicate_operator`), which is what makes the threaded build race-free.
+    op = solver.A
+    b = hp_dsat!(similar(χ), op, χ)
+    U = apply_P!(similar(χ), op, split_node_solve(solver, b)) .+ χ
     τ2 = fe.T2 * U
     τ3 = fe.T3 * U
     @inbounds for (k, b) in enumerate(fe.omega)
@@ -685,15 +712,25 @@ end
 
 """
     fault_stiffness_gpu(fe; verbose=false) -> K
+    fault_stiffness_gpu(fe; shard, nshards, verbose=false) -> (cols, Kshard)
 
 GPU-accelerated `symmetry=true` build: same D4-orbit reduction as
 [`fault_stiffness`](@ref)`(fe; symmetry=true)` (PERFORMANCE.md §5 item 0b),
-but each orbit representative's CG solve runs on the GPU against `A`, `P`,
-`T2`, `T3` held resident there for the whole build, rather than
-CPU-threaded. **No sharding** — the whole `A` must fit in one GPU's memory
-(measured: `A`+`HP_DSAT` is ~15 GB at Δz = 20 m, ~65-116 GB at Δz = 10 m
-depending on domain, `PERFORMANCE.md` §4 — this needs a GPU with enough VRAM
-for the target resolution, e.g. an H100 80/94 GB card at Δz = 10 m).
+but each orbit representative's CG solve runs on the GPU against the elastic
+system held resident there for the whole build, rather than CPU-threaded.
+
+With the default matrix-free representation (`SplitNodeOperator`,
+`MATRIX_FREE_PLAN.md`) "resident" means the 1D operators, `P`'s index data,
+the small SAT block and ~9 vectors of system length — about 9 GB at Δz = 10 m
+on (1600, 1600), where the assembled `A` alone would be ~85 GB — so any
+datacenter card holds any BP8 configuration. `representation=:assembled`
+uploads the CSR `A` and `P` instead and is limited by their size (~23 GB at
+Δz = 10 m on (1150, 1150), measured).
+
+`shard`/`nshards` split the representatives exactly as
+[`fault_stiffness_d4_shard`](@ref) does and return its `(cols, Kshard)`, so
+`merge_stiffness_cache.jl` reassembles GPU shards unchanged. Use it to spread
+a build over several cards, or to keep one job inside a walltime limit.
 
 **Why sequential, not threaded like the CPU path.** A single GPU has one
 memory-bandwidth budget; the whole motivation for this path is that a

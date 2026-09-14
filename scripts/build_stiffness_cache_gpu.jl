@@ -2,40 +2,42 @@
 # cache — the GPU counterpart of `build_stiffness_cache.jl`.
 #
 # WHY A SEPARATE ENTRY POINT (rather than a flag on the CPU script). The two
-# have opposite job shapes. The CPU build is sharded across many nodes and
-# needs a merge step afterwards; the GPU build is *one* job on *one* device
-# holding the whole `A` in VRAM, with no shards and nothing to merge. It
-# therefore writes a complete cache entry directly via `save_stiffness`, and
-# `run_bp8.jl` reads it through the normal `EQD_STIFFNESS_CACHE` lookup with
-# no further step. Same cache key as the CPU path, so the two are
+# have different job shapes. The CPU build is sharded across many nodes; the
+# GPU build is one job on one device — or, with `[shard] [nshards]`, a few —
+# and writes a complete cache entry directly via `save_stiffness` when
+# unsharded, so `run_bp8.jl` reads it through the normal `EQD_STIFFNESS_CACHE`
+# lookup with no further step. Same cache key as the CPU path, so the two are
 # interchangeable: whichever finishes first satisfies the run, and the second
 # one sees the file and exits.
 #
 # Run:
 #   export EQD_STIFFNESS_CACHE=/path/to/scratch/eqd-stiffness
-#   julia --project=scripts scripts/build_stiffness_cache_gpu.jl [Δz] [L_fault] [L_normal]
+#   julia --project=scripts scripts/build_stiffness_cache_gpu.jl [Δz] [L_fault] [L_normal] [shard nshards]
 #
 # With no arguments it builds the Δz = 20 m submission configuration. Only
 # `:exact` is supported — `:toeplitz` is 10 solves and does not need a GPU.
+# With `shard nshards` it writes a `.shard<k>` file of the D4 representatives
+# `shard:nshards:end` (same format as the CPU shards) for
+# `merge_stiffness_cache.jl` to assemble — to spread one build over several
+# cards, or to keep one inside a walltime.
 #
-# MEMORY. Two separate requirements, and the host one is the larger:
+# MEMORY. The elastic system is applied **matrix-free** (`SplitNodeOperator`,
+# MATRIX_FREE_PLAN.md): nothing of size `nnz(A)` is ever formed, on the host
+# or the device. What the device holds is ~9 vectors of system length (the
+# CG workspace, rhs, solution, the operator's scratch) plus the small
+# boundary-local SAT block and `T2`/`T3`:
 #
-#   * host RAM  — `build_fault_elasticity` assembles `A` and `HP_DSAT` as
-#     Float64/Int64 CSC. That is ~15 GB at Δz = 20 m, ~65 GB at Δz = 10 m on
-#     the relaxed (1200, 1200) domain and ~116 GB on the converged
-#     (1600, 1200) one (PERFORMANCE.md §4).
-#   * VRAM — only `A`, `P`, `T2`, `T3` go to the device, as CSR, and
-#     `HP_DSAT` stays on the host because the right-hand side is formed
-#     there. The index width follows `nnz`: Int32 (12 bytes per nonzero)
-#     while `nnz` fits in one, Int64 (16, same as the host CSC) once it does
-#     not — which the converged Δz = 10 m `A` does not, at ~3.55e9. So the
-#     device needs a bit over *half* the host figure: ~28 GB at Δz = 10 m
-#     relaxed and ~65 GB converged, CG vectors included. Only the 94 GB H100
-#     NVL holds the converged case; the relaxed one also fits a 48 GB L40S.
+#     Δz = 20 m (1600, 1600), 12.6 M DOF   ~1 GB
+#     Δz = 10 m (1150, 1150), 37 M DOF     ~3 GB   (assembled: 23 GB measured)
+#     Δz = 10 m (1600, 1600), 100 M DOF    ~9 GB   (assembled: ~85 GB, Int64 CSR)
 #
-# The script prints both estimates and the device's actual free VRAM before it
-# starts, and refuses to begin a build that cannot fit — an OOM 40 minutes into
-# a 10-hour allocation is worth one second of arithmetic up front.
+# so any BP8 configuration fits an L40S, and host RAM is the dense `K`
+# (1.3 GB at Δz = 10 m) plus a few vectors. There is no assembly step to wait
+# through either: the operator is built in seconds, where the assembled `A`
+# took 17.5 h at Δz = 10 m (1150, 1150) and would take ~73 h on (1600, 1600).
+#
+# The script prints the estimate and the device's actual free VRAM before it
+# starts, and refuses to begin a build that cannot fit.
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.BP8
 using EarthquakeDiffinitive.FaultResponse: fault_stiffness_gpu, fault_grid_axes,
@@ -107,6 +109,12 @@ dir === nothing && error("""
 Δz = length(ARGS) >= 1 ? parse(Float64, ARGS[1]) : DEFAULT_Δz
 L_fault = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : DEFAULT_L_FAULT
 L_normal = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : DEFAULT_L_NORMAL
+shard = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : nothing
+nshards = length(ARGS) >= 5 ? parse(Int, ARGS[5]) : nothing
+(shard === nothing) == (nshards === nothing) ||
+    error("pass both [shard] and [nshards], or neither")
+shard === nothing || 1 <= shard <= nshards ||
+    error("shard must be in 1:nshards, got shard=$shard nshards=$nshards")
 
 par = benchmark_parameters()
 order = 4
@@ -114,78 +122,54 @@ set = read_stencil_set(SbpOperators.sbp_operators_path() * "standard_diagonal.to
 key = stiffness_cache_key(; λ=EarthquakeDiffinitive.BP8.lame_lambda(par), μ=par.μ,
                           l_f=par.l_f, Δz, L_fault, L_normal, order, stencil=set,
                           stiffness=:exact)
-path = stiffness_cache_path(dir, key)
+path = shard === nothing ? stiffness_cache_path(dir, key) :
+                           joinpath(dir, key.name * ".shard$shard")
 
 nf = (round(Int, 2par.l_f / Δz) + 1)^2
 n1, n23 = fault_grid_sizes(par, Δz, L_fault, L_normal, order)
 Ntot = 3 * 2 * n1 * n23 * n23
 
 @printf("""
-target      Δz = %g m, L_fault = %g m, L_normal = %g m, exact (GPU)
+target      Δz = %g m, L_fault = %g m, L_normal = %g m, exact (GPU, matrix-free)
 grid        %d x %d x %d per side, %d DOF
 Ω_f nodes   %d  (K is %d x %d, %.1f MB on disk)
+shard       %s
 device      %s, %.1f GB total, %.1f GB free
-cache       %s
+output      %s
 """, Δz, L_fault, L_normal, n1, n23, n23, Ntot, nf, 2nf, 2nf, (2nf)^2 * 8 / 2^20,
+     shard === nothing ? "none (whole K in one job)" : "$shard of $nshards (D4 representatives $shard:$nshards:end)",
      CUDA.name(CUDA.device()), vram_total() / 2^30,
      vram_free() / 2^30, path)
 
 if isfile(path)
-    println("\nalready cached — nothing to do (delete the file to rebuild it)")
+    println("\nalready written — nothing to do (delete the file to rebuild it)")
     exit(0)
 end
 
-# ---- a-priori VRAM check, BEFORE the hours of host assembly -----------------
-# `nnz(A)` is not known until `A` exists, but it is very predictable: measured
-# at Δz = 100/80/50/40/25 m, nonzeros per row fit `48.52 - 349/n23` to within
-# 0.25% at every point. That is more than accurate enough to reject a job that
-# is off by a factor of two, which is the case that matters — landing on a
-# 48 GB L40S when the run needs 65 GB. The exact check still runs after
-# assembly; this one exists so that failure costs seconds, not hours.
-est_nnz_row(n) = 48.52 - 349.0 / n
-est_nnzA = Ntot * est_nnz_row(n23)
-est_Ti = est_nnzA <= typemax(Int32) - 1 ? 4 : 8
-est_need = est_nnzA * (8 + est_Ti) * 1.03 + 9 * Ntot * 8   # +3% for P, T2, T3
+# ---- VRAM check --------------------------------------------------------------
+# Matrix-free, the device footprint is arithmetic on `Ntot`: Krylov's CG
+# workspace (4 vectors), rhs, solution, χ and the operator's own scratch
+# (`pv`, `dsat`, five field-length vectors ≈ 1.7 system-length ones), plus the
+# SAT block (boundary-local, ~1% of an assembled `A`) and `T2`/`T3`.
+need = (7 + 2 + 5 / 3) * Ntot * 8 * 1.10
 free0 = vram_free()
-@printf("estimate    nnz(A) ~%.2fe9 (%s), VRAM ~%.0f GB needed, %.0f GB free\n",
-        est_nnzA / 1e9, est_Ti == 4 ? "Int32" : "Int64", est_need / 2^30, free0 / 2^30)
-est_need < free0 || error("""
-    this configuration needs ~$(round(est_need / 2^30, digits=0)) GB of VRAM but only \
-    $(round(free0 / 2^30, digits=0)) GB is free on $(CUDA.name(CUDA.device())).
-    Refusing before the (multi-hour) host assembly rather than after it.
-    Use a larger GPU (--gpus=h100:1), or the relaxed (1200, 1200) domain.""")
+@printf("VRAM        ~%.1f GB needed (vectors + SAT), %.1f GB free\n", need / 2^30, free0 / 2^30)
+need < free0 || error("""
+    this configuration needs ~$(round(need / 2^30, digits=1)) GB of VRAM but only \
+    $(round(free0 / 2^30, digits=1)) GB is free on $(CUDA.name(CUDA.device())).""")
 
 t0 = time()
 fe = build_fault_elasticity(; par, Δz, L_fault, L_normal, n1, n23, set, verbose=true)
-@printf("assembly    %.2f h\n", (time() - t0) / 3600)
+@printf("operator    built in %.1f s (matrix-free; no assembly)\n", time() - t0)
 
-# Now that `A` exists, the VRAM requirement is known exactly rather than
-# estimated — check it before uploading anything, while the failure is still
-# a clear message instead of a CUDA OOM.
-# Mirrors `to_csr`'s index-width rule exactly: assuming Int32 here would
-# under-report by ~14 GB on the converged Δz = 10 m `A`, which is precisely
-# the configuration this check exists to catch.
-csr_bytes(M) = (w = nnz(M) <= typemax(Int32) - 1 ? 4 : 8;
-                nnz(M) * (8 + w) + (size(M, 1) + 1) * w)
-resident = csr_bytes(fe.rs.A) + csr_bytes(fe.P) + csr_bytes(fe.T2) + csr_bytes(fe.T3)
-# Krylov's CG workspace plus the rhs/solution vectors this build keeps live.
-vectors = 9 * fe.Ntot * 8
-need = resident + vectors
-free = vram_free()
-@printf("""
-A           %d nonzeros (%.2f per row)
-VRAM        %.1f GB matrices + %.1f GB vectors = %.1f GB needed, %.1f GB free
-""", nnz(fe.rs.A), nnz(fe.rs.A) / fe.Ntot, resident / 2^30, vectors / 2^30,
-     need / 2^30, free / 2^30)
-
-need < free || error("""
-    this build needs ~$(round(need / 2^30, digits=1)) GB of VRAM but only \
-    $(round(free / 2^30, digits=1)) GB is free on $(CUDA.name(CUDA.device())).
-    Use a larger GPU, or drop to the relaxed (1200, 1200) domain.""")
-
-K = fault_stiffness_gpu(fe; verbose=true)
 x2, x3 = collect.(fault_grid_axes(fe))
-save_stiffness(path, key, K, x2, x3)
+if shard === nothing
+    K = fault_stiffness_gpu(fe; verbose=true)
+    save_stiffness(path, key, K, x2, x3)
+else
+    cols, Kc = fault_stiffness_gpu(fe; verbose=true, shard, nshards)
+    save_stiffness_shard(path, key, cols, Kc, x2, x3)
+end
 
 rep = elastic_solver_report(fe)
 @printf("\ndone in %.2f h → %s (%.1f MB)\nsolves %d, mean CG iterations %.0f, unconverged %d\n",

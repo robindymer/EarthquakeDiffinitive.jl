@@ -48,6 +48,10 @@ function split_node_stencil_set()
     return read_stencil_set(SbpOperators.sbp_operators_path() * "standard_diagonal.toml", order=4)
 end
 
+# Two half-spaces meeting at x1 = 0, n1 nodes across each, n23 along the fault.
+sn_grids(n1, n23; L=1.2) = (equidistant_grid((-1.0, -L, -L), (0.0, L, L), n1, n23, n23),
+                             equidistant_grid((0.0, -L, -L), (1.0, L, L), n1, n23, n23))
+
 @testset "ElasticitySplitNode" begin
     @testset "self-consistent: recovers an arbitrary smooth two-sided field" begin
         set = split_node_stencil_set()
@@ -233,5 +237,80 @@ end
         # shrinking with h — the exact value on the fault is zero.
         @test σ11(coarse) < 0.1 * maximum(abs, coarse.τ_minus[2])
         @test σ11(fine) < σ11(coarse)
+    end
+
+    # The matrix-free SplitNodeOperator is the same `A` — every check below is
+    # a round-off comparison against the assembled matrices, not a tolerance.
+    # See MATRIX_FREE_PLAN.md for why it exists (85 GB and 73 h of assembly at
+    # Δz = 10 m on (1600, 1600) that the operator never spends).
+    @testset "matrix-free operator equals the assembled system to round-off" begin
+        set = split_node_stencil_set()
+        for (n1, n23) in ((9, 13), (11, 11))     # non-cubic AND cubic, so axis
+            g_minus, g_plus = sn_grids(n1, n23)  # bookkeeping is exercised
+            A, HP_DSAT, P = split_node_system(g_minus, g_plus, λ_sn, μ_sn, set)
+            op = split_node_operator(g_minus, g_plus, λ_sn, μ_sn, set)
+            @test size(op) == size(A)
+            v = [sin(0.37k) + 0.1cos(1.3k) for k in 1:size(A, 2)]
+            y = similar(v)
+            @test norm(mul!(y, op, v) - A * v) <= 1e-14 * norm(A * v)
+            @test norm(op * v - A * v) <= 1e-14 * norm(A * v)
+            @test norm(hp_dsat!(y, op, v) - HP_DSAT * v) <= 1e-14 * norm(HP_DSAT * v)
+            @test apply_P!(y, op, v) == P * v
+
+            # CG on the operator is CG on A: identical iteration count, and the
+            # displacement agrees to the solve tolerance.
+            χ = build_chi(g_minus, g_plus, (x2, x3) -> (exp(-(x2^2 + x3^2) / 0.1), 0.0))
+            b = HP_DSAT * χ
+            s_op, s_A = CGSolver(op), CGSolver(A)
+            u_op, u_A = split_node_solve(s_op, b), split_node_solve(s_A, b)
+            @test s_op.stats.iterations == s_A.stats.iterations
+            @test norm(u_op - u_A) <= 1e-9 * norm(u_A)
+
+            # duplicate_operator shares everything but scratch: same answer,
+            # distinct buffers (the threaded K build depends on this).
+            op2 = duplicate_operator(op)
+            @test op2.pv !== op.pv && op2.minus === op.minus && op2.SAT === op.SAT
+            @test mul!(similar(v), op2, v) == mul!(y, op, v)
+        end
+    end
+
+    @testset "projection_matrix reproduces the row-loop construction of P" begin
+        # The old construction — `sparse(I)` then `P[r, :] .= 0` per row — is
+        # kept here as the reference the triplet build must match exactly. It
+        # is what `projection_matrix` replaced (DOF^1.7, ~30% of assembly).
+        function old_P(g_minus, g_plus)
+            D = 3
+            Nm, Np = length(g_minus), length(g_plus)
+            Ntot = D * (Nm + Np)
+            bid_minus = CartesianBoundary{1,UpperBoundary}()
+            bid_plus = CartesianBoundary{1,LowerBoundary}()
+            P = sparse(1.0I, Ntot, Ntot)
+            for bid in filter(!=(bid_minus), boundary_identifiers(g_minus)),
+                I in boundary_indices(g_minus, bid), comp in 1:D
+                P[dof_index_minus(g_minus, comp, I), :] .= 0.0
+            end
+            for bid in filter(!=(bid_plus), boundary_identifiers(g_plus)),
+                I in boundary_indices(g_plus, bid), comp in 1:D
+                P[dof_index_plus(g_minus, g_plus, comp, I), :] .= 0.0
+            end
+            for (Im, Ip) in fault_node_pairs(g_minus, g_plus), comp in 1:3
+                rm = dof_index_minus(g_minus, comp, Im)
+                rp = dof_index_plus(g_minus, g_plus, comp, Ip)
+                for r in (rm, rp)
+                    P[r, :] .= 0.0
+                    P[r, rm] = 0.5
+                    P[r, rp] = 0.5
+                end
+            end
+            dropzeros!(P)
+            return P
+        end
+        for (n1, n23) in ((9, 13), (7, 9))
+            g_minus, g_plus = sn_grids(n1, n23)
+            mask, pm, pp = ElasticitySplitNode.projection_parts(g_minus, g_plus)
+            @test ElasticitySplitNode.projection_matrix(mask, pm, pp) == old_P(g_minus, g_plus)
+            # a DOF is never both masked out and paired
+            @test all(==(1.0), mask[pm]) && all(==(1.0), mask[pp])
+        end
     end
 end

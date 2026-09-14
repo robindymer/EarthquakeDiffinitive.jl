@@ -3,18 +3,21 @@
 # One command to produce a BP8-QD-GS submission using a single GPU for the `K`
 # build — the GPU counterpart of `submit_bp8.sh`.
 #
-#   scripts/submit_bp8_gpu.sh <Δz> [L_fault] [L_normal] [gpu_type]
+#   scripts/submit_bp8_gpu.sh <Δz> [L_fault] [L_normal] [gpu_type] [nshards]
 #
 # Submits two chained jobs and returns immediately:
 #
-#   1. the `K` build, one GPU, one job, no shards and no merge
+#   1. the `K` build, one GPU, one job — or, with `nshards`, an array of
+#      `nshards` one-GPU jobs each solving a slice of the D4 representatives,
+#      followed by the merge job from `submit_bp8.sh`
 #   2. the BP8-QD-GS run, which reads that `K` and writes the §4 files
 #
-# WHY TWO JOBS AND NOT THREE. `submit_bp8.sh`'s middle job merges shard files.
-# The GPU build is a single process holding all of `A` on one device, so there
-# is nothing to shard and nothing to merge — it writes the finished cache entry
-# itself. Same cache key as the CPU path, so the two are interchangeable and
-# can even race: whichever writes the entry first satisfies the run.
+# The build is MATRIX-FREE (`SplitNodeOperator`, MATRIX_FREE_PLAN.md): the
+# elastic system is applied from six 1D operators per side, nothing of size
+# `nnz(A)` is assembled on the host or uploaded to the device, and the whole
+# build is CG solves from the first minute. Same cache key as the CPU path, so
+# the two are interchangeable and can even race: whichever writes the entry
+# first satisfies the run.
 #
 # See CLUSTER_RUNBOOK.md "Running it on a GPU instead" for the sizing behind
 # the defaults below.
@@ -56,82 +59,45 @@ DZ="${1:?usage: submit_bp8_gpu.sh <dz> [L_fault] [L_normal] [gpu_type]}"
 
 # Defaults per resolution.
 #
-# DOMAIN. Δz = 10 m defaults to the relaxed (1200, 1200) domain, matching
-# submit_bp8.sh — pass 1600 1200 for the converged one. Both now fit a single
-# GPU, which was not true of the host-memory figures: only `A`, `P`, `T2` and
-# `T3` go to the device, while `HP_DSAT` stays on the host, so the device needs
-# ~28 GB relaxed and ~65 GB converged against ~61/~110 GB of host RAM.
-# PERFORMANCE.md §5 item 0c's fit table sized the device from the host number
-# and wrongly concluded the converged domain fits nothing.
+# DOMAIN. Δz = 10 m defaults to the (1600, 1600) domain — the domain sweep at
+# Δz = 20 m (`scripts/bp8_compare_runs.jl`, 2026-09-14) shows the post-shut-in
+# `V_max` still moving 2-5 % between 1200² and 1600², so (1200, 1200) is not
+# domain-converged and there is no longer a memory reason to prefer it.
 #
 # GPU TYPE. `sinfo` on Pelle:
 #     gpu  gpu:l40s:10(S:0-1)  386000
 #     gpu  gpu:h100:2(S:1)     386000
-# so there are ten 48 GB L40S and only *two* H100. Sizing and speed:
+# Matrix-free, every configuration fits either card with a wide margin, so the
+# choice is purely queue length vs bandwidth (L40S 864 GB/s, H100 NVL 3.9 TB/s):
 #
-#   run                     VRAM    L40S (864 GB/s)   H100 (3.9 TB/s)
-#   Δz = 20 m               ~7 GB   ~4 h              ~1 h
-#   Δz = 10 m relaxed      ~28 GB   ~28 h             ~7 h
-#   Δz = 10 m converged    ~65 GB   does not fit      ~20 h
+#   run                          VRAM    L40S              H100
+#   Δz = 20 m (1600, 1600)      ~1 GB   ~1 h              ~15 min
+#   Δz = 10 m (1150, 1150)      ~3 GB   ~7 h              ~2 h        (assembled path: 40 h measured)
+#   Δz = 10 m (1600, 1600)      ~9 GB   ~1 day            ~5 h
 #
-# Δz = 20 m therefore defaults to an L40S — it fits easily, and with ten cards
-# the queue is far shorter than for the two H100s. Δz = 10 m defaults to an
-# H100 because 28 h on an L40S is uncomfortably close to the 2-day GPU limit
-# once assembly is added, and the converged domain does not fit an L40S at all.
-# Override as the 4th argument if the H100 queue is long.
+# Estimated from the laptop measurements in MATRIX_FREE_PLAN.md scaled by
+# bandwidth; the first Δz = 10 m run on the cluster calibrates them. Ten L40S
+# against two H100 makes the L40S the default everywhere.
 #
-# CORES: 16, and not more, because **assembly is single-threaded** (measured:
-# 100% of one core, not 400% of four). Extra cores do nothing for the phase
-# that turns out to dominate; they are here only for the per-solve host
-# right-hand side. Do not raise this expecting assembly to speed up.
+# CORES: the host does the per-solve right-hand side bookkeeping and the D4
+# orbit fill, nothing heavier; 8 is plenty.
 #
-# TIME: the GPU limit is 2 days, and the budget is assembly + solve. Assembly
-# is NOT the "minutes" PERFORMANCE.md §4c suggests — measured at four sizes it
-# is superlinear with a *rising* exponent (1.02, 1.19, 1.37 across the range),
-# extrapolating to ~2 h at Δz = 20 m and much worse at 10 m. That extrapolation
-# is the least certain number in this script: it is 27x beyond the largest
-# measured point, on different hardware, and the rising exponent means it is a
-# lower bound. **Run Δz = 20 m first** — the build script prints `assembly
-# X.XX h`, which replaces this guess with a measurement before you commit a
-# 47 h H100 allocation.
+# TIME: solve time only — there is no assembly phase any more. 47 h (the GPU
+# partition's 2-day limit) for Δz = 10 m so one job can take (1600, 1600) on an
+# L40S; pass `nshards` to split it across cards instead.
 case "$DZ" in
-  10) DEF_LF=1200; DEF_LN=1200; CORES=16; DEF_GPU=h100; TIME="47:00:00" ;;
-  20) DEF_LF=1600; DEF_LN=1200; CORES=16; DEF_GPU=l40s; TIME="12:00:00" ;;
-  *)  DEF_LF=1600; DEF_LN=1200; CORES=16; DEF_GPU=l40s; TIME="12:00:00" ;;
+  10) DEF_LF=1600; DEF_LN=1600; CORES=8; DEF_GPU=l40s; TIME="47:00:00" ;;
+  20) DEF_LF=1600; DEF_LN=1600; CORES=8; DEF_GPU=l40s; TIME="06:00:00" ;;
+  *)  DEF_LF=1600; DEF_LN=1600; CORES=8; DEF_GPU=l40s; TIME="06:00:00" ;;
 esac
 L_FAULT="${2:-$DEF_LF}"
 L_NORMAL="${3:-$DEF_LN}"
 GPU_TYPE="${4:-$DEF_GPU}"
+NSHARDS="${5:-1}"
 
-# HOST MEMORY is set from the *domain*, not just Δz, because the converged
-# domain needs roughly twice the relaxed one and the difference straddles what
-# a default request would cover.
-#
-# Peak RSS during assembly is **~2x the final `A`+`HP_DSAT`**, not ~1x —
-# measured at four sizes (92 k to 2.77 M DOF), fitting
-# `peak = 2.03 * final + 1.6 GB` to within 0.3 GB at every point. So:
-#
-#   Δz = 20 m converged   final  13 GB -> peak  ~29 GB
-#   Δz = 10 m relaxed     final  61 GB -> peak ~125 GB
-#   Δz = 10 m converged   final 108 GB -> peak ~222 GB
-#
-# GPU nodes have 386 GB, so even the largest fits with room; the point of the
-# table is that sizing from the *final* matrix size would under-request by 2x
-# and OOM during assembly, hours before the GPU is ever touched.
-if [[ "${DZ%.*}" == "10" ]]; then
-    if [[ "${L_FAULT%.*}" -gt 1200 ]]; then MEM=320G; else MEM=200G; fi
-else
-    MEM=64G
-fi
-
-# The converged domain at Δz = 10 m needs ~65 GB and an L40S has 48 GB. The
-# build script checks this too, but only after assembling `A` — catching it
-# here saves hours of host work before a certain failure.
-if [[ "$GPU_TYPE" == "l40s" && "${DZ%.*}" == "10" && "${L_FAULT%.*}" -gt 1200 ]]; then
-    echo "error: Δz = 10 m on the converged (${L_FAULT%.*}, ${L_NORMAL%.*}) domain needs ~65 GB of VRAM;" >&2
-    echo "       an L40S has 48 GB. Use h100, or the relaxed (1200, 1200) domain." >&2
-    exit 1
-fi
+# HOST MEMORY: the dense `K` (86 MB at Δz = 20 m, 1.3 GB at 10 m), a few
+# system-length vectors and the small SAT block. Nothing of size `nnz(A)`.
+MEM=32G
 
 mkdir -p "$REPO/logs"
 mkdir -p "$EQD_STIFFNESS_CACHE" || {
@@ -147,7 +113,7 @@ BP8-QD-GS submission chain (GPU K build)
   repo         $REPO
   dz           $DZ m
   domain       L_fault = $L_FAULT m, L_normal = $L_NORMAL m
-  K build      1x $GPU_TYPE, $CORES cores, $MEM host RAM, walltime $TIME
+  K build      $NSHARDS x $GPU_TYPE, $CORES cores, $MEM host RAM, walltime $TIME each
   K cache      $EQD_STIFFNESS_CACHE  (shared with the CPU path)
   account      $SLURM_ACCOUNT   partition $SLURM_PARTITION_GPU
 EOF
@@ -210,8 +176,7 @@ PRE
 )
 
 # --- 1. build K on the GPU ----------------------------------------------------
-# Threads still matter even though the solves are on the device: the host
-# assembles A and HP_DSAT, and forms every right-hand side.
+if [[ "$NSHARDS" -le 1 ]]; then
 JID_K=$(sbatch --parsable \
   -A "$SLURM_ACCOUNT" -p "$SLURM_PARTITION_GPU" -c "$CORES" --mem="$MEM" \
   --gpus="$GPU_TYPE:1" -t "$TIME" -J "bp8Kgpu_$TAG" \
@@ -223,6 +188,35 @@ julia --project=scripts scripts/build_stiffness_cache_gpu.jl $DZ $L_FAULT $L_NOR
 EOF
 )
 echo "  [1] K build (GPU) job $JID_K"
+JID_DEP="$JID_K"
+else
+# Sharded: an array of one-GPU jobs, then the same merge job the CPU chain
+# uses (`afterany`, so a timed-out shard still gets its missing columns named
+# by the merge's coverage check; a shard whose file exists exits at once, so
+# resubmitting the array re-runs only what is missing).
+JID_K=$(sbatch --parsable \
+  -A "$SLURM_ACCOUNT" -p "$SLURM_PARTITION_GPU" -c "$CORES" --mem="$MEM" \
+  --gpus="$GPU_TYPE:1" -t "$TIME" -J "bp8Kgpu_$TAG" --array="1-$NSHARDS" \
+  -o "$REPO/logs/Kgpu_${TAG}_%A_%a.out" <<EOF
+#!/bin/bash -l
+$PREAMBLE
+$GPU_PREFLIGHT
+julia --project=scripts scripts/build_stiffness_cache_gpu.jl $DZ $L_FAULT $L_NORMAL \$SLURM_ARRAY_TASK_ID $NSHARDS
+EOF
+)
+echo "  [1] K shards (GPU) job $JID_K  (array 1-$NSHARDS)"
+JID_M=$(sbatch --parsable \
+  -A "$SLURM_ACCOUNT" -p "$SLURM_PARTITION_SMALL" -c 4 --mem=16G -t 02:00:00 \
+  -J "bp8M_$TAG" --dependency="afterany:$JID_K" --kill-on-invalid-dep=yes \
+  -o "$REPO/logs/merge_${TAG}_%j.out" <<EOF
+#!/bin/bash -l
+$PREAMBLE
+julia --project=scripts scripts/merge_stiffness_cache.jl $DZ $L_FAULT $L_NORMAL
+EOF
+)
+echo "  [1b] merge        job $JID_M  (after $JID_K)"
+JID_DEP="$JID_M"
+fi
 
 # --- 2. run -------------------------------------------------------------------
 # `afterok`, not `afterany`: there is no merge step to diagnose a partial
@@ -230,7 +224,7 @@ echo "  [1] K build (GPU) job $JID_K"
 # a failed build leaves no file and the run would only fail again, slower.
 JID_R=$(sbatch --parsable \
   -A "$SLURM_ACCOUNT" -p "$SLURM_PARTITION_SMALL" -c 4 --mem=16G -t 04:00:00 \
-  -J "bp8R_$TAG" --dependency="afterok:$JID_K" --kill-on-invalid-dep=yes \
+  -J "bp8R_$TAG" --dependency="afterok:$JID_DEP" --kill-on-invalid-dep=yes \
   -o "$REPO/logs/run_${TAG}_%j.out" <<EOF
 #!/bin/bash -l
 $PREAMBLE
@@ -239,7 +233,7 @@ export BP8_OUTPUT_SUFFIX="$BP8_OUTPUT_SUFFIX"
 julia --project=. scripts/run_bp8.jl gs $DZ $L_FAULT $L_NORMAL exact
 EOF
 )
-echo "  [2] run + outputs job $JID_R  (after $JID_K)"
+echo "  [2] run + outputs job $JID_R  (after $JID_DEP)"
 
 cat <<EOF
 

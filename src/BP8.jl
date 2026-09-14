@@ -227,13 +227,13 @@ safe to assemble a `K` from shards built in separate processes and merge them
 into one cache entry (`merge_stiffness_cache.jl`).
 """
 function build_fault_elasticity(; par::BP8Params, Δz, L_fault, L_normal, n1, n23, set,
-                                verbose=false, solver_kwargs...)
+                                verbose=false, representation=:kronecker, solver_kwargs...)
     g_minus = equidistant_grid((-L_normal, -L_fault, -L_fault), (0.0, L_fault, L_fault), n1, n23, n23)
     g_plus = equidistant_grid((0.0, -L_fault, -L_fault), (L_normal, L_fault, L_fault), n1, n23, n23)
 
     t0 = time()
     fe = FaultElasticity(g_minus, g_plus, lame_lambda(par), par.μ, set;
-                         l_f=par.l_f, solver_kwargs...)
+                         l_f=par.l_f, representation, solver_kwargs...)
     verbose && @info "split-node system ready" seconds = round(time() - t0, digits=1)
     return fe
 end
@@ -246,7 +246,8 @@ end
 # whole cache: assembling the split-node system is ~15 GB and minutes at the
 # Δz = 20 m target (PERFORMANCE.md §4), and a hit has no use for it.
 function stiffness_matrix(; par, Δz, L_fault, L_normal, n1, n23, order, set,
-                          stiffness, cache, cache_dir, verbose, solver_kwargs)
+                          stiffness, cache, cache_dir, verbose, solver_kwargs,
+                          representation=:kronecker)
     cache ∈ (:auto, :read, :refresh, :off) ||
         error("cache must be :auto, :read, :refresh or :off, got $cache")
 
@@ -266,7 +267,7 @@ function stiffness_matrix(; par, Δz, L_fault, L_normal, n1, n23, order, set,
     end
 
     fe = build_fault_elasticity(; par, Δz, L_fault, L_normal, n1, n23, set,
-                                verbose, solver_kwargs...)
+                                verbose, representation, solver_kwargs...)
 
     t0 = time()
     # `symmetry=true` is safe unconditionally here: `build_fault_elasticity`
@@ -353,7 +354,7 @@ returning the wrong `K`; see `StiffnessCache`.
 function build_model(; par::BP8Params=benchmark_parameters(),
                      Δz=par.Δz, L_fault=3par.l_f, L_normal=2par.l_f,
                      injection=:gaussian, order=4, verbose=false,
-                     stiffness=:toeplitz,
+                     stiffness=:toeplitz, representation=:kronecker,
                      cache=:auto, cache_dir=stiffness_cache_dir(),
                      pressure=true, pressure_kwargs=(;),
                      solver_kwargs...)
@@ -371,7 +372,8 @@ function build_model(; par::BP8Params=benchmark_parameters(),
     stiffness ∈ (:exact, :toeplitz) ||
         error("stiffness must be :exact or :toeplitz, got $stiffness")
     K, x2, x3 = stiffness_matrix(; par, Δz, L_fault, L_normal, n1, n23, order, set,
-                                 stiffness, cache, cache_dir, verbose, solver_kwargs)
+                                 stiffness, cache, cache_dir, verbose, solver_kwargs,
+                                 representation)
     nf = length(x2) * length(x3)
     n2f, n3f = length(x2), length(x3)
 

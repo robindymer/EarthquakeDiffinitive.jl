@@ -45,25 +45,21 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 DZ="${1:?usage: submit_bp8.sh <dz> [L_fault] [L_normal] [nshards]}"
 
-# Defaults per resolution. The Δz = 10 m domain is the relaxed (1200, 1200) —
-# ~65 GB per node rather than (1600, 1200)'s ~116 GB, which matters because
-# every shard holds its own copy. That relaxation is an extrapolation from
-# Δz = 25 m, not a measurement at 10 m; pass (1600, 1200) explicitly if you want
-# the conservative domain and have fat nodes.
+# Defaults per resolution.
 #
-# Shard counts are set by *walltime*, not by total compute: ~2730 s per column
-# at Δz = 10 m means ~30 columns fit in 24 h, and 13,122 columns therefore need
-# ~440 tasks. At Δz = 20 m it is ~328 s per column, so 32 tasks is generous.
+# The elastic system is applied MATRIX-FREE (`SplitNodeOperator`,
+# MATRIX_FREE_PLAN.md), so a shard no longer holds a copy of `A`+`HP_DSAT`:
+# memory is the dense `K` slice plus a few system-length vectors, and the
+# hours of assembly per shard are gone. Shard counts are still set by
+# *walltime*: each solve moves ~3x fewer bytes than the CSR mat-vec did, so
+# the per-column figures CLUSTER_RUNBOOK.md quotes (~2730 s at Δz = 10 m) are
+# an upper bound — measure the first shard and resize.
 #
-# CORES/MEM: a shard holds its own copy of `A`+`HP_DSAT`, so memory is the hard
-# requirement — ~15 GB at Δz = 20 m, ~65 GB at Δz = 10 m — and the values below
-# ask for that plus headroom. If the cluster refuses `--mem` (some UPPMAX
-# systems tie memory to core count instead), drop MEM and raise CORES until
-# cores x GB-per-core clears the figure above.
+# Prefer `submit_bp8_gpu.sh`: one L40S does what ~100 of these shards do.
 case "$DZ" in
-  10) DEF_LF=1200; DEF_LN=1200; DEF_SHARDS=440; CORES=16; MEM=96G ;;
-  20) DEF_LF=1600; DEF_LN=1200; DEF_SHARDS=32;  CORES=8;  MEM=24G ;;
-  *)  DEF_LF=1600; DEF_LN=1200; DEF_SHARDS=32;  CORES=8;  MEM=24G ;;
+  10) DEF_LF=1600; DEF_LN=1600; DEF_SHARDS=200; CORES=16; MEM=32G ;;
+  20) DEF_LF=1600; DEF_LN=1600; DEF_SHARDS=16;  CORES=8;  MEM=16G ;;
+  *)  DEF_LF=1600; DEF_LN=1600; DEF_SHARDS=16;  CORES=8;  MEM=16G ;;
 esac
 L_FAULT="${2:-$DEF_LF}"
 L_NORMAL="${3:-$DEF_LN}"

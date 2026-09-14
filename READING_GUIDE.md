@@ -45,7 +45,10 @@ a comment pointing you there, is mostly noise.
 
 1. `PorePressure.jl` + `test/pore_pressure_test.jl`
 2. `Elasticity.jl` + `test/elasticity_test.jl`
-3. `ElasticitySplitNode.jl` + `test/elasticity_split_node_test.jl`
+3. `ElasticitySplitNode.jl` + `test/elasticity_split_node_test.jl` — the
+   assembled `split_node_system` first (it is what the derivations refer to),
+   then `SplitNodeOperator`, the matrix-free form that production uses
+   (`MATRIX_FREE_PLAN.md` for the why)
 4. `RateStateFriction.jl` + `test/rate_state_friction_test.jl`
 5. `FaultResponse.jl` + `test/fault_response_test.jl`
 6. `BP8.jl` + `test/bp8_test.jl`

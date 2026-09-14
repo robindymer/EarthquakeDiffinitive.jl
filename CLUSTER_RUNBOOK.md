@@ -160,10 +160,28 @@ tasks. At Δz = 20 m a column is ~328 s, so 32 tasks is already generous.
 ## Running it on a GPU instead
 
 **One card replaces the whole job array.** `fault_stiffness_gpu`
-(`PERFORMANCE.md` §5 item 0c) holds `A` resident on one device and runs the
-same D4 orbit representatives against it, so there are no shards and no merge —
-two chained jobs instead of three, and the build writes the finished cache
-entry itself.
+(`PERFORMANCE.md` §5 item 0c) runs the same D4 orbit representatives on one
+device, so by default there are no shards and no merge — two chained jobs
+instead of three, and the build writes the finished cache entry itself.
+`submit_bp8_gpu.sh <Δz> [L_fault] [L_normal] [gpu] [nshards]` with `nshards`
+> 1 splits the representatives across an array of one-GPU jobs plus the merge.
+
+**As of 2026-09-14 the elastic system is applied matrix-free**
+(`SplitNodeOperator`, `MATRIX_FREE_PLAN.md`): nothing of size `nnz(A)` is
+assembled on the host or uploaded. The "Sizing", "Assembly" and "Two things
+that had to be fixed" subsections below describe the **assembled** path
+(`representation=:assembled`), which is retained for validation only. What
+matters now:
+
+| | Δz = 20 m (1600,1600) | Δz = 10 m (1150,1150) | Δz = 10 m (1600,1600) |
+|---|---|---|---|
+| DOF | 12.6 M | 37 M | 100 M |
+| VRAM | ~1 GB | ~3 GB | ~9 GB |
+| host RAM | < 4 GB | < 8 GB | < 12 GB |
+| assembly | none (seconds) | none (was 17.5 h) | none (would have been ~73 h) |
+| solve, L40S (est.) | ~1 h | ~7 h (was 23 h) | ~1 day |
+
+Every configuration fits an L40S; `submit_bp8_gpu.sh` defaults to one.
 
 ### One-time setup, on top of the CPU setup above
 

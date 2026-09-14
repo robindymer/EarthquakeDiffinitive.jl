@@ -29,11 +29,35 @@ if get(ENV, "EQD_TEST_GPU", "") == "1"
             @test solver_report(fe_gpu.rs).solves == solver_report(fe_cpu.rs).solves
             @test all(<(0), diag(K_gpu))
 
+            # Sharded GPU build reassembles the full one exactly (same solves,
+            # same columns), through `merge_stiffness_shards`' contract.
+            nshards = 3
+            covered = Int[]
+            K_sh = zeros(size(K_cpu))
+            for sh in 1:nshards
+                fe_s = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.6)
+                cols, Kc = fault_stiffness_gpu(fe_s; shard=sh, nshards)
+                append!(covered, cols)
+                K_sh[:, cols] .= Kc
+            end
+            @test sort(covered) == 1:size(K_cpu, 2)
+            # Not `==`: device reductions (cuSPARSE, CG dot products) are not
+            # bitwise reproducible between runs, and CG at rtol=1e-10 turns
+            # last-bit differences into ~1e-10 in the solution.
+            @test K_sh ≈ K_gpu rtol = 1e-8
+
+            # The assembled representation goes through the same GPU path
+            # (CSR upload) and must give the same K.
+            fe_asm = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.6, representation=:assembled)
+            @test fault_stiffness_gpu(fe_asm) ≈ K_cpu rtol = 1e-8
+
             # precond=:jacobi is explicitly unsupported on the GPU path (untested
-            # there) — must error, not silently ignore the keyword.
+            # there) — must error, not silently ignore the keyword. (Only the
+            # assembled representation can even construct it.)
             set2 = fr_stencil_set()
             gmj, gpj = fr_grids(13; L=1.2)
-            fe_jacobi = FaultElasticity(gmj, gpj, λ_fr, μ_fr, set2; l_f=0.6, precond=:jacobi)
+            fe_jacobi = FaultElasticity(gmj, gpj, λ_fr, μ_fr, set2; l_f=0.6, precond=:jacobi,
+                                        representation=:assembled)
             @test_throws ErrorException fault_stiffness_gpu(fe_jacobi)
         end
     end

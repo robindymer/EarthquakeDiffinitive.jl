@@ -98,10 +98,11 @@ stand.
 
 ### The two things standing between here and a Δz = 10 m submission
 
-1. **[ ] Memory: ~65 GB for `A`+`HP_DSAT`.** The 15 GB workstation cannot hold
-   it. This is now the *only* blocker for BP8-GS, and it is a single-node
-   requirement — `:toeplitz` removed the multi-node one. The `K` build itself is
-   ~1-4 days (extrapolation spread; `DOF^1.56` vs `DOF^1.80` bracket it).
+1. **[x] Memory: ~65 GB for `A`+`HP_DSAT`.** Gone (2026-09-14): the elastic
+   system is applied matrix-free (`SplitNodeOperator`, `MATRIX_FREE_PLAN.md`),
+   so `A` is never formed — ~9 GB of device memory and no assembly even at
+   Δz = 10 m on (1600, 1600). Remaining: calibrate the ~1 day/L40S estimate
+   with the first cluster build, then run (1600, 1600) at Δz = 10 m.
 2. **[x] BP8-PW is stiffness-bound — RESOLVED 2026-09-12.** `run_bp8` now
    defaults BP8-PW to `QNDF` with an analytic block-diagonal Jacobian
    (`BP8.state_jacobian!`): 1,105 steps / 20 s at Δz = 25 m against Tsit5's

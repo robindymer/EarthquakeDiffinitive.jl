@@ -432,6 +432,30 @@ the experiments live in a scratch environment.
 Against `:toeplitz`'s 578 → 10 solves (~58× on the dominant term), preconditioning
 offers ~1×. That is what returned the project to finishing the Toeplitz build.
 
+## 7. Matrix-free: `A` is never formed (2026-09-14)
+
+Supersedes every memory and assembly figure above for the production path.
+`SplitNodeOperator` applies `A = -H P (D+SAT) P` from the 1D SBP operators
+(Diffinitive's 3D `D1`/`D2` on an equidistant `TensorGrid` are exact Kronecker
+products, measured `max|diff| = 0.0`), `P` as a mask plus fault-pair list, and
+the boundary-local `SAT` as the small sparse matrix it is. Agreement with the
+assembled `A` is round-off (3e-16 on `A v`; identical CG iteration counts; `K`
+to CG tolerance). Measured on a laptop RTX 2000 Ada against cuSPARSE CSR at its
+bandwidth roofline:
+
+| DOF | CSR SpMV | matrix-free | speedup | device memory |
+|---|---|---|---|---|
+| 634 k | 1.52 ms | 0.81 ms | 1.9× | 0.33 → 0.03 GB |
+| 1.2 M | 3.00 ms | 1.33 ms | 2.25× | 0.64 → 0.06 GB |
+| 4.9 M | 13.4 ms | 5.9 ms | 2.27× | 2.69 → 0.22 GB |
+
+and the assembly it replaces (same sizes): 197 s, 422 s, **3149 s**, of which
+sparsifying the lazy `D` was 40-69% and the `P[r,:] .= 0` CSC row loops 27-59%
+(DOF^1.75). The assembled path keeps the operator-based `P` construction and
+lost that term. A fused single-kernel stencil was measured *slower* (0.5× the
+axis-pass) on Ada-class GPUs — FP64 at 1/64 rate makes it FLOP-bound — and is
+not used. Full account, plan and status: `MATRIX_FREE_PLAN.md`.
+
 ## 5. Where the time goes, and what to attack
 
 At any converged resolution, `fault_stiffness` is ~98% of the cost. Assembly is

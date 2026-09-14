@@ -254,4 +254,33 @@ const FE_K = fault_stiffness(FE)
         @test solver_report(fe_t.rs).solves == 10
         @test solver_report(fe_e.rs).solves == 2nf
     end
+
+    # `representation=:kronecker` (the default) and `:assembled` are the same
+    # operator to round-off (elasticity_split_node_test.jl), so the K they
+    # produce must agree to CG tolerance — through every build path, since
+    # they all go through `shear_traction!` and its `apply_P!`/`hp_dsat!`.
+    @testset "matrix-free and assembled representations give the same K" begin
+        set = fr_stencil_set()
+        gm, gp = fr_grids(11)
+        fe_k = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.4)
+        fe_a = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.4, representation=:assembled)
+        @test fe_k.op isa SplitNodeOperator
+        @test fe_a.op isa AssembledSplitNode
+        K_k = fault_stiffness(fe_k; threaded=false)
+        K_a = fault_stiffness(fe_a; threaded=false)
+        @test K_k ≈ K_a rtol = 1e-9
+        # Same work to within a few iterations: the two summation orders differ
+        # in the last bits, which occasionally moves a solve across the 1e-10
+        # stopping test one iteration either way (measured 5432 vs 5436 over
+        # 50 solves).
+        it_k, it_a = solver_report(fe_k.rs).iterations, solver_report(fe_a.rs).iterations
+        @test abs(it_k - it_a) <= 0.01 * it_a
+        # D4 build too (it is the production path)
+        K_k4 = fault_stiffness(FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.4); symmetry=true)
+        @test K_k4 ≈ K_a rtol = 1e-9
+        # Jacobi needs diag(A): refused matrix-free, still available assembled.
+        @test_throws ErrorException FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.4, precond=:jacobi)
+        fe_j = FaultElasticity(gm, gp, λ_fr, μ_fr, set; l_f=0.4, precond=:jacobi, representation=:assembled)
+        @test fault_stiffness(fe_j; threaded=false) ≈ K_a rtol = 1e-8
+    end
 end
