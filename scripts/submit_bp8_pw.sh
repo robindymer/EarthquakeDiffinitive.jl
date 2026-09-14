@@ -34,7 +34,7 @@ set -euo pipefail
 SLURM_ACCOUNT="uppmax2026-1-45"
 SLURM_PARTITION="pelle"
 # CHECK: same storage as submit_bp8.sh / submit_bp8_gpu.sh. NOT $HOME.
-EQD_STIFFNESS_CACHE="/proj/efficient_elastic/efficient_elastic/nobackup/temp/EarthquakeDiffinitive.jl/eqd-stiffness"
+EQD_STIFFNESS_CACHE="/proj/efficient_elastic/efficient_elastic/nobackup/EarthquakeDiffinitive.jl/eqd-stiffness"
 JULIA_MODULE="Julia/1.11.3-linux-x86_64"
 BP8_MODELER="Robin Dymér"
 # Appended to the output directory name so this run never overwrites another
