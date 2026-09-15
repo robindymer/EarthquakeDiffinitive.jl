@@ -140,6 +140,7 @@ output      %s
      shard === nothing ? "none (whole K in one job)" : "$shard of $nshards (D4 representatives $shard:$nshards:end)",
      CUDA.name(CUDA.device()), vram_total() / 2^30,
      vram_free() / 2^30, path)
+flush(stdout)
 
 if isfile(path)
     println("\nalready written — nothing to do (delete the file to rebuild it)")
@@ -154,13 +155,16 @@ end
 need = (7 + 2 + 5 / 3) * Ntot * 8 * 1.10
 free0 = vram_free()
 @printf("VRAM        ~%.1f GB needed (vectors + SAT), %.1f GB free\n", need / 2^30, free0 / 2^30)
+flush(stdout)
 need < free0 || error("""
     this configuration needs ~$(round(need / 2^30, digits=1)) GB of VRAM but only \
     $(round(free0 / 2^30, digits=1)) GB is free on $(CUDA.name(CUDA.device())).""")
 
 t0 = time()
 fe = build_fault_elasticity(; par, Δz, L_fault, L_normal, n1, n23, set, verbose=true)
+flush(stdout)
 @printf("operator    built in %.1f s (matrix-free; no assembly)\n", time() - t0)
+flush(stdout)
 
 x2, x3 = collect.(fault_grid_axes(fe))
 if shard === nothing
@@ -175,4 +179,5 @@ rep = elastic_solver_report(fe)
 @printf("\ndone in %.2f h → %s (%.1f MB)\nsolves %d, mean CG iterations %.0f, unconverged %d\n",
         (time() - t0) / 3600, path, filesize(path) / 2^20,
         rep.solves, rep.iterations / max(rep.solves, 1), rep.unconverged)
+flush(stdout)
 rep.unconverged == 0 || error("$(rep.unconverged) solve(s) did not converge — K is not trustworthy")
