@@ -3,7 +3,7 @@
 # One command to produce a BP8-QD-GS submission using a single GPU for the `K`
 # build — the GPU counterpart of `submit_bp8.sh`.
 #
-#   scripts/submit_bp8_gpu.sh <Δz> [L_fault] [L_normal] [gpu_type] [nshards]
+#   scripts/submit_bp8_gpu.sh <Δz> [L_fault] [L_normal] [gpu_type] [nshards] [walltime]
 #
 # Submits two chained jobs and returns immediately:
 #
@@ -29,7 +29,7 @@ SLURM_PARTITION_GPU="gpu"            # confirmed present: l40s:10 and h100:2
 SLURM_PARTITION_SMALL="pelle"        # the run: a few cores, minutes
 
 # CHECK: same storage as submit_bp8.sh. NOT $HOME.
-EQD_STIFFNESS_CACHE="/proj/efficient_elastic/efficient_elastic/nobackup/EarthquakeDiffinitive.jl/eqd-stiffness"
+EQD_STIFFNESS_CACHE="/proj/efficient_elastic/efficient_elastic/nobackup/GPU/EarthquakeDiffinitive.jl/eqd-stiffness"
 
 JULIA_MODULE="Julia/1.11.3-linux-x86_64"
 BP8_MODELER="Robin Dymér"
@@ -55,7 +55,7 @@ export EQD_STIFFNESS_CACHE BP8_MODELER BP8_OUTPUT_SUFFIX
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-DZ="${1:?usage: submit_bp8_gpu.sh <dz> [L_fault] [L_normal] [gpu_type]}"
+DZ="${1:?usage: submit_bp8_gpu.sh <dz> [L_fault] [L_normal] [gpu_type] [nshards] [walltime]}"
 
 # Defaults per resolution.
 #
@@ -77,23 +77,60 @@ DZ="${1:?usage: submit_bp8_gpu.sh <dz> [L_fault] [L_normal] [gpu_type]}"
 #
 # Estimated from the laptop measurements in MATRIX_FREE_PLAN.md scaled by
 # bandwidth; the first Δz = 10 m run on the cluster calibrates them. Ten L40S
-# against two H100 makes the L40S the default everywhere.
+# against two H100 makes the L40S the default everywhere — and since an L40S
+# job is short enough to backfill, it will usually *start* sooner too.
 #
 # CORES: the host does the per-solve right-hand side bookkeeping and the D4
 # orbit fill, nothing heavier; 8 is plenty.
 #
-# TIME: solve time only — there is no assembly phase any more. 47 h (the GPU
-# partition's 2-day limit) for Δz = 10 m so one job can take (1600, 1600) on an
-# L40S; pass `nshards` to split it across cards instead.
+# EST_H is the estimated *solve* time in hours for the whole build on one L40S
+# — there is no assembly phase any more, so this is the whole job. It is what
+# the walltime is derived from below, and the only thing to update once the
+# cluster has measured a real figure.
 case "$DZ" in
-  10) DEF_LF=1600; DEF_LN=1600; CORES=8; DEF_GPU=l40s; TIME="47:00:00" ;;
-  20) DEF_LF=1600; DEF_LN=1600; CORES=8; DEF_GPU=l40s; TIME="06:00:00" ;;
-  *)  DEF_LF=1600; DEF_LN=1600; CORES=8; DEF_GPU=l40s; TIME="06:00:00" ;;
+  10) DEF_LF=1600; DEF_LN=1600; CORES=8; DEF_GPU=l40s ;;
+  *)  DEF_LF=1600; DEF_LN=1600; CORES=8; DEF_GPU=l40s ;;
 esac
 L_FAULT="${2:-$DEF_LF}"
 L_NORMAL="${3:-$DEF_LN}"
 GPU_TYPE="${4:-$DEF_GPU}"
 NSHARDS="${5:-1}"
+
+if [[ "${DZ%.*}" == "10" ]]; then
+    if [[ "${L_FAULT%.*}" -gt 1200 ]]; then EST_H=21; else EST_H=7; fi
+else
+    EST_H=1
+fi
+# An H100 NVL has 4.5x an L40S's bandwidth and the build is bandwidth-bound, but
+# only 3x is claimed here: the estimates themselves are unmeasured, and there
+# are only two H100s, so the walltime that gets the job *started* matters more
+# than shaving the last hour off the request.
+[[ "$GPU_TYPE" == "h100" ]] && EST_H=$(( (EST_H + 2) / 3 ))
+
+# WALLTIME IS DERIVED, NOT FIXED PER RESOLUTION, for two reasons that both cost
+# queue time when got wrong:
+#
+#  1. **A 47 h request queues far worse than a 12 h one.** SLURM backfills short
+#     jobs into gaps ahead of long ones, so asking for the partition maximum
+#     "to be safe" can cost more waiting than the job takes to run. A Δz = 10 m
+#     (1150, 1150) build is ~7 h — asking 47 h for it is pure queue penalty.
+#  2. **A shard does 1/nshards of the work**, so with `nshards` the per-job
+#     walltime must shrink too. Handing every array task the whole build's
+#     walltime is the same mistake, multiplied.
+#
+# So: 2x the estimate (the estimates are scaled from laptop measurements and
+# have not been checked on an L40S yet), divided across the shards, floored at
+# 2 h so a small build still has room to precompile, capped at the partition's
+# 47 h. Override with the 6th argument when the estimate is wrong — the one
+# number to trust more than this arithmetic is a previous log's `done in X h`.
+if [[ -n "${6:-}" ]]; then
+    TIME="$6"
+else
+    TIME_H=$(( (2 * EST_H + NSHARDS - 1) / NSHARDS ))
+    [[ "$TIME_H" -lt 2 ]] && TIME_H=2
+    [[ "$TIME_H" -gt 47 ]] && TIME_H=47
+    TIME=$(printf '%02d:00:00' "$TIME_H")
+fi
 
 # HOST MEMORY: the dense `K` (86 MB at Δz = 20 m, 1.3 GB at 10 m), a few
 # system-length vectors and the small SAT block. Nothing of size `nnz(A)`.
@@ -114,6 +151,7 @@ BP8-QD-GS submission chain (GPU K build)
   dz           $DZ m
   domain       L_fault = $L_FAULT m, L_normal = $L_NORMAL m
   K build      $NSHARDS x $GPU_TYPE, $CORES cores, $MEM host RAM, walltime $TIME each
+               (estimate ${EST_H} h total on one L40S; override walltime with the 6th argument)
   K cache      $EQD_STIFFNESS_CACHE  (shared with the CPU path)
   account      $SLURM_ACCOUNT   partition $SLURM_PARTITION_GPU
 EOF

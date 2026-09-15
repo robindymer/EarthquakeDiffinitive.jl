@@ -246,11 +246,13 @@ agreeing to 1e-16.
 **Still to do on the cluster**: rerun Δz = 10 m (1150, 1150) on an L40S and
 compare against the 40.4 h in `logs/Kgpu_dz10_Lf1150_Ln1150_6713776.out`
 (expected ~7 h) — that calibrates the (1600, 1600) estimate before it is
-queued.
+queued. `submit_bp8_gpu.sh` derives its walltime request from `EST_H`, so
+that measurement is the one number to update there afterwards.
 
-**9. Production.** `scripts/submit_bp8_gpu.sh 10 1600 1600` (one L40S, ~1 day)
-or `… 10 1600 1600 l40s 4` (four shards, ~6 h each), then `run_bp8.jl gs/pw`
-against the cache entry as today. Then the domain question from the compare
+**9. Production.** `scripts/submit_bp8_gpu.sh 10 1600 1600` (one L40S, ~1 day,
+requests 42 h) or `… 10 1600 1600 l40s 4` (four shards, 11 h each — usually
+*starts* sooner, since SLURM backfills short jobs ahead of long ones), then
+`run_bp8.jl gs/pw` against the cache entry as today. Then the domain question from the compare
 script is answered directly instead of extrapolated.
 
 ## Risks and what bounds them

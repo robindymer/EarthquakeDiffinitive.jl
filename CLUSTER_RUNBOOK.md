@@ -183,6 +183,20 @@ matters now:
 
 Every configuration fits an L40S; `submit_bp8_gpu.sh` defaults to one.
 
+**Walltime is derived, not fixed.** The script requests `2 x EST_H / nshards`
+(floor 2 h, cap 47 h, `EST_H` the table above), because a 47 h request queues
+far worse than a 12 h one — SLURM backfills short jobs into gaps ahead of long
+ones — and because an array task does `1/nshards` of the work. So
+
+    scripts/submit_bp8_gpu.sh 10 1150 1150          ->  14 h requested
+    scripts/submit_bp8_gpu.sh 10 1600 1600          ->  42 h
+    scripts/submit_bp8_gpu.sh 10 1600 1600 l40s 4   ->  11 h per shard
+    scripts/submit_bp8_gpu.sh 10 1600 1600 h100     ->  14 h
+
+Sharding is therefore the way to *start* sooner as well as finish sooner. Pass
+a 6th argument (`… l40s 1 30:00:00`) to override; a previous log's `done in X h`
+beats the built-in estimate, which is scaled from laptop measurements.
+
 ### One-time setup, on top of the CPU setup above
 
 ```bash
