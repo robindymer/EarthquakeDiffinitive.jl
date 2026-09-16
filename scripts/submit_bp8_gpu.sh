@@ -70,15 +70,24 @@ DZ="${1:?usage: submit_bp8_gpu.sh <dz> [L_fault] [L_normal] [gpu_type] [nshards]
 # Matrix-free, every configuration fits either card with a wide margin, so the
 # choice is purely queue length vs bandwidth (L40S 864 GB/s, H100 NVL 3.9 TB/s):
 #
-#   run                          VRAM    L40S              H100
-#   Δz = 20 m (1600, 1600)      ~1 GB   ~1 h              ~15 min
-#   Δz = 10 m (1150, 1150)      ~3 GB   ~7 h              ~2 h        (assembled path: 40 h measured)
-#   Δz = 10 m (1600, 1600)      ~9 GB   ~1 day            ~5 h
+#   run                          VRAM    L40S                H100
+#   Δz = 20 m (1600, 1600)      ~1 GB   ~1.5 h (extrap.)   ~30 min
+#   Δz = 10 m (1150, 1150)      ~3 GB   **11.89 h measured** ~4 h (extrap.)  (assembled path: 40.4 h measured)
+#   Δz = 10 m (1600, 1600)      ~9 GB   ~32 h (extrap.)     ~11 h (extrap.)
 #
-# Estimated from the laptop measurements in MATRIX_FREE_PLAN.md scaled by
-# bandwidth; the first Δz = 10 m run on the cluster calibrates them. Ten L40S
-# against two H100 makes the L40S the default everywhere — and since an L40S
-# job is short enough to backfill, it will usually *start* sooner too.
+# Calibrated 2026-09-16 from the one real cluster figure above
+# (Kgpu_dz10_Lf1150_Ln1150_6839867.out, L40S, matrix-free): grid DOF scales
+# almost exactly as (L_fault/Δz)^3 (measured ratio 1.1354 for 1150->1200 m at
+# Δz=10, predicted (1200/1150)^3=1.1362), representative count as 1/Δz^2 (Ω_f
+# is the physical fault patch, independent of the padding domain — 1681 at
+# Δz=10 vs 441 at Δz=20 m is 3.81x, matching (20/10)^2=4x), and mean CG
+# iterations move only mildly with Δz (1194 at Δz=10 vs 951 at Δz=20 m,
+# 1150-1800 m domains). Multiplying those factors through calibrates every
+# other cell in the table to within the same laptop-scaled assumption used
+# before, now anchored to one cluster measurement instead of zero. **Still
+# extrapolated for every cell but the one in bold** — the (1600, 1600) row is
+# the production target and has not itself been measured; treat 32 h as
+# central, not a ceiling, and shard it (see EST_H below).
 #
 # CORES: the host does the per-solve right-hand side bookkeeping and the D4
 # orbit fill, nothing heavier; 8 is plenty.
@@ -97,9 +106,15 @@ GPU_TYPE="${4:-$DEF_GPU}"
 NSHARDS="${5:-1}"
 
 if [[ "${DZ%.*}" == "10" ]]; then
-    if [[ "${L_FAULT%.*}" -gt 1200 ]]; then EST_H=21; else EST_H=7; fi
+    # 12 h: the measured 11.89 h (1150, 1150) rounded up.
+    # 32 h: (1600/1150)^3 = 2.69x that measurement — extrapolated, not
+    # measured; the L_FAULT > 1200 bucket still needs its own calibration run.
+    if [[ "${L_FAULT%.*}" -gt 1200 ]]; then EST_H=32; else EST_H=12; fi
 else
-    EST_H=1
+    # 2 h: ~1.2 h at (1800, 1800) falls out of the same scaling relation
+    # applied backwards from the Δz=10 measurement, rounded up for the domain
+    # sweep going past 1800 m (~2.2 h extrapolated at 2200 m).
+    EST_H=2
 fi
 # An H100 NVL has 4.5x an L40S's bandwidth and the build is bandwidth-bound, but
 # only 3x is claimed here: the estimates themselves are unmeasured, and there
