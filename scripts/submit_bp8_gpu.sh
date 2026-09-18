@@ -55,6 +55,8 @@ export EQD_STIFFNESS_CACHE BP8_MODELER BP8_OUTPUT_SUFFIX
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+error_exit() { echo "error: $*" >&2; exit 1; }
+
 DZ="${1:?usage: submit_bp8_gpu.sh <dz> [L_fault] [L_normal] [gpu_type] [nshards] [walltime]}"
 
 # Defaults per resolution.
@@ -103,7 +105,22 @@ esac
 L_FAULT="${2:-$DEF_LF}"
 L_NORMAL="${3:-$DEF_LN}"
 GPU_TYPE="${4:-$DEF_GPU}"
-NSHARDS="${5:-1}"
+# `nshards` accepts `N` or `N%C`: N independent shards, at most C of them
+# running at once (SLURM's own `--array=1-N%C` throttle). The two are separate
+# concerns and conflating them is what makes sharding look antisocial — N sets
+# how small each task is (and so how easily it backfills), C sets how much of
+# the partition you occupy. Pelle has ten L40S, so `8%2` is eight ~5 h tasks
+# that never hold more than two cards: friendlier than one 47 h job, and it
+# starts sooner.
+NSHARDS_SPEC="${5:-1}"
+NSHARDS="${NSHARDS_SPEC%%\%*}"          # count, for sizing the walltime
+NSHARDS_CONC="${NSHARDS_SPEC#*%}"       # concurrency cap, or == NSHARDS_SPEC if absent
+[[ "$NSHARDS" =~ ^[0-9]+$ ]] ||
+    error_exit "nshards must be N or N%C with integer N, got '$NSHARDS_SPEC'"
+if [[ "$NSHARDS_CONC" != "$NSHARDS_SPEC" ]]; then
+    [[ "$NSHARDS_CONC" =~ ^[0-9]+$ ]] ||
+        error_exit "nshards concurrency must be an integer, got '$NSHARDS_SPEC'"
+fi
 
 # EST_H scales from a MEASURED anchor per resolution, by DOF — not a per-domain
 # constant. A single constant for every `L_fault > 1200` under-sizes the larger
@@ -184,7 +201,7 @@ BP8-QD-GS submission chain (GPU K build)
   repo         $REPO
   dz           $DZ m
   domain       L_fault = $L_FAULT m, L_normal = $L_NORMAL m
-  K build      $NSHARDS x $GPU_TYPE, $CORES cores, $MEM host RAM, walltime $TIME each
+  K build      $NSHARDS x $GPU_TYPE$([[ "$NSHARDS_CONC" != "$NSHARDS_SPEC" ]] && echo " (max $NSHARDS_CONC at once)"), $CORES cores, $MEM host RAM, walltime $TIME each
                (estimate ${EST_H} h total on one L40S; override walltime with the 6th argument)
   K cache      $EQD_STIFFNESS_CACHE  (shared with the CPU path)
   account      $SLURM_ACCOUNT   partition $SLURM_PARTITION_GPU
@@ -268,7 +285,7 @@ else
 # resubmitting the array re-runs only what is missing).
 JID_K=$(sbatch --parsable \
   -A "$SLURM_ACCOUNT" -p "$SLURM_PARTITION_GPU" -c "$CORES" --mem="$MEM" \
-  --gpus="$GPU_TYPE:1" -t "$TIME" -J "bp8Kgpu_$TAG" --array="1-$NSHARDS" \
+  --gpus="$GPU_TYPE:1" -t "$TIME" -J "bp8Kgpu_$TAG" --array="1-$NSHARDS_SPEC" \
   -o "$REPO/logs/Kgpu_${TAG}_%A_%a.out" <<EOF
 #!/bin/bash -l
 $PREAMBLE
@@ -276,7 +293,7 @@ $GPU_PREFLIGHT
 julia --project=scripts scripts/build_stiffness_cache_gpu.jl $DZ $L_FAULT $L_NORMAL \$SLURM_ARRAY_TASK_ID $NSHARDS
 EOF
 )
-echo "  [1] K shards (GPU) job $JID_K  (array 1-$NSHARDS)"
+echo "  [1] K shards (GPU) job $JID_K  (array 1-$NSHARDS_SPEC)"
 JID_M=$(sbatch --parsable \
   -A "$SLURM_ACCOUNT" -p "$SLURM_PARTITION_SMALL" -c 4 --mem=16G -t 02:00:00 \
   -J "bp8M_$TAG" --dependency="afterany:$JID_K" --kill-on-invalid-dep=yes \
