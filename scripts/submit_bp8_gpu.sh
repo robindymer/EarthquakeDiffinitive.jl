@@ -105,22 +105,39 @@ L_NORMAL="${3:-$DEF_LN}"
 GPU_TYPE="${4:-$DEF_GPU}"
 NSHARDS="${5:-1}"
 
-if [[ "${DZ%.*}" == "10" ]]; then
-    # 12 h: the measured 11.89 h (1150, 1150) rounded up.
-    # 32 h: (1600/1150)^3 = 2.69x that measurement — extrapolated, not
-    # measured; the L_FAULT > 1200 bucket still needs its own calibration run.
-    if [[ "${L_FAULT%.*}" -gt 1200 ]]; then EST_H=32; else EST_H=12; fi
-else
-    # 2 h: ~1.2 h at (1800, 1800) falls out of the same scaling relation
-    # applied backwards from the Δz=10 measurement, rounded up for the domain
-    # sweep going past 1800 m (~2.2 h extrapolated at 2200 m).
-    EST_H=2
-fi
+# EST_H scales from a MEASURED anchor per resolution, by DOF — not a per-domain
+# constant. A single constant for every `L_fault > 1200` under-sizes the larger
+# domains badly: it gave 2000^2 the same 32 h as 1600^2, so a 4-way shard asked
+# 16 h per task for ~23 h of work and would have been killed with nothing
+# written (job 6861315, cancelled).
+#
+# Anchors, both measured on an L40S on this matrix-free path:
+#   Δz = 10 m  11.89 h at 37.1 M DOF  (1150, 1150)  Kgpu_dz10_Lf1150_Ln1150_6839867.out
+#   Δz = 20 m   1.79 h at 24.5 M DOF  (2000, 2000)  Kgpu_dz20_Lf2000_Ln2000_6857776.out
+# Separate anchors per Δz because the *number* of solves is set by Δz alone
+# (441 at 20 m, 1681 at 10 m — Ω_f is a fixed 400 m patch), while DOF is set by
+# the domain; one global law cannot carry both.
+#
+# Exponent 1.2, not 1.0: cost is DOF x iterations, and mean CG iterations climb
+# with domain size too — 665 -> 858 from (1200,1200) to (1600,1600) at Δz = 20 m,
+# and 730 -> 1042 across the new 7.1 M -> 24.5 M sweep. Checked back against the
+# four Δz = 20 m measurements it predicts 0.41/0.53/0.98/1.79 h against 0.33/
+# 0.43/0.80/1.79 measured — 10-25% high, which is the safe direction for a
+# walltime request.
+case "${DZ%.*}" in
+  10) DOF_REF=37139256; T_REF=11.89 ;;
+  *)  DOF_REF=24483006; T_REF=1.79  ;;
+esac
+DZI="${DZ%.*}"; LFI="${L_FAULT%.*}"; LNI="${L_NORMAL%.*}"
+N1=$(( LNI / DZI + 1 )); N23=$(( 2 * LFI / DZI + 1 ))
+DOF=$(( 6 * N1 * N23 * N23 ))
+EST_H=$(LC_ALL=C awk -v t="$T_REF" -v d="$DOF" -v r="$DOF_REF" 'BEGIN{printf "%.1f", t*(d/r)^1.2}')
+
 # An H100 NVL has 4.5x an L40S's bandwidth and the build is bandwidth-bound, but
 # only 3x is claimed here: the estimates themselves are unmeasured, and there
 # are only two H100s, so the walltime that gets the job *started* matters more
 # than shaving the last hour off the request.
-[[ "$GPU_TYPE" == "h100" ]] && EST_H=$(( (EST_H + 2) / 3 ))
+[[ "$GPU_TYPE" == "h100" ]] && EST_H=$(LC_ALL=C awk -v e="$EST_H" 'BEGIN{printf "%.1f", e/3}')
 
 # WALLTIME IS DERIVED, NOT FIXED PER RESOLUTION, for two reasons that both cost
 # queue time when got wrong:
@@ -141,10 +158,12 @@ fi
 if [[ -n "${6:-}" ]]; then
     TIME="$6"
 else
-    TIME_H=$(( (2 * EST_H + NSHARDS - 1) / NSHARDS ))
-    [[ "$TIME_H" -lt 2 ]] && TIME_H=2
-    [[ "$TIME_H" -gt 47 ]] && TIME_H=47
+    TIME_H=$(LC_ALL=C awk -v e="$EST_H" -v n="$NSHARDS" \
+        'BEGIN{h=2*e/n; h=int(h)+(h>int(h)); if(h<2)h=2; if(h>47)h=47; printf "%d", h}')
     TIME=$(printf '%02d:00:00' "$TIME_H")
+    # A request pinned at the 47 h cap means the estimate exceeds what one task
+    # can finish — more shards, not a longer request.
+    [[ "$TIME_H" -eq 47 ]] && echo "  warning: estimate ${EST_H}h/task exceeds the 47h cap — raise nshards" >&2
 fi
 
 # HOST MEMORY: the dense `K` (86 MB at Δz = 20 m, 1.3 GB at 10 m), a few
