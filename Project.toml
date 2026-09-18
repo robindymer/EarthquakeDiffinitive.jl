@@ -18,7 +18,7 @@ Tokens = "040c2ec2-8d69-4aca-bf03-7d3a7092f2f6"
 Diffinitive = {rev = "92d842cf1b9a137aa4952b59ad959abf588ba855", url = "https://github.com/Diffinitive/Diffinitive"}
 
 [compat]
-Dates = "1.11.0"
+Dates = "1.11.0, 1.10"
 Diffinitive = "0.1.8"
 ForwardDiff = "1.4.5"
 Krylov = "0.10.9"
