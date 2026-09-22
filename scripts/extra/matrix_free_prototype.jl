@@ -1,5 +1,5 @@
 # Matrix-free (Kronecker 1D-operator) prototype of the split-node system A = -H P (D+SAT) P.
-#   julia --project=scripts scripts/matrix_free_prototype.jl <Δz> <L_fault> <L_normal> [gpu]
+#   julia --project=scripts scripts/extra/matrix_free_prototype.jl <Δz> <L_fault> <L_normal> [gpu]
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.BP8
 using EarthquakeDiffinitive.BP8: BP8Params, lame_lambda, fault_grid_sizes

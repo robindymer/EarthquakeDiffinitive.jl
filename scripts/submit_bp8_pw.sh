@@ -20,7 +20,7 @@
 # the benchmark at any Δz measured, so the expected cost is minutes to an
 # hour — the same order as GS. The default walltime is padded because the
 # Δz = 10 m number has not been measured yet; watch the progress bar in the
-# log and record the actual figure in TODO.md item 2.
+# log and record the actual figure in TODO.md.
 #
 # The code on the cluster must include the implicit integrator (commit after
 # 2026-09-12), and both environments need re-resolving once, because

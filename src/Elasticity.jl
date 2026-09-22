@@ -11,22 +11,14 @@ using StaticArrays
 export elastic_operator, elastic_blocks, traction_blocks,
        flatten, unflatten, dof_index, inject_dirichlet!
 
-# ==============================================================================
-# Constant-coefficient isotropic elastic (Navier) operator, adapted from
-# context/notebooks/elastic.jl's variable-coefficient IsotropicElasticOperator.
+# Constant-coefficient isotropic Navier operator, adapted from
+# context/notebooks/elastic.jl's variable-coefficient version.
 #
-# The λ (Hessian-of-divergence) terms ALWAYS use the "wide" sandwich form
-# Dᵢ∘Dⱼ (composed first derivatives), including the diagonal i=j entries —
-# this is not just a variable-coefficient necessity: the notebook's own
-# comment is explicit that the diagonal must stay wide "to avoid dispersion
-# errors" between the λ- and μ-driven parts of the operator, and that holds
-# for constant coefficients too. Only μ's *diagonal* (same-direction, i=j)
-# term gets the compact "narrow" native `second_derivative` — it's a
-# genuinely separate physical piece (the shear-Laplacian term), not part of
-# the λ Hessian structure, so there's nothing to stay consistent with.
-# μ's off-diagonal terms have no narrow equivalent (no mixed-partial SBP
-# operator exists) and use the same wide sandwich as λ.
-# ==============================================================================
+# Wide/narrow split: all λ terms use the wide sandwich Dᵢ∘Dⱼ, diagonal included,
+# to avoid dispersion errors against the μ part. Only μ's diagonal (i=j) term
+# uses the narrow native `second_derivative` — it is the shear-Laplacian piece,
+# not part of the λ Hessian. μ's off-diagonal terms have no narrow equivalent
+# (no mixed-partial SBP operator) and go wide too.
 
 struct IsotropicElasticOperator{D,TL<:NTuple{D,NTuple{D,LazyTensor{D,D}}},TM<:NTuple{D,NTuple{D,LazyTensor{D,D}}}} <: LazyTensor{D,D}
     lambda::TL   # lambda[i][j] = λ*(Dᵢ∘Dⱼ), for all i,j
@@ -37,9 +29,9 @@ end
 """
     isotropic_lambda_mu(g, λ, μ, stencil_set)
 
-Builds the `D×D` tuples of λ- and μ-weighted second-derivative operators
-(see module notes above for the wide/narrow split) used by both
-`elastic_operator` and `elastic_blocks`.
+The `D×D` tuples of λ- and μ-weighted second-derivative operators used by
+both `elastic_operator` and `elastic_blocks`. Wide/narrow split: see the
+module header.
 """
 function isotropic_lambda_mu(g, λ, μ, stencil_set)
     D = ndims(g)
@@ -91,10 +83,9 @@ end
 LazyTensors.range_size(op::IsotropicElasticOperator) = op.size
 LazyTensors.domain_size(op::IsotropicElasticOperator) = op.size
 
-# General D-dimensional apply, kept as a correctness reference (mirrors
-# elastic.jl's general case) — allocates due to Julia/Diffinitive inference
-# limitations on the generic `ntuple`+loop form (documented in the notebook
-# as a known issue), which is why the 3D case below is hand-specialized.
+# General D-dimensional apply, kept as a correctness reference. Allocates —
+# inference cannot handle the generic `ntuple`+loop form, hence the
+# hand-specialized 2D/3D cases below.
 function LazyTensors.apply(op::IsotropicElasticOperator{D}, u::AbstractArray{Tu,D}, I...) where {D,Tu}
     S = eltype(Tu)
     return ntuple(Val(D)) do j
@@ -111,8 +102,7 @@ function LazyTensors.apply(op::IsotropicElasticOperator{D}, u::AbstractArray{Tu,
     end |> SVector
 end
 
-# Non-allocating specialized 3D apply (this project is always 3D), directly
-# mirroring elastic.jl's hand-unrolled 3D specialization.
+# Non-allocating 3D apply — the case this project always runs.
 @inline function LazyTensors.apply(op::IsotropicElasticOperator{3}, u::AbstractArray{Tu,3}, I...) where Tu
     u1 = componentview(u, 1)
     u2 = componentview(u, 2)
@@ -142,8 +132,7 @@ end
     return SVector{3,eltype(Tu)}(res1, res2, res3)
 end
 
-# Non-allocating specialized 2D apply, mirroring elastic.jl's 2D
-# specialization (used e.g. for 2D elastic wave simulations).
+# Non-allocating 2D apply, for 2D elastic wave simulations.
 @inline function LazyTensors.apply(op::IsotropicElasticOperator{2}, u::AbstractArray{Tu,2}, I...) where Tu
     u1 = componentview(u, 1)
     u2 = componentview(u, 2)
@@ -171,26 +160,22 @@ component `τᵢ = σᵢ,dim` (with respect to the fixed `+dim` axis direction,
 `dim = grid_id(bid)` — NOT the outward-normal sign convention) on boundary
 `bid` is `τᵢ = Σₖ T[i,k]*uₖ`.
 
-**The normal-direction μ derivatives use the boundary derivative, not
-`first_derivative`**, mirroring `context/notebooks/elastic_clean.jl`'s
-`IsotropicTractionOperator`. This is required for `T` to be the operator that
-appears in `elastic_blocks`' own discrete SBP identity, i.e. for
+**Normal-direction μ derivatives use the boundary derivative, not
+`first_derivative`.** This is what makes `T` the operator in `elastic_blocks`'
+own discrete SBP identity,
 
     (v, Eu)_Ω - (Ev, u)_Ω = (v, Tu)_∂Ω - (Tv, u)_∂Ω
 
-to hold — see the `"SBP property: E and T are compatible"` test. The reason is
-that the two schemes' SBP identities carry *different* boundary operators:
-`H·D₂ = -D₁ᵀHD₁ - R + e'Hᵧ·D̂` for the narrow `second_derivative`, versus
-`H·D₁∘D₁ = -D₁ᵀHD₁ + e'Hᵧ·(e∘D₁)` for the wide sandwich. So λ terms and μ's
-*tangential* terms pair with `e∘first_derivative`, while μ's normal-direction
-terms — which come from the narrow operators (`laplace` and `second_derivative`
-in `elastic_blocks`) — pair with `D̂`. Using `first_derivative` throughout left
-`-HP(D+SAT)P` ~14% asymmetric and made CG unusable; see `SYMMETRIC_SAT.md` for
-the full diagnosis and `scripts/symmetry_decomposition.jl` to reproduce it.
+(test `"SBP property: E and T are compatible"`). The narrow and wide schemes
+carry different boundary operators — `H·D₂ = -D₁ᵀHD₁ - R + e'Hᵧ·D̂` versus
+`H·D₁∘D₁ = -D₁ᵀHD₁ + e'Hᵧ·(e∘D₁)` — so λ terms and μ's tangential terms pair
+with `e∘first_derivative` while μ's normal terms pair with `D̂`. Using
+`first_derivative` throughout left `-HP(D+SAT)P` ~14% asymmetric and CG
+unusable: `SYMMETRIC_SAT.md`, reproduced by
+`scripts/extra/symmetry_decomposition.jl`.
 
-`D̂ = s·normal_derivative`, undoing Diffinitive's outward sign to get the
-fixed-`+dim`-axis convention used here. (`Grids._boundary_sign` is private
-Diffinitive API; the notebook uses it the same way.)
+`D̂ = s·normal_derivative` undoes Diffinitive's outward sign for the fixed
+`+dim`-axis convention used here (`Grids._boundary_sign` is private API).
 """
 function traction_blocks(g, λ, μ, stencil_set, bid)
     D = ndims(g)
@@ -220,9 +205,7 @@ function traction_blocks(g, λ, μ, stencil_set, bid)
     return T
 end
 
-# ==============================================================================
-# Vector-valued grid function <-> flat component-major vector utilities.
-# ==============================================================================
+# Vector-valued grid function <-> flat component-major vector.
 
 """
     dof_index(g, component, I::CartesianIndex)
@@ -236,8 +219,7 @@ dof_index(g, component, I::CartesianIndex) = (component - 1) * length(g) + Linea
     flatten(u::AbstractArray{<:SVector{D}})
 
 Flattens a `D`-component vector-valued grid function into a component-major
-vector of length `D*length(u)`, matching `dof_index`/`halfspace_system`'s
-ordering.
+vector of length `D*length(u)`, in `dof_index` ordering.
 """
 function flatten(u::AbstractArray{<:SVector{D}}) where D
     N = length(u)
@@ -251,8 +233,7 @@ end
 """
     unflatten(v::AbstractVector, g, D)
 
-Inverse of `flatten`: reshapes a component-major flat vector back into a
-`D`-component vector-valued grid function on `g`.
+Inverse of `flatten`.
 """
 function unflatten(v::AbstractVector, g, D)
     li = LinearIndices(size(g))
@@ -266,8 +247,8 @@ end
     inject_dirichlet!(A, rhs, rows, values)
 
 Strongly enforces `rhs[rows] .= values` by zeroing those rows of `A` and
-setting the diagonal to `1` (no Diffinitive helper exists for this — it's
-only needed for strong/injection boundary conditions, not SAT).
+setting the diagonal to `1`. Only needed for strong/injection boundary
+conditions, not SAT, so Diffinitive has no helper for it.
 """
 function inject_dirichlet!(A::SparseMatrixCSC, rhs::AbstractVector, rows, values)
     for (r, v) in zip(rows, values)

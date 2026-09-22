@@ -19,38 +19,30 @@ export split_node_system, dof_index_minus, dof_index_plus, build_chi,
        CGSolver, CG_DEFAULTS, split_node_solve, jacobi_preconditioner,
        solver_report, duplicate, merge_stats!
 
-# ==============================================================================
-# Two-sided (split-node) SBP-SAT elastic system, matching the formulation in
-# context/SEAS_benchmark.pdf:
+# Two-sided (split-node) SBP-SAT elastic system, per context/SEAS_benchmark.pdf:
 #
 #   -H P (D + SAT) P u = H P (D + SAT) χ(s)
 #
-# D: block-diagonal elastic operator (Elasticity.elastic_blocks, unchanged,
-#    on each side's own grid).
-# SAT: interface traction coupling — the usual scalar Neumann-SAT pattern
-#    penalty = -H⁻¹∘e'∘Hᵧ, but with the scalar normal-derivative operator
-#    replaced by the traction operator, and "data" being the OTHER side's
-#    traction. See the sign discussion in `split_node_system`.
-# P: projection — averages ALL THREE fault DOF pairs (u1 too: that is how the
-#    no-opening condition u1(0⁺)=u1(0⁻), BP8 eq. 3, gets imposed), zeroes
-#    far-field DOFs, identity elsewhere.
-# χ(s): forcing vector encoding the prescribed slip, ±s_j/2 at the fault.
+# D    block-diagonal elastic operator (`Elasticity.elastic_blocks`) per side.
+# SAT  interface traction coupling: the scalar Neumann-SAT pattern with penalty
+#      -H⁻¹∘e'∘Hᵧ, the normal derivative replaced by the traction operator, and
+#      "data" the other side's traction. Signs: see `split_node_system`.
+# P    averages all three fault DOF pairs (u1 too — that is how no-opening,
+#      BP8 eq. 3, is imposed), zeroes far-field DOFs, identity elsewhere.
+# χ(s) prescribed slip, ±s_j/2 at the fault.
 #
-# DOF layout (flat vector of length 3*(N₋+N₊)): component-major within each
-# side, sides concatenated as [u₋ (3N₋) ; u₊ (3N₊)] — see dof_index_minus/
-# dof_index_plus.
-# ==============================================================================
+# DOF layout (length 3*(N₋+N₊)): component-major within a side, sides
+# concatenated [u₋ ; u₊]. See `dof_index_minus`/`dof_index_plus`.
 
 dof_index_minus(g_minus, component, I) = (component - 1) * length(g_minus) + LinearIndices(size(g_minus))[I]
 dof_index_plus(g_minus, g_plus, component, I) = 3 * length(g_minus) + (component - 1) * length(g_plus) + LinearIndices(size(g_plus))[I]
 
 _to_sparse_matrix(M) = reduce(vcat, [reduce(hcat, [sparse(M[j][k]) for k in 1:length(M)]) for j in 1:length(M)])
 
-# Appends block `B`'s stored entries to the (I,J,V) triplet lists, shifted so
-# that B[1,1] lands at (row0+1, col0+1). Lets `SATmat` be built in one
-# `sparse(I,J,V,…)` call instead of repeated `SATmat[rows,cols] .+= B`, which
-# rewrites the whole CSC structure each time and made assembly quadratic
-# (199× slower by n=21). See `PERFORMANCE.md` §2.2.
+# Appends `B`'s stored entries to the (I,J,V) lists with B[1,1] at
+# (row0+1, col0+1), so `SATmat` needs one `sparse(I,J,V,…)` call. Repeated
+# `SATmat[rows,cols] .+= B` rewrites the CSC structure each time and made
+# assembly quadratic (199× slower by n=21) — `PERFORMANCE.md` §2.2.
 function _append_block!(I, J, V, B::AbstractSparseMatrix, row0, col0)
     rows = rowvals(B)
     vals = nonzeros(B)
@@ -73,17 +65,14 @@ end
 """
     fault_node_pairs(g_minus, g_plus)
 
-Pairs of `(I_minus, I_plus)` full-grid `CartesianIndex`es on the two grids'
-fault-facing boundaries that share the same `(x2,x3)` location, matched by
-coordinate value (robust to any difference in `boundary_indices` iteration
-order between the two grids).
+Pairs of `(I_minus, I_plus)` `CartesianIndex`es on the two fault-facing
+boundaries sharing an `(x2,x3)` location, matched by coordinate value so the
+two grids' `boundary_indices` order does not matter.
 
-Nodes that lie on a far-field boundary as well as on the fault — the ring
-where the fault plane meets the truncated domain's sides — are **excluded**:
-those carry the far-field Dirichlet condition `u=0` (which the reference note
-applies to all of `j=1,2,3`), so they must be neither averaged by `P` nor
-given slip by `χ`. Physically consistent too: they sit outside the frictional
-domain `Ω_f`, where BP8 eq. 13 gives zero slip anyway.
+The ring where the fault meets the truncated domain's sides is **excluded**:
+those nodes carry the far-field Dirichlet `u=0` for all three components, so
+they must be neither averaged by `P` nor given slip by `χ`. They also sit
+outside `Ω_f`, where BP8 eq. 13 gives zero slip anyway.
 """
 function fault_node_pairs(g_minus, g_plus)
     bid_minus = CartesianBoundary{1,UpperBoundary}()
@@ -98,11 +87,10 @@ end
 """
     sat_matrix(g_minus, g_plus, λ, μ, stencil_set) -> SparseMatrixCSC
 
-The interface SAT block of the split-node system, `Ntot × Ntot`, half-weighted
-on both sides — see the sign discussion in [`split_node_system`](@ref). It is
-boundary-local (nonzeros only in the rows of the few node layers the SAT
-prolongation reaches), so it is cheap to assemble and small to store, which is
-why the matrix-free [`SplitNodeOperator`](@ref) keeps it as a sparse matrix.
+The interface SAT block, `Ntot × Ntot`, half-weighted on both sides — signs in
+[`split_node_system`](@ref). Boundary-local (nonzeros only in the few node
+layers the prolongation reaches), hence cheap to assemble and small enough for
+the matrix-free [`SplitNodeOperator`](@ref) to keep as a sparse matrix.
 """
 function sat_matrix(g_minus, g_plus, λ, μ, stencil_set)
     D = 3
@@ -115,10 +103,8 @@ function sat_matrix(g_minus, g_plus, λ, μ, stencil_set)
     Prolong_p = _prolongation(g_plus, stencil_set, bid_plus)
     Prolong_m = _prolongation(g_minus, stencil_set, bid_minus)
 
-    # Accumulated as triplets and assembled in one `sparse` call — see
-    # `_append_block!` for why the obvious `SATmat[rows, cols] .+= …` form is
-    # not used. Column offset 0 addresses the `-` side's block, `D*Nm` the `+`
-    # side's.
+    # Triplets, assembled in one `sparse` call (see `_append_block!`). Column
+    # offset 0 is the `-` side's block, `D*Nm` the `+` side's.
     Isat, Jsat, Vsat = Int[], Int[], Float64[]
     for j in 1:D
         row0_m = (j-1) * Nm
@@ -140,17 +126,15 @@ end
 """
     projection_parts(g_minus, g_plus) -> (mask, pm, pp)
 
-The projection `P` as data rather than a matrix: `mask[r]` is `0.0` on every
-far-field DOF (rows `P` zeroes) and `1.0` elsewhere; `(pm[k], pp[k])` are the
-`-`/`+` side DOFs of the `k`-th averaged fault pair, for all three components
-(`u1` too — averaging it IS the no-opening condition `u1(0⁺)=u1(0⁻)`, BP8
-eq. 3; leaving it unaveraged decouples the two fault-normal DOFs entirely).
-Pairs on the fault ∩ far-field ring are excluded by `fault_node_pairs`, so a
-DOF is never both masked and paired.
+`P` as data rather than a matrix: `mask[r]` is `0.0` on far-field DOFs and
+`1.0` elsewhere; `(pm[k], pp[k])` are the `-`/`+` DOFs of the `k`-th averaged
+fault pair, all three components (averaging `u1` *is* no-opening, BP8 eq. 3;
+leaving it unaveraged decouples the fault-normal DOFs). `fault_node_pairs`
+excludes the fault ∩ far-field ring, so no DOF is both masked and paired.
 
-`P v` is then `mask .* v` with `v[pm]` and `v[pp]` both replaced by their mean —
-[`apply_P!`](@ref) — and [`projection_matrix`](@ref) builds the explicit
-matrix from the same data, so the two are identical by construction.
+`P v` is `mask .* v` with `v[pm]`, `v[pp]` replaced by their mean
+([`apply_P!`](@ref)). [`projection_matrix`](@ref) builds the explicit matrix
+from the same data, so the two agree by construction.
 """
 function projection_parts(g_minus, g_plus)
     D = 3
@@ -178,11 +162,10 @@ end
 """
     projection_matrix(mask, pm, pp) -> SparseMatrixCSC
 
-The explicit `P` from [`projection_parts`](@ref), assembled from triplets in
-one `sparse` call. The previous construction — `sparse(I)` followed by
-`P[r, :] .= 0.0` for every far-field row — rewrote the CSC structure once per
-row and scaled as DOF^1.7 (52 s at 634 k DOF, 158 s at 1.2 M, ~27-37% of the
-whole assembly). This is linear and gives the same matrix.
+The explicit `P` from [`projection_parts`](@ref), from triplets in one
+`sparse` call. The old `sparse(I)` + per-row `P[r, :] .= 0.0` form rewrote the
+CSC structure once per row and scaled as DOF^1.7 (~27-37% of assembly at 1.2 M
+DOF). Same matrix, linear cost.
 """
 function projection_matrix(mask, pm, pp)
     Ntot = length(mask)
@@ -220,42 +203,32 @@ function split_node_system(g_minus, g_plus, λ, μ, stencil_set)
     bid_plus = CartesianBoundary{1,LowerBoundary}()
 
     # ---- D: block-diagonal elastic operator ----
-    # Assembled here. Applying Diffinitive's *lazy* composition instead was
-    # measured 41-67× slower than `mul!` (`PERFORMANCE.md` §1); the matrix-free
-    # route that does work is `SplitNodeOperator` below, which applies the same
-    # `D` as Kronecker products of the 1D operators — see `MATRIX_FREE_PLAN.md`.
-    # This sparsification is ~60-70% of the assembly time at production size.
+    # Assembled, not lazy: Diffinitive's lazy composition measured 41-67× slower
+    # than `mul!` (`PERFORMANCE.md` §1). The matrix-free route that does work is
+    # `SplitNodeOperator` below. This sparsification is ~60-70% of assembly time.
     Dm = _to_sparse_matrix(elastic_blocks(g_minus, λ, μ, stencil_set))
     Dp = _to_sparse_matrix(elastic_blocks(g_plus, λ, μ, stencil_set))
     Dmat = blockdiag(Dm, Dp)
 
-    # ---- SAT: interface traction coupling, half-weighted on both sides.
-    # (The note also allows applying it fully to one side only; that
-    # produced an asymmetric, non-PSD system empirically, so using the
-    # symmetric half-on-both-sides construction instead.)
+    # ---- SAT: interface traction coupling, half-weighted on both sides ----
+    # The benchmark also allows applying it fully to one side; that measured
+    # asymmetric and non-PSD, so both sides get half.
     #
-    # SIGNS. The Neumann/traction SAT `-H⁻¹∘e'∘Hᵧ ∘ (t_out - data)` is written
-    # in terms of the OUTWARD-normal traction: in Diffinitive's own
-    # `sat_tensors(::NeumannCondition)` the penalty prefactor `-H⁻¹∘e'∘Hᵧ` is
-    # side-independent and all of the side-dependence lives in
-    # `normal_derivative`'s outward sign. `traction_blocks` is deliberately
-    # fixed-`+x₁`-axis, so t_out = +T on `g_minus` (whose fault is its UPPER
-    # boundary, outward = +x₁) but t_out = -T on `g_plus` (LOWER boundary,
-    # outward = -x₁). The data is the other side's outward traction negated,
-    # since traction balance across the interface (BP8 eq. 6) reads
-    # t_out⁻ + t_out⁺ = 0. Both sides therefore penalize the same fixed-axis
-    # difference (τ₋ - τ₊), but the `+` side carries an extra overall minus
-    # from its outward normal. Getting this wrong leaves the shear tractions
-    # discontinuous and inflates the solution by orders of magnitude.
+    # SIGNS. `-H⁻¹∘e'∘Hᵧ ∘ (t_out - data)` is in terms of the OUTWARD traction,
+    # and `traction_blocks` is fixed-`+x₁`-axis: t_out = +T on `g_minus` (fault
+    # is its upper boundary) and -T on `g_plus`. The data is the other side's
+    # outward traction negated, since traction balance (BP8 eq. 6) is
+    # t_out⁻ + t_out⁺ = 0. So both sides penalize the same (τ₋ - τ₊) and the `+`
+    # side carries one extra minus. Wrong signs leave the shear tractions
+    # discontinuous and inflate the solution by orders of magnitude.
     SATmat = sat_matrix(g_minus, g_plus, λ, μ, stencil_set)
 
     DSAT = Dmat + SATmat
 
-    # ---- P: projection (average tangential fault DOFs, zero far-field) ----
-    # An explicit matrix here because `A` is being assembled; a *lazy* `P` would
-    # force `A` into a composite that measured 1.66× slower per mat-vec
-    # (`PERFORMANCE.md` §1). The matrix-free operator instead applies `P` from
-    # the same `(mask, pm, pp)` data directly — `apply_P!`, no matrix at all.
+    # ---- P: projection (average fault DOF pairs, zero far-field) ----
+    # Explicit because `A` is being assembled: a lazy `P` forces `A` into a
+    # composite, 1.66× slower per mat-vec (`PERFORMANCE.md` §1). The matrix-free
+    # operator applies the same `(mask, pm, pp)` data directly via `apply_P!`.
     P = projection_matrix(projection_parts(g_minus, g_plus)...)
 
     # ---- H: block-diagonal volume inner product (for symmetrization) ----
@@ -272,9 +245,8 @@ end
 """
     build_chi(g_minus, g_plus, slip_fn)
 
-Builds `χ(s)`: zero everywhere except the fault, zero for `u1`, and
-`±slip_fn(x2,x3)/2` for `u2,u3` on the +/- sides, per
-`context/SEAS_benchmark.pdf`. `slip_fn(x2,x3) -> (s2,s3)`.
+`χ(s)`: zero except on the fault, zero for `u1`, and `±slip_fn(x2,x3)/2` for
+`u2,u3` on the +/- sides. `slip_fn(x2,x3) -> (s2,s3)`.
 """
 function build_chi(g_minus, g_plus, slip_fn)
     Nm, Np = length(g_minus), length(g_plus)
@@ -293,53 +265,45 @@ end
 """
     reconstruct_U(P, u, χ)
 
-The true displacement field `U = P*u + χ`; tractions must be computed from
-`U`, not the raw solve variable `u` (per `context/SEAS_benchmark.pdf`).
+The true displacement field `U = P*u + χ`. Tractions must come from `U`, not
+the raw solve variable `u`.
 """
 reconstruct_U(P, u, χ) = P * u + χ
 
-# ==============================================================================
-# Matrix-free split-node operator.
+# Matrix-free split-node operator. This is the production path.
 #
-# On an equidistant `TensorGrid` Diffinitive's 3D `D1`/`D2` are *exactly*
-# Kronecker products of the 1D operators (measured `max|diff| = 0.0`,
-# `scripts/matrix_free_prototype.jl`), so the whole Navier block operator on
-# one side is six small `n×n` 1D matrices plus the 1D inner-product weights.
-# `A v = -H P (D + SAT) P v` is then applied as
+# On an equidistant `TensorGrid` Diffinitive's 3D `D1`/`D2` are exactly
+# Kronecker products of the 1D operators (`max|diff| = 0.0`), so one side's
+# Navier operator is six `n×n` 1D matrices plus the 1D weights.
+# `A v = -H P (D + SAT) P v` is applied as
 #
-#   P            mask + pair averaging            (`apply_P!`)
-#   D            18 axis passes per side           (`navier!` / `axpass!`)
-#   SAT          the small boundary-local sparse   (`sat_matrix`)
-#   H            Kronecker weights h1[i]h2[j]h3[k]  (`scale_H!`)
+#   P     mask + pair averaging              (`apply_P!`)
+#   D     18 axis passes per side            (`navier!` / `axpass!`)
+#   SAT   the boundary-local sparse block    (`sat_matrix`)
+#   H     Kronecker weights h1[i]h2[j]h3[k]  (`scale_H!`)
 #
-# Nothing of size `nnz(A)` is ever formed. At Δz = 10 m on (1600, 1600) that
-# removes ~85 GB of device memory, ~73 h of host assembly and ~3× of memory
-# traffic per mat-vec (~530 B/point against ~1590 B/point for the CSR SpMV).
-# Results agree with the assembled `A` to round-off (3e-16 on `A v`, identical
-# CG iteration counts). See `MATRIX_FREE_PLAN.md`.
+# Nothing of size `nnz(A)` is formed. At Δz = 10 m on (1600, 1600) that saves
+# ~85 GB of device memory, ~73 h of host assembly and ~3× the memory traffic
+# per mat-vec. Agrees with the assembled `A` to 3e-16 with identical CG
+# iteration counts. See `MATRIX_FREE_PLAN.md`.
 #
 # The Navier block, arranged to minimise passes, with `w_k = D1_k u_k`:
 #
-#   out_j = μ Σ_i D2_i u_j + μ D2_j u_j + D1_j[(λ+μ) div − μ w_j],   div = Σ_k w_k
+#   out_j = μ Σ_i D2_i u_j + μ D2_j u_j + D1_j[(λ+μ) div − μ w_j],  div = Σ_k w_k
 #
-# — the wide `λ D1_j∘D1_j` and `(λ+μ) D1_j∘D1_k` sandwiches of `elastic_blocks`
-# folded into one `D1_j` pass over a combined field. Same operator, term for
-# term; only the summation order differs.
+# — `elastic_blocks`' wide sandwiches folded into one `D1_j` pass over a
+# combined field. Same operator term for term, different summation order.
 #
-# All fields are passed as flat vectors plus an offset (`u[off + i + (j-1)n1 +
-# (k-1)n1n2]`) rather than as reshaped views, so the very same `mul!` runs on
-# `Vector` and, through the CUDA extension's `axpass!`/`scale_H!` methods, on
-# `CuVector`, with no array wrappers in either kernel.
-# ==============================================================================
+# Fields are flat vectors plus an offset, not reshaped views, so one `mul!`
+# runs on `Vector` and (via the CUDA extension's `axpass!`/`scale_H!`) on
+# `CuVector` with no array wrappers.
 
 """
     Rows1D(M::SparseMatrixCSC) -> Rows1D
 
-A 1D SBP operator stored **by rows** (CSR: `rowptr`, `colind`, `val`), which is
-the access pattern an axis pass needs: output point `r` along the axis reads
-row `r`. Interior stencil and boundary closures are just different rows, so a
-pass needs no special-casing. Index vectors are `Int` on the host and `Int32`
-on the device (see the CUDA extension).
+A 1D SBP operator stored by rows (CSR), the access pattern an axis pass needs:
+output point `r` reads row `r`, so interior stencil and boundary closures need
+no special-casing. Index vectors are `Int` on the host, `Int32` on the device.
 """
 struct Rows1D{VI<:AbstractVector{<:Integer},VV<:AbstractVector{Float64}}
     n::Int
@@ -356,9 +320,9 @@ end
 """
     SideOps
 
-One elastic half-space of the split-node system: its grid size, the three 1D
-first- and second-derivative operators and the three 1D inner-product weight
-vectors. `H` on this side is `h[1][i] * h[2][j] * h[3][k]`.
+One half-space: grid size, the three 1D first- and second-derivative
+operators, and the three 1D inner-product weight vectors. `H` on this side is
+`h[1][i] * h[2][j] * h[3][k]`.
 """
 struct SideOps{R<:Rows1D,VV<:AbstractVector{Float64}}
     n::NTuple{3,Int}
@@ -367,8 +331,8 @@ struct SideOps{R<:Rows1D,VV<:AbstractVector{Float64}}
     h::NTuple{3,VV}
 end
 function SideOps(g, stencil_set)
-    # The TensorGrid's 1D factor grids, axis order = index order — the same field
-    # Diffinitive's own `first_derivative(::TensorGrid, set, dim)` inflates from.
+    # The TensorGrid's 1D factor grids, axis order = index order — the field
+    # Diffinitive's `first_derivative(::TensorGrid, set, dim)` inflates from.
     gs = g.grids
     d1 = ntuple(d -> Rows1D(sparse(first_derivative(gs[d], stencil_set))), 3)
     d2 = ntuple(d -> Rows1D(sparse(second_derivative(gs[d], stencil_set))), 3)
@@ -380,15 +344,15 @@ Base.length(s::SideOps) = prod(s.n)
 """
     SplitNodeOperator
 
-`A = -H P (D + SAT) P` applied matrix-free — see the module notes above. Holds
-the two sides' 1D operators, `P` as `(mask, pm, pp)` from
-[`projection_parts`](@ref), the sparse SAT block, and the scratch vectors one
-mat-vec needs, so `mul!` allocates nothing. Scratch makes an operator
-**stateful per call**: two solves must not share one instance concurrently —
-[`duplicate_operator`](@ref) gives a copy with its own scratch and everything
-else shared, and `duplicate(::CGSolver)` uses it.
+`A = -H P (D + SAT) P` applied matrix-free (see the notes above). Holds both
+sides' 1D operators, `P` as `(mask, pm, pp)`, the sparse SAT block, and the
+scratch one mat-vec needs, so `mul!` allocates nothing.
 
-Build with [`split_node_operator`](@ref); use with `mul!`, [`apply_P!`](@ref),
+That scratch makes the operator **stateful per call**: two solves must not
+share an instance concurrently. [`duplicate_operator`](@ref) gives a copy with
+its own scratch and everything else shared; `duplicate(::CGSolver)` uses it.
+
+Build with [`split_node_operator`](@ref); use via `mul!`, [`apply_P!`](@ref),
 [`hp_dsat!`](@ref), or hand it to [`CGSolver`](@ref) like a matrix.
 """
 struct SplitNodeOperator{S<:SideOps,VV<:AbstractVector{Float64},VI<:AbstractVector{<:Integer},TS}
@@ -414,8 +378,8 @@ end
     split_node_operator(g_minus, g_plus, λ, μ, stencil_set) -> SplitNodeOperator
 
 The matrix-free counterpart of [`split_node_system`](@ref): the same `A`,
-`HP_DSAT` and `P` as functions rather than matrices. Takes seconds (the SAT block dominates) where
-the assembly takes hours, and holds no `nnz(A)`-sized data.
+`HP_DSAT` and `P` as functions rather than matrices. Seconds to build (the SAT
+block dominates) where assembly takes hours, and holds no `nnz(A)`-sized data.
 """
 function split_node_operator(g_minus, g_plus, λ, μ, stencil_set)
     minus = SideOps(g_minus, stencil_set)
@@ -452,9 +416,9 @@ LinearAlgebra.ishermitian(::SplitNodeOperator) = true
 """
     axpass!(out, off_out, M::Rows1D, u, off_u, n, d, α)
 
-`out[off_out + p] += α * (M applied along axis d of u[off_u + …])[p]` for the
-`n = (n1,n2,n3)` field stored column-major at those offsets. The host version;
-the CUDA extension adds the `CuVector` method with the same signature.
+`out[off_out + p] += α * (M along axis d of u[off_u + …])[p]` for the
+`n = (n1,n2,n3)` field stored column-major at those offsets. The CUDA
+extension adds the `CuVector` method with the same signature.
 """
 function axpass!(out::Vector{Float64}, off_out::Int, M::Rows1D, u::Vector{Float64}, off_u::Int,
                  n::NTuple{3,Int}, d::Int, α::Float64)
@@ -507,8 +471,8 @@ end
     scale_H!(y, off, side::SideOps, α)
 
 `y[off + (i,j,k)] *= α * h1[i] h2[j] h3[k]` over one side's three components
-(`3 * length(side)` entries from `off`). Host version; the CUDA extension adds
-the `CuVector` method.
+(`3 * length(side)` entries from `off`). The CUDA extension adds the
+`CuVector` method.
 """
 function scale_H!(y::Vector{Float64}, off::Int, side::SideOps{<:Any,Vector{Float64}}, α::Float64)
     n1, n2, n3 = side.n
@@ -554,8 +518,8 @@ end
 """
     apply_P!(y, op, v) -> y
 
-`y = P v`: far-field DOFs zeroed, each fault pair replaced by its mean. Works
-on host and device vectors alike (broadcast, gather, scatter).
+`y = P v`: far-field DOFs zeroed, each fault pair replaced by its mean.
+Broadcast/gather/scatter only, so it runs on host and device vectors alike.
 """
 function apply_P!(y::AbstractVector, op::SplitNodeOperator, v::AbstractVector)
     y .= op.mask .* v
@@ -599,9 +563,9 @@ Base.:*(op::SplitNodeOperator, v::AbstractVector) = mul!(similar(v, op.Ntot), op
 """
     AssembledSplitNode(A, HP_DSAT, P)
 
-The three matrices of [`split_node_system`](@ref) behind the same interface as
-[`SplitNodeOperator`](@ref) (`mul!`, [`apply_P!`](@ref), [`hp_dsat!`](@ref)),
-so `FaultElasticity` can be built either way and the two compared.
+[`split_node_system`](@ref)'s three matrices behind the same interface as
+[`SplitNodeOperator`](@ref), so `FaultElasticity` can be built either way and
+the two compared.
 """
 struct AssembledSplitNode{TA,TH,TP}
     A::TA
@@ -619,16 +583,14 @@ Base.:*(w::AssembledSplitNode, v::AbstractVector) = w.A * v
 apply_P!(y::AbstractVector, w::AssembledSplitNode, v::AbstractVector) = mul!(y, w.P, v)
 hp_dsat!(y::AbstractVector, w::AssembledSplitNode, x::AbstractVector) = mul!(y, w.HP_DSAT, x)
 
-# ==============================================================================
 # Iterative solver: CG straight onto the singular A.
-# ==============================================================================
 
 """
     CGStats
 
-Running totals across every solve a [`CGSolver`](@ref) has performed. Iteration
-count is the thing to watch: it grows with problem size, and it is what decides
-how expensive a build of `K` is.
+Running totals across every solve a [`CGSolver`](@ref) has performed.
+Iteration count is what decides the cost of a `K` build, and it grows with
+problem size.
 """
 mutable struct CGStats
     solves::Int
@@ -641,62 +603,39 @@ CGStats() = CGStats(0, 0, 0, 0)
 """
     CGSolver(A; rtol=1e-10, atol=0.0, itmax=0)
 
-Conjugate gradients on `A = -H*P*(D+SAT)*P` **directly**, with no reduction and
-no factorization. Memory is a handful of vectors rather than a sparse factor,
-which is the entire point: fill-in is what caps resolution (PROGRESS.md "Known
-limitations" 2), and this has none.
+Conjugate gradients on `A = -H*P*(D+SAT)*P` directly — no reduction, no
+factorization. Memory is a handful of vectors instead of a sparse factor, and
+that is the point: fill-in is what used to cap resolution.
 
 ## Why the singularity needs no special handling
 
-`A` is singular by construction — it annihilates `P`'s null space (far-field
-DOFs, and the antisymmetric half of every fault pair, together ~40% of the
-system). That would normally rule out CG. It does not here, for three reasons
-that hold *exactly* rather than approximately:
+`A` annihilates `null(P)` (far-field DOFs plus the antisymmetric half of every
+fault pair, ~40% of the system), which would normally rule out CG. Three
+things make it safe, all holding exactly rather than approximately:
 
- 1. **The system is consistent**, `b ⊥ null(A)`. Since `null(P) ⊆ null(A)`, take
-    any `v ∈ null(P)`: `vᵀb = vᵀHP(D+SAT)χ = (HPv)ᵀ(D+SAT)χ = 0`, using
-    `HP = PH` (measured exact) and `P = Pᵀ`. Measured directly:
-    `‖(I-P)b‖/‖b‖ = 0.0`, i.e. `b ∈ range(P)` to the last bit.
- 2. **The iterates never leave `range(A)`.** Started from `x₀ = 0`, every Krylov
-    vector lies in `span{b, Ab, A²b, …} ⊆ range(A)`. Measured null-space content
-    of the returned `u` after ~100 iterations: `0.0` exactly.
- 3. **Anything that did leak would be projected away.** The only use of `u` is
-    `U = P*u + χ`, and `P` annihilates `null(P)`. So null-space content is not
-    merely small, it is irrelevant.
+ 1. **The system is consistent**, `b ⊥ null(A)`. For `v ∈ null(P) ⊆ null(A)`,
+    `vᵀb = vᵀHP(D+SAT)χ = (HPv)ᵀ(D+SAT)χ = 0`, using `HP = PH` and `P = Pᵀ`.
+    Measured `‖(I-P)b‖/‖b‖ = 0.0`.
+ 2. **Iterates never leave `range(A)`.** From `x₀ = 0` every Krylov vector is
+    in `span{b, Ab, A²b, …} ⊆ range(A)`; measured null-space content of `u`
+    after ~100 iterations is exactly 0.
+ 3. **Any leak is projected away** by the only use of `u`, `U = P*u + χ`.
 
-`A` restricted to `range(A)` is positive definite (`λ ∈ [0.101, 11.9]`, κ = 118
-at n=9), so CG converges there at the normal rate — 71 iterations at n=9 and 108
-at n=13, agreeing with a reference direct solve's tractions to 1.4e-11 (measured
-when this module also carried a Cholesky/LU path; see git history).
+On `range(A)` it is positive definite (κ = 118 at n=9), so CG converges at the
+normal rate and matches a direct solve's tractions to 1.4e-11.
 
-This all depends on `A` being **symmetric**, which it only became once
-`traction_blocks` was fixed; before that CG stalled at residual 3.7e-2 after
-5000 iterations. See SYMMETRIC_SAT.md.
+All of this needs `A` **symmetric**, which required fixing `traction_blocks` —
+before that CG stalled at residual 3.7e-2 after 5000 iterations
+(`SYMMETRIC_SAT.md`).
 
-## Caveats
+`itmax=0` lets Krylov pick its own cap. A solve that hits it is counted in
+[`solver_report`](@ref)'s `unconverged` and warned about once: silently
+returning an unconverged `u` would corrupt `K` unnoticed.
 
-`itmax=0` lets Krylov pick its own default cap. A solve that hits the cap is
-counted in [`solver_report`](@ref)'s `unconverged` and warned about once —
-silently returning an unconverged `u` would corrupt `K` in a way nothing
-downstream would notice.
-
-## Preconditioning
-
-`precond` selects `M⁻¹`. `:none` (default) is plain CG; `:jacobi` is
-[`jacobi_preconditioner`](@ref).
-
-The safety question the earlier version of this docstring left open is now
-**measured and closed**: a diagonal `M` commutes with `P` *exactly*, not
-approximately. Rows `rm` and `rp` of `P` are identical (both `0.5e_rm + 0.5e_rp`),
-so rows `rm` and `rp` of `A = -HP·DSAT·P` are identical, and symmetry then forces
-`A[rm,rm] = A[rp,rp]`. Measured at n1=9, n23=13: worst relative disagreement
-within a merged pair is `0.0`, and `‖MP − PM‖/‖MP‖ = 0.0`.
-
-**Jacobi does not help, and is kept only so that stays visible.** 86 iterations
-against plain CG's 79 — a 0.92× *regression*. `diag(A)`'s nonzero entries span
-only 13.5×, so there is almost no diagonal scaling to remove. The reconstructed
-`U` is unchanged to 2.5e-11, so the option is correct; it is simply not worth
-selecting. See `PERFORMANCE.md` §6.
+`precond` selects `M⁻¹` — `:none` (default) or `:jacobi`. A diagonal `M`
+commutes with `P` exactly, so any SPD preconditioner is safe here, but Jacobi
+measures 0.92× (a regression) and is kept only to record that. `PERFORMANCE.md`
+§6.
 """
 struct CGSolver{TA,TM}
     A::TA
@@ -713,18 +652,13 @@ end
 """
     jacobi_preconditioner(A) -> Diagonal
 
-`M⁻¹ = diag(A)⁻¹`, with the **zero** diagonal entries floored to 1.
+`M⁻¹ = diag(A)⁻¹`, with zero diagonal entries floored to 1.
 
-The floor is not defensive coding, it is required. `P` zeroes every far-field
-DOF's row, and `A = -HP·DSAT·P` inherits that, so `A` has entirely zero rows and
-columns there and `diag(A)` contains *exact* zeros — measured at n1=9, n23=13:
-3,318 of 9,126 entries, and that set is precisely the far-field DOF set. Naive
-`1 ./ diag(A)` gives `Inf`.
-
-The floor *value* is arbitrary: those DOFs lie in `null(P)`, so whatever the
-solve puts there is annihilated by `U = P*u + χ`. It only has to keep `M`
-positive definite, which CG requires. Every nonzero entry is positive (measured),
-so no other entry needs guarding.
+The floor is required, not defensive: `P` zeroes every far-field DOF's row, so
+`diag(A)` contains exact zeros there (~36% of entries) and `1 ./ diag(A)` would
+give `Inf`. The value is arbitrary — those DOFs lie in `null(P)` and are
+annihilated by `U = P*u + χ` — it only has to keep `M` positive definite. Every
+nonzero entry is positive, so nothing else needs guarding.
 """
 jacobi_preconditioner(::SplitNodeOperator) =
     error("precond=:jacobi needs diag(A), which the matrix-free SplitNodeOperator does " *
@@ -746,10 +680,8 @@ end
 """
     CG_DEFAULTS
 
-The default `CGSolver` keyword values, in one place so that anything needing to
-know them — notably `StiffnessCache`, which has to fold the solver settings into
-a cache key and cannot afford to guess — reads them from here rather than
-duplicating the literals.
+The default `CGSolver` keywords in one place, so `StiffnessCache` can fold
+the solver settings into a cache key without duplicating the literals.
 """
 const CG_DEFAULTS = (rtol=1e-10, atol=0.0, itmax=0, precond=:none)
 
@@ -764,8 +696,8 @@ end
 """
     split_node_solve(solver, rhs) -> u
 
-Solves `A u = rhs` by CG. Only `P*u` is meaningful — whatever CG's iterates
-carry on `P`'s null space is discarded by the `U = P*u + χ` reconstruction.
+Solves `A u = rhs` by CG. Only `P*u` is meaningful; `U = P*u + χ` discards
+whatever the iterates carry on `null(P)`.
 """
 function split_node_solve(s::CGSolver, rhs)
     cg!(s.workspace, s.A, rhs; M=s.M, ldiv=s.ldiv,
@@ -790,22 +722,17 @@ end
 """
     duplicate(solver) -> solver
 
-An independent solver for use on another thread. `CGSolver`'s per-solve state
-is its `CgWorkspace`, which is cheap to duplicate (a few vectors); a matrix
-`A` is only ever read concurrently and is shared, while a `SplitNodeOperator`
-carries scratch and is handed over via [`duplicate_operator`](@ref).
-This is what makes the `K` build in `fault_stiffness` embarrassingly
-parallel: its `2·N_Ωf` columns are independent right-hand sides against the
-same `A`.
+An independent solver for another thread. The per-solve state is the
+`CgWorkspace` (a few vectors); a matrix `A` is shared since it is only read,
+and a `SplitNodeOperator` goes through [`duplicate_operator`](@ref) for its
+scratch. This is what makes `fault_stiffness` embarrassingly parallel — its
+`2·N_Ωf` columns are independent right-hand sides against one `A`.
 """
 function duplicate(s::CGSolver)
     n = size(s.A, 2)
-    # `M` is SHARED, not rebuilt: rebuilding is pointless for a Diagonal and
-    # would be expensive for anything with a setup phase. That is only valid
-    # while `M` is stateless under application — true for `I` and `Diagonal`.
-    # A preconditioner carrying internal scratch (AMG's cycle temporaries) must
-    # be duplicated here instead, or the threaded build races exactly the way
-    # the shared per-task buffers did (see `fault_stiffness`).
+    # `M` is shared, not rebuilt — valid only while it is stateless under
+    # application, true for `I` and `Diagonal`. A preconditioner with internal
+    # scratch must be duplicated here instead or the threaded build races.
     return CGSolver(duplicate_operator(s.A), s.M, s.ldiv, s.precond, CgWorkspace(n, n, Vector{Float64}),
                     s.rtol, s.atol, s.itmax, CGStats())
 end
@@ -828,9 +755,8 @@ end
 """
     solver_report(solver::CGSolver) -> NamedTuple
 
-What the solve has cost so far: total and worst-case iteration counts,
-accumulated over every solve — so a build of `K` reports the totals over all
-`2·N_Ωf` right-hand sides.
+What the solves have cost so far: totals and worst case over every solve, so
+a `K` build reports across all `2·N_Ωf` right-hand sides.
 """
 function solver_report(s::CGSolver)
     t = s.stats

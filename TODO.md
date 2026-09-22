@@ -1,492 +1,153 @@
 # TODO
 
-Open work, in dependency order. Background for the symmetry items is in
-`SYMMETRIC_SAT.md`, for the cost items in `PERFORMANCE.md`; the rest is from
-`PROGRESS.md`'s "Known limitations".
+Open work, in dependency order. Section numbers `§1`/`§2`/`§3` are cited from
+code comments and are kept stable. Everything *done* lives in `PROGRESS.md`
+(measurements and narrative), `PERFORMANCE.md` (cost) and
+`MATRIX_FREE_PLAN.md` (the matrix-free operator); this file is only what is
+still open.
 
-## Open (2026-09-10)
+## Open now
 
-- [ ] **Validate `fault_stiffness_gpu` on real Pelle hardware.** Implemented
-      and correctness-checked (`PERFORMANCE.md` §5 item 0c,
-      `test/fault_response_gpu_test.jl`, `EQD_TEST_GPU=1`), but only measured
-      on a consumer RTX 2060 up to 56k DOF. The Δz = 10 m target needs an
-      H100 NVL (94 GB — the only one of Pelle's three GPUs that fits the
-      ~65 GB `A` on one card). Run `fault_stiffness_gpu(fe; verbose=true)` on
-      an actual H100 allocation before relying on any extrapolated speedup
-      number for planning.
+- [ ] **Merge and run the Δz = 10 m (1600, 1600) `K`.** The 8 L40S shards are
+      built (48.1 h of card time, `logs/Kgpu_dz10_Lf1600_Ln1600_6889974_*`) but
+      there is no merge log, so `merge_stiffness_cache.jl 10 1600 1600` still
+      needs running, then `run_bp8.jl gs/pw 10 1600 1600 exact` against the
+      cache entry. This answers §1 and §2 by measurement rather than
+      extrapolation.
 
-## Direction (2026-08-20)
+- [ ] **Update `submit_bp8_gpu.sh`'s Δz = 10 m walltime anchor.** It predicts
+      38.8 h for the point that measured 48.1 h — 24% low, the wrong direction
+      for a walltime request. Two Δz = 10 m measurements ((1150, 1150) at
+      11.89 h, (1600, 1600) at 48.1 h) imply a DOF exponent of **~1.42**, not
+      the 1.2 in the script. The comment at the `TIME` derivation also still
+      says the estimates "have not been checked on an L40S yet", which is no
+      longer true.
 
-**Preconditioned CG was tried, measured, and does not pay. Back to finishing the
-Toeplitz build.** Robin's call was to go the standard route — preconditioned CG
-sized for a cluster — with Toeplitz as the fallback "if the preconditioning
-becomes too complex". It did not become complex; it became *measurably
-worthless*, which is a cleaner reason to stop. Full write-up in
-`PERFORMANCE.md` §6. The boundary-element route remains ruled out.
+- [ ] **Decide `build_model`'s `stiffness` default.** It is `:toeplitz`, while
+      `run_bp8.jl` and all three `submit_bp8*.sh` pass `exact`, and §2's own
+      note below says `:exact` "stays the default". The three disagree.
+      `:toeplitz` was right when `:exact` meant ~17 CPU node-days; D4 symmetry
+      and the GPU build removed that gap, so the library default probably wants
+      to follow the scripts.
 
-### What preconditioning bought: ~1×
+- [ ] **Publish the branch.** Matrix-free, GPU, the stiffness cache, implicit
+      pore pressure and D4 sharding are all on `GPU`, 22 commits ahead of
+      `main`, which has been untouched since 2026-08-21. Also: `dev` is 6
+      behind `GPU`, `direct_solver` is dead, and four dependabot branches widen
+      the stdlib `[compat]` entries that currently pin
+      `Dates`/`Printf`/`LinearAlgebra`/`SparseArrays` at `^1.11.0` while
+      `[compat] julia = "1.10"` — those cannot both hold.
 
-- **Jacobi: 0.92×** — a regression. `diag(A)`'s nonzero entries span only 13.5×,
-  so there is no diagonal scaling to remove.
-- **AMG: 3-8× slower in wall-clock**, and — the decisive part — **not
-  mesh-independent**. Fitting `iters ∝ DOF^p` over 4,374 → 34,398 DOF gives
-  plain CG `p = 0.264`, Ruge-Stüben `p = 0.298`, smoothed aggregation
-  `p = 0.311`. AMG's iteration count grows *faster* than plain CG's, so its
-  ~3.3× is a flat constant that narrows with size.
-- **The ceiling is computable, and it is break-even.** Even with a perfectly
-  implemented smoother (the measured V-cycle is 9.2 mat-vecs against an operator
-  complexity implying ~3.5), a preconditioned iteration costs ~5.1 mat-vecs
-  against plain CG's ~1.6 — a 3.2× cost ratio against a 3.3× iteration
-  reduction. **Net ~1.03×.** AMG needs ~10× to pay for a V-cycle.
+- [ ] **`CUDA.CUSPARSE` is deprecated.** `ext/EarthquakeDiffinitiveCUDAExt.jl`,
+      `scripts/gpu_smoke_test.jl` and `scripts/extra/matrix_free_prototype.jl`
+      all use it and warn under the resolved CUDA 6.3.1. There is no
+      `CUDA.cuSPARSE` to switch to — the fix is a direct `cuSPARSE` dependency,
+      which means dropping `CUDA = "5"` from `[compat]`.
 
-Against `:toeplitz`'s 578 → 10 solves, ~1× is not a route. **AlgebraicMultigrid
-is not a dependency**; the experiments live in a scratch environment.
+- [ ] **The docs site renders nothing.** `docs/src/index.md` is the
+      PkgTemplates skeleton with `@autodocs Modules = [EarthquakeDiffinitive]`.
+      Every docstring lives in a submodule, which that never picks up, so ~100
+      docstrings publish as an empty page. Either list the submodules or
+      re-export from the top module — the latter would also make the redundant
+      `using EarthquakeDiffinitive; using EarthquakeDiffinitive.BP8` pair in
+      every script mean something.
 
-### What was kept
+## 1. The converged domain
 
-- The **`precond` knob** (`build_model(; precond=:none|:jacobi)`), because it is
-  small, tested, and records the dead ends so they are not re-proposed from first
-  principles. `:none` is the default.
-- Two results that close long-standing questions in `CGSolver`'s docstring:
-  a diagonal `M` commutes with `P` **exactly**, and **`null(A) == null(P)`**, so
-  *any* SPD preconditioner is safe here — verified end-to-end with a
-  non-commuting `M` that leaves 41% null-space content in the iterate and still
-  reproduces `U` to 1.5e-10. That is worth having even though nothing currently
-  uses it.
-- Suite green at **200/200** (was 176).
+**Required domain: `L_fault` ≥ 4·`l_f` = 1600 m, `L_normal` ≥ 3·`l_f` = 1200 m**
+for ~1% in `V_max` (sweeps at Δz = 50 m in both directions; table in
+`PROGRESS.md` "Results"). The old shipped configuration (2·`l_f`, 1·`l_f`) is
+**~53% low** in peak slip rate, and `build_model`'s defaults (3·`l_f`, 2·`l_f`)
+are also short. Convergence is slow for a physical reason: the elastostatic
+kernel decays as 1/r³, so doubling the domain cuts the error only ~8×. Slip and
+`K_self` were converged throughout (≤0.3%) — this is entirely a peak-`V_max`
+problem, and `V_max(t)` is one of the two global source parameters the
+benchmark requires.
 
-### Decisions settled
-
-- **2 → 5 sources in `fault_stiffness_toeplitz`** — delegated back to me and
-  kept. Centre-only is 0.004% through injection and 97% over 30 days.
-- **`output/` regeneration** — not needed now; gitignored and not present
-  locally. Generate the shipped set once, at the final domain and resolution.
-- **Multi-node parallelism** — still required for Δz = 10 m if `:exact` is used,
-  but `:toeplitz` largely dissolves it again. Revisit after the item below.
-- **Housekeeping:** `diffinitive_registry` is still in `~/.julia/registries`.
-
-## State as of 2026-08-20 (end of session)
-
-Everything below the "Done" heading is history. This is where things actually
-stand.
-
-### Closed this session
-
-1. **[x] `:toeplitz` validated at finer Δz and made the default.** Error *falls*
-   6.6× under refinement (5.78% → 0.87%, small domain, 30 d). Independently
-   re-validated by the domain control below, which reproduces the exact build's
-   truncation sensitivity to 0.02 percentage points.
-2. **[x] Preconditioning measured and rejected.** Jacobi 0.92×; AMG 3-8× slower
-   and *not* mesh-independent (`iters ∝ DOF^0.31` vs plain CG's 0.264), with a
-   computable break-even ceiling of ~1.03× even with an ideal smoother.
-   `PERFORMANCE.md` §6. `precond=:none|:jacobi` ships so the dead ends stay
-   visible; AlgebraicMultigrid is **not** a dependency.
-3. **[x] Domain requirement re-measured at Δz = 25 m — it relaxes.** `(1200,
-   1200)` is 0.37% from converged, against a Δz = 50 m requirement of `(1600,
-   1200)`. Takes the Δz = 10 m footprint from ~116 GB to **~65 GB**. See
-   `PROGRESS.md` "Domain requirement relaxes with resolution".
-4. **[x] Peaceman limitation 4 resolved** — it was a measurement artefact.
-   `r_e = 0.198Δz` is a *five-point* constant; the measured value for this SBP
-   order-4 operator is `SBP4_RE_FACTOR ≈ 0.268`, and §2.1.2 explicitly asks for
-   the radius appropriate to your discretization. `well_index` now defaults to
-   it.
-5. **[x] Peaceman limitation 3 bounded and half-fixed.** The unclamped patch is
-   a disc of radius ≈ 15 m *independent of Δz* (confirmed: exactly 1 node at
-   both Δz = 50 and 25 m). `effective_stress_report` now reports `nodes`,
-   `fraction`, `radius`. The dense-output blowup is fixed
-   (`save_everystep=false`, 284 MB → 1.1 MB).
-
-### The two things standing between here and a Δz = 10 m submission
-
-1. **[x] Memory: ~65 GB for `A`+`HP_DSAT`.** Gone (2026-09-14): the elastic
-   system is applied matrix-free (`SplitNodeOperator`, `MATRIX_FREE_PLAN.md`),
-   so `A` is never formed — ~9 GB of device memory and no assembly even at
-   Δz = 10 m on (1600, 1600). Remaining: calibrate the ~1 day/L40S estimate
-   with the first cluster build, then run (1600, 1600) at Δz = 10 m.
-2. **[x] BP8-PW is stiffness-bound — RESOLVED 2026-09-12.** `run_bp8` now
-   defaults BP8-PW to `QNDF` with an analytic block-diagonal Jacobian
-   (`BP8.state_jacobian!`): 1,105 steps / 20 s at Δz = 25 m against Tsit5's
-   488,788 / 4,901 s, and the implicit step count does not grow with
-   refinement. `σ̄_min` untouched at 1 kPa. `PROGRESS.md` "BP8-PW stiffness:
-   RESOLVED". Remaining: run it at Δz = 20/10 m on the cluster
-   (`scripts/submit_bp8_pw.sh`) and record the actual timings.
-
-   *Record of the problem as it stood:* the floored well cell made the coupled
-   integration cost `≈ Δz⁻⁴` in steps: 31,249 steps (17 s) at Δz = 50 m,
-   **488,885 steps (4,901 s)** at Δz = 25 m. Extrapolated to Δz = 10 m that
-   was **weeks-to-months** — larger than the `K` build. Confirmed as stiffness
-   by control: the Gaussian variant takes **405** steps on an identical grid.
-
-   **Route that was pursued first: regularize via `σ̄_min`** (2026-08-20 —
-   measure before committing to a solver project). **Dropped 2026-09-12**: the
-   floor is not in the benchmark description at all, so raising it is a
-   physics perturbation with no spec cover, and the solver route turned out to
-   be a day's work. At Δz = 50 m a 10 kPa floor
-   buys **9.2× for 0.04% in `V_max`**; 100 kPa buys 38× for 0.47%. Table and
-   caveats in `PROGRESS.md` "BP8-PW stiffness: σ̄_min as a regularization".
-
-   **Two things to carry forward, because they change the argument:**
-   - `V_max` does **not** live at the well cell — global and `r > 20 m` values
-     are identical — so the "confined to an already-invalid region" defence is
-     **not available**. Any change to `V_max` is a change to genuine fault.
-   - What remains is quantitative: 0.04% against a 0.41-0.87% Toeplitz error and
-     a much larger resolution error. Defensible, but it *is* a deliberate physics
-     perturbation to a submitted number where the spec is silent, not permissive.
-     **Worth raising with the benchmark organizers.**
-
-   **Δz = 25 m confirmation is DONE and it holds — better than at 50 m.**
-   100 kPa gives **113× for 0.00% in `V_max`** and 0.14% in slip (at Δz = 50 m
-   the same floor cost 0.47%). The speedup grew and the perturbation shrank,
-   because a finer grid makes the floored cell smaller in area while its
-   stiffness worsens. Suggested value **`σ̄_min` = 100 kPa**; 1 MPa gives 748×
-   but moves slip 1.42%, above the Toeplitz error, and slip is a §4.1 output.
-
-   **Remaining to do:** adopt the value (it is `par.σ̄_min`, currently 1 kPa —
-   a one-line default change plus a docstring), and decide the disclosure
-   question below.
-
-   **The solver fallback is now scoped, and it is smaller than assumed
-   (2026-08-21).** `PROGRESS.md` "BP8-PW stiffness: what the stiff eigenvalue
-   is"; `scripts/bp8_stiffness_spectrum.jl` reproduces it. Three results:
-
-   - **The stiff eigenvalue is `K_ww/D`**, `D = ∂g/∂V ≈ σ̄a/V` — the well
-     node's slip against its own self-stiffness. Predicts the measured λ to
-     1.3% at every time. Since `λ ∝ 1/σ̄`, this is *why* `σ̄_min` works: a
-     1 kPa → 100 kPa floor predicts ~100× against the 113× measured.
-   - **It is local.** A per-node **3×3** block-diagonal (`s2,s3,ϕ`, using only
-     `diag(K)`) reproduces the stiff eigenvalue to ratio **1.0000**. The dense
-     `K` off-diagonals contribute nothing, and the pressure block is *not*
-     stiff (-2.1e-4). *(2026-09-09: that -2.1e-4 excluded the Peaceman well
-     coupling — with it the pressure block is -5.9e-4 at Δz = 50 m and 10×
-     diffusion at Δz = 100 m. Still ~2800× below the friction mode, so this
-     conclusion stands. Pressure is no longer integrated with the elastic
-     system at all; see `PROGRESS.md` "Pore pressure is integrated separately".)*
-   - **So the fix is IMEX, not JFNK** — `nf` independent 3×3 solves, no Krylov,
-     no preconditioner, no dense factorization. JFNK is overkill.
-
-   The `Rosenbrock23` probe failed on **Jacobian construction**, not implicit
-   integration: an FD/AD Jacobian is `N` RHS evals (0.076 s at Δz = 50 m,
-   ~10 min at Δz = 10 m — dead), each running `nf` nested Newton solves. An
-   analytic JVP is one `K` mat-vec, 0.042 ms. The derivatives are closed-form
-   from quantities `solve_slip_rate` already computes, and are verified to 6
-   digits against FD.
-
-   - [x] **Prerequisite for any implicit route:** `solve_slip_rate(...;
-         onfail=:nan)`; a failed warm start is retried from `V_star`; `Vprev`
-         is not written on a failed evaluation.
-   - [x] **The implicit integration** — done as an inexact-Jacobian BDF rather
-         than an IMEX split: the full `rhs!` plus the 3×3 block-diagonal `J`,
-         Newton absorbs the off-diagonals. Simpler and measured to work.
-
-   **Do not benchmark this at Δz = 50 m.** Tsit5 does 100 h in 15.8 s there and
-   no implicit method will beat it at `N` = 1157. Validate correctness at 50 m;
-   the crossover is expected around Δz = 20-25 m.
-
-   **The benchmark description is silent on both stiffness and σ̄ < 0** (checked
-   directly against the PDF). These are gaps in the specification.
-
-   Note this supersedes "the `K` build is ~98-99.8% of run cost" wherever it
-   appears — that was measured on the Gaussian variant.
-
-### Smaller items, unchanged
-
-- [ ] **Order 6** — blocked upstream; needs Mattsson's coefficients in
-  Diffinitive's `standard_diagonal.toml`.
-- [ ] **Variable coefficients** — a foreclosed capability, not a defect.
-- [ ] **CRESCENT DET upload** — files are written in the §4 formats but nothing
-  has been validated against the server's parser.
-- [ ] **Housekeeping:** `diffinitive_registry` is still in `~/.julia/registries`.
-
-## Done
-
-### Earlier session
-
-- [x] **Diagnose the `-HP(D+SAT)P` asymmetry.** Root cause: `traction_blocks`
-      used `first_derivative` for every term, but μ's normal-direction terms
-      come from the *narrow* `second_derivative`, whose SBP identity carries a
-      different boundary operator (`normal_derivative`). λ and μ's tangential
-      terms were already correct. `scripts/symmetry_decomposition.jl`
-      reproduces the whole decomposition; `SYMMETRIC_SAT.md` writes it up.
-      Ruled out by measurement: `P`, operator ordering, the interface, the
-      two-grid coupling, `elastic_blocks`, and the quadrature `H`.
-- [x] **Fix `traction_blocks`** (`src/Elasticity.jl`) to match
-      `context/notebooks/elastic_clean.jl`'s `IsotropicTractionOperator`.
-- [x] **Add the SBP property test** (`test/elasticity_test.jl`,
-      `"SBP property: E and T are compatible"`) — the notebook had it, this
-      package did not, and it is what would have caught the bug immediately.
-
-### This session
-
-- [x] **Run the test suite.** 172/172 before the solver change, **176/176**
-      after, ~2m45s. The `src/` edit and the new SBP test are exercised. Both
-      of the risks flagged for this step held up: the 5% manufactured-traction
-      tolerance passes, and `Grids._boundary_sign` still exists.
-- [x] **Verify the traction fix against production runs** (was BLOCKING).
-      All four configurations re-run and diffed against `PROGRESS.md`'s table;
-      numbers in "Results" there and in `SYMMETRIC_SAT.md` "Gate 2". Peak `V`
-      shifts 2.5-7.0× against a 105-406× resolution spread, final slip 5-11%,
-      peak pressure bit-identical. The fix also *narrows* the resolution spread
-      and makes the GS peak time resolution-consistent (2.26/0.62 d → 2.22/2.18
-      d), neither of which was tuned for.
-- [x] **Re-check `K`'s symmetry at production size.** 0.2003% at Δz = 50 and
-      0.1827% at Δz = 100, against 0.19% before — unchanged, as predicted, and
-      `diag(K) < 0` holds. Confirms the 2.8-3.3% seen at `L=1, n=11..15` was
-      domain truncation, not a regression.
-- [x] **Re-run `scripts/bp8_validate_pressure.jl`** as a control. Reproduces
-      its entire table to the digit, as it must — pore pressure never touches
-      elasticity.
-- [x] **Galerkin reduction `SᵀAS` + Cholesky** in `factorize_reduced`, with
-      `prolongation(rs)` exported. Solutions agree with the old LU path to
-      2.7e-15; factor is 1.77×/1.88× smaller at n = 9/13. Falls back to LU with
-      a loud warning on `PosDefException`, since that would mean a real
-      regression. Pinned by `test/elasticity_split_node_test.jl`'s
-      `"Galerkin reduction is SPD and Cholesky agrees with LU"`, which also
-      asserts `E·A·S` is *still* asymmetric so the Galerkin form cannot be
-      quietly swapped back.
-- [x] **Reproducible environment.** `Project.toml` now has a `[sources]` entry
-      pinning `Diffinitive` to upstream `92d842cf`. Verified by instantiating
-      `Project.toml` + `src/` with no Manifest: it resolves, precompiles, and
-      builds a symmetric operator. An explicit `Pkg.develop` still overrides it,
-      so the local dev workflow is untouched.
-- [x] **Domain-size validation gap.** The obvious fix — adding a
-      `(L_fault=800, L_normal=400)` row to the existing sweep — is impossible:
-      that sweep runs at Δz = 100 m, where `L_normal = 400` is only 5 points
-      across the fault-normal direction against SBP order 4's minimum of 9.
-      `L_normal = 400` is legal *only* at Δz = 50 m, which is also the
-      production resolution. `scripts/bp8_domain_convergence.jl` therefore now
-      runs a **second sweep** at Δz = 50 m over `L_normal ∈ {400, 600, 800}`
-      with `L_fault` fixed at 800 m, isolating the fault-normal truncation at
-      the resolution that actually ships. The loop and reporting were factored
-      into `sweep`/`report` so both studies share them.
-- [x] **Run both sweeps.** All 8 rows completed. The Δz = 100 m `L_fault` study
-      reproduces its published numbers and pressure is identical across its
-      rows. The new Δz = 50 m study found a real bias — see item 1 below, which
-      is the one thing this session opened rather than closed.
-- [x] **Iterative solver.** `build_model(...; solver=:cg)` runs CG (Krylov.jl)
-      on the singular `A` directly — no reduction, no factorization, no
-      null-space handling, because `b ⊥ null(A)` exactly and CG from `x₀ = 0`
-      never leaves `range(A)`. Same `K` as the direct path to 1.6e-11. At
-      production size it costs ~2× the wall-clock and **~6× less of the memory
-      that actually binds** (0.38 GB of solver footprint against 2.45 GB, and
-      no 168M-nonzero factor).
-- [x] **Thread the `K` build.** Its `2·N_Ωf` columns are independent and now
-      run in parallel under CG, bit-identical to serial. That brings threaded
-      CG to 156 s against the direct path's 128 s at production size — a 22%
-      time penalty for 2.3× less peak memory. Scaling is sublinear (5.1× on 8
-      threads at n=13, 2.13× on 16 at production) because the sparse mat-vec is
-      memory-bandwidth bound; more threads is not the remaining lever, fewer
-      iterations is. Impossible for the direct path (CHOLMOD's solve is not
-      thread-safe), so `duplicate` throws there and `fault_stiffness` falls
-      back to serial.
-      Caught a genuine data race doing this: `if`/`else` and `begin` do not
-      open a scope in Julia, so the per-task buffers were shared and `K` came
-      out 2.35 relative off. Now a regression test demanding bit-identity, and
-      CI runs with `JULIA_NUM_THREADS: 4` — one thread cannot detect it.
-- [x] **Diagnose "order 6 is unusable".** Broader than recorded: order 6 in
-      `standard_diagonal.toml` has only `H`, `e`, `d1` and `D2.positivity` —
-      no `D1` at all and no `D2` stencils. Upstream Diffinitive data gap, not
-      fixable here. Recorded as `PROGRESS.md` limitation 5.
-
-### Performance session (2026-08-19)
-
-Full write-up in `PERFORMANCE.md`; only the outcomes are listed here.
-
-- [x] **Answer "should this be matrix-free?"** No — and by a wide margin.
-      Diffinitive's lazy composition re-expands the stencil at every point,
-      measuring **41-67× slower** than sparse `mul!` on the same operator.
-      A matrix-free `P` is worse still (forces `A` into a composite, 1.66×
-      slower per mat-vec). Both TODO notes in `ElasticitySplitNode.jl` are
-      now answered in place with pointers to `PERFORMANCE.md` §1.
-- [x] **Remove stored zeros from `P`.** `P[r,:] .= 0.0` keeps the CSC
-      structural entry; those zeros multiplied into full `DSAT` rows and
-      inflated `HP_DSAT`/`A` by **29-52%**. One `dropzeros!`. Operators
-      bit-identical, 179/179.
-- [x] **Fix quadratic SAT assembly.** `SATmat[rows,cols] .+= B` rewrote the
-      whole CSC each of 12 times; assembly scaled quadratically and was 64% of
-      all assembly by n=21. Triplet accumulation + one `sparse()` call:
-      **199× faster** at n=21, growth now linear, matrix identical, 179/179.
-- [x] **Establish the cost model.** `t_solve ∝ DOF^1.56`, CG iterations
-      ∝ DOF^0.31, columns ∝ Δz⁻², so the `K` build scales as **Δz⁻⁶·⁷**.
-      Measured at Δz = 100/80/50 m on benchmark-shaped grids.
-- [x] **Confirm the assembly changes are physics-neutral end-to-end.** All six
-      configurations of `bp8_domain_convergence.jl` with published values
-      reproduce **to every digit** on full coupled 100 h runs, at two
-      resolutions — a far stronger check than the unit tests, since it exercises
-      the whole elastic → friction → pressure chain.
-
-**Stale references below.** The `Done` entries above this block mention
-`factorize_reduced`, `prolongation(rs)`, `solver=:cg` and the CHOLMOD fallback;
-none of those exist in `src/` any more (commit `02b6c91` "Only CG"). They are
-kept as history — do not treat them as API.
-
-## 1. Act on the domain-convergence result — `L_normal = 400` is not innocent
-
-**The sweep now runs to convergence** (2026-08-19): `L_normal ∈ {400, 600, 800,
-1000, 1200, 1600}` at Δz = 50 m, `L_fault` = 800 m. Full table and discussion in
-`PROGRESS.md` "Results".
-
-`V_max` **does** settle, in both directions — but only well beyond any domain
-previously used. **Both sweeps are now done** (fault-normal and the `L_fault`
-mirror), and the combined answer is:
-
-> **Required domain: `L_fault` ≥ 4·`l_f` = 1600 m, `L_normal` ≥ 3·`l_f` = 1200 m**
-> for ~1% in `V_max`. The shipped configuration (2·`l_f`, 1·`l_f`) is **~53%
-> low**. `build_model`'s defaults (3·`l_f`, 2·`l_f`) are also short.
-
-Successive estimates were 42% → 45.3% → 53%, each growing as the reference
-improved — the signature of measuring against an unconverged reference. The 53%
-is the first bounded in both directions. Convergence is slow for a physical
-reason: the elastostatic kernel decays as 1/r³, so doubling the domain cuts the
-error only ~8×. `K_self` and slip were converged throughout (≤0.3%); this is
-entirely a peak-slip-rate problem — and `V_max(t)` is one of the two global
-source parameters the benchmark requires, not a diagnostic.
-
-**This inflates every cost estimate**: ~4.5× compute and ~2.6× memory at each
-resolution. `PERFORMANCE.md` §4 is rewritten accordingly — Δz = 20 m is no
-longer a workstation job (~15 GB), and Δz = 10 m needs ~120 GB per node.
-
-So the answer to the original question is *no*: the halving was not free for
-peak `V`. It is free for slip and stiffness.
-
-- [x] **Push the fault-normal sweep past 800 m.** Done — `V_max` converges by
-      1600 m (Richardson limit 3.048e-7, 0.13% beyond that row). The rows were
-      previously thought not to fit; that was the direct solver's fill-in.
-- [x] **Mirror sweep: vary `L_fault` at large fixed `L_normal`.** Done, and it
-      was needed — `V_max` moved 12.8% over `L_fault` 2·`l_f` → 3·`l_f`, so the
-      fault-normal sweep's limit *was* set by its pinned `L_fault`. Run it with
-      `scripts/bp8_domain_convergence.jl mirror`.
-- [ ] **Re-run production at the converged domain.** Every number in `output/`
-      carries the ~53% `V_max` bias. Not yet done deliberately: at the required
-      domain Δz = 50 m is 634k DOF (~1.1 h) but still not resolution-converged,
-      so a regeneration now gets superseded by §2's resolution work. Decide
-      whether to ship a corrected-domain Δz = 50 m set as an interim, or wait
-      and regenerate once at the target resolution.
-- [x] **Report the computational domain in the output headers.** Already done —
-      `domain_line` (`src/BP8.jl`) emits `# elastic_domain=…` with `L_normal`,
-      `L_fault`, SBP order and DOF count into both the time-series and profile
-      headers. (Listed as open in an earlier draft of this file; that was an
-      assumption, not a check.)
-- [ ] **Do not assume these domain requirements transfer to finer Δz.** The
-      same `L_normal` 800→1200 step moves `V_max` +0.324% at Δz = 100 m but
-      +5.17% at Δz = 50 m. That comparison is confounded (different `L_fault`,
-      and Δz = 100 m is badly under-resolved) so it proves nothing either way —
-      but it removes the grounds for assuming transferability. A matched
-      two-resolution sweep would settle it; at Δz = 25 m that is ~12 h.
-      **If the requirement does grow with resolution, §2 should have come
-      first** and this study needs redoing at the target Δz.
-
-- [ ] **Decide whether to re-run production at a larger `L_normal`.** Now known
-      to be affordable: `(Δz=50, L_fault=800, L_normal=800)` builds in 385 s,
-      so a full 30-day run is ~10 min per injection model. That would make peak
-      `V` less biased — but peak `V` is *already* documented as indicative-only
-      because of resolution (item 2), which dominates this by ~100×, and
-      re-running changes every number in `output/`. Worth doing if the runs are
-      going to be regenerated anyway; not worth it on its own.
-- [ ] **Push the fault-normal sweep past 800 m** to find where `V_max` settles,
-      if peak `V` is ever going to be quoted quantitatively. `L_normal = 1000`
-      at Δz = 50 m is ~137k DOF and may not fit.
-- [ ] Note for anyone reading the older `L_fault` sweep: its 0.55% `V_max`
+- [ ] **Re-run production at the converged domain.** Every number in a
+      pre-(1600, 1600) `output/` directory carries that bias. Gated on the
+      merge above so the regeneration happens once, at the target domain *and*
+      resolution.
+- [ ] **Do not assume the domain requirement transfers to finer Δz.** The same
+      `L_normal` 800→1200 step moves `V_max` +0.324% at Δz = 100 m but +5.17%
+      at Δz = 50 m. That comparison is confounded (different `L_fault`, and
+      Δz = 100 m is badly under-resolved) so it proves nothing either way — but
+      it removes the grounds for assuming transferability. A matched
+      two-resolution sweep settles it; ~12 h at Δz = 25 m.
+- [ ] Note for anyone reading the *older* `L_fault` sweep: its 0.55% `V_max`
       spread does **not** mean domain size is settled. It varied the far
       boundary while the near one sat at 400 m.
 
-## 2. Resolution — the actual blocker
+## 2. Resolution
 
-`PROGRESS.md` "Known limitations" 1 and 2. Δz = 50 m gives 1.3 cells per
-process zone `L_b ≈ 64 m`.
+`PROGRESS.md` "Known limitations" 1 and 2. `resolution_report` calls a grid
+converged at `L_b/Δz ≥ 3`, i.e. Δz ≤ 21 m, so the benchmark's nominal 10 m is
+~6.7× more expensive than convergence requires. Quote 10 m only if the
+submission demands the nominal spec.
 
-**The target is Δz = 20 m, not the benchmark's 10 m.** `resolution_report`
-calls a grid converged at `L_b/Δz ≥ 3`, i.e. Δz ≤ 21 m — so 10 m is 6.7× more
-expensive than convergence actually requires. Quote 10 m only if the submission
-demands the nominal spec.
+**This is no longer a blocker.** The matrix-free operator removed the memory
+ceiling (`MATRIX_FREE_PLAN.md`), and D4 symmetry plus the GPU build brought the
+Δz = 10 m (1600, 1600) `K` to 48 h of single-card time. `PROGRESS.md`
+limitation 2's "Δz = 50 m is the ceiling" refers to the removed direct solver's
+fill-in and is stale.
 
-Costs from `PERFORMANCE.md` §4 (extrapolated ±2×):
-
-| Δz | DOF | `A`+`HP_DSAT` | `K` build | converged |
-|---|---|---|---|---|
-| 50 m (shipped) | 245 k | 0.34 GB | 0.5 core-h | no (1.3) |
-| **20 m** | 3.6 M | ~5.5 GB | **182 core-h** | **yes (3.2)** |
-| 10 m (spec) | 28.2 M | ~42 GB | ~17,700 core-h | yes (6.4) |
-
-`PROGRESS.md` limitation 2's "Δz = 50 m is the ceiling" is **stale** — that was
-the removed direct solver's fill-in. Memory is no longer what binds.
-
-- [x] **Multi-node parallelism.** **Stale as written** — done via independent
-      processes + a shared directory, not `Distributed`/MPI (never needed):
-      `build_stiffness_cache.jl [shard] [nshards]` + `merge_stiffness_cache.jl`.
-      Since (2026-09-10) it composes with D4 symmetry
-      (`PERFORMANCE.md` §5 item 0b) via `fault_stiffness_d4_shard`, which
-      splits D4 orbit representatives — not raw columns — across shards, so
-      sharding does not give up item 0b's ~7.8×. At Δz = 10 m that takes
-      `:exact` from ~934 node-days (raw columns) to ~120 (with D4), i.e.
-      ~12-15 nodes for ~10 days instead of ~100.
-- [x] **Test whether `K` is near-block-Toeplitz.** **Yes, and decisively.**
-      `scripts/k_toeplitz_structure.jl` + `k_toeplitz_validate.jl`. A `K` rebuilt
-      from **5 sources (10 CG solves)** reproduces `V_max(t)` to **0.41%** over
-      30 days at the converged domain, against the full 578-solve build. Full
-      write-up in `PERFORMANCE.md` §4b, including three results that each cost a
-      wrong turn: averaging sources is ~500× worse than prioritising them,
-      matrix-norm error is amplified 2-3 orders of magnitude into `V_max` (and
-      can move in the opposite direction), and validating through the injection
-      phase alone hides a 97% error that only appears after shut-in.
-- [x] **Implement the Toeplitz `K` build.** `fault_stiffness_toeplitz`
-      (`src/FaultResponse.jl`), opt-in via `build_model(; stiffness=:toeplitz)`
-      with `:exact` still the default. Regression tests in
-      `test/fault_response_test.jl` pin that the centre column is exact, that
-      self-stiffness stays negative everywhere, and that it uses exactly 2
-      solves — the last guards against "improving" it by adding sources, which
-      measured ~500× worse.
-- [x] **Validate across domain × duration.** All four combinations run at
-      Δz = 50 m. The shipped 10-solve priority build gives **0.41% worst-case in
-      `V_max(t)` over 30 days at the converged domain** — the only configuration
-      that will actually be run. Table in `PERFORMANCE.md` §4b.
-      This is what forced the design from 2 sources to 5: centre-only scores
-      0.004% at 100 h and **97%** over 30 days. Validating through the injection
-      phase alone would have shipped that.
-- [ ] **Validate at a finer Δz, then consider making `:toeplitz` the default.**
-      The last gap. The centre source's ~44% coverage gap is resolution-
-      independent in *fraction*, but the far-field-decay argument behind it is
-      not proven to be. Δz = 25 m at the small domain is ~2.4 h for the
-      reference build; that is the cheapest meaningful check. Until it lands,
-      `:exact` stays the default.
-- [ ] **Try symmetrising the Toeplitz `K`.** Reciprocity says the true kernel is
-      even, `kernel(−d) = kernel(d)`, so the exact `K` is symmetric (measured
-      ~0.2%). The reconstruction takes the kernel from one column and does *not*
-      enforce that, so `K_toep` is only as even as the sampled column. Replacing
-      it with `(K + Kᵀ)/2` costs nothing and may cut the error — untested, so
-      not done. Test it end-to-end, not in Frobenius norm: §4b's whole lesson is
-      that matrix-norm improvements and `V_max` improvements are not the same
-      thing, and can point in opposite directions.
-- [ ] **Preconditioner.** Attacks the iteration count directly (236 at
-      Δz = 50 m, ~450 extrapolated at Δz = 20 m). Deliberately not shipped
-      unvalidated: a diagonal preconditioner preserves the `range(A)` invariant
-      CG relies on here only if it commutes with `P`, i.e. if its entries agree
-      within each merged fault pair. Check that before assuming it is safe —
-      `CGSolver`'s docstring has the argument.
-- [ ] **Decide between preconditioned/multigrid CG on this discretization and
-      the boundary-integral route** most SEAS codes take (whole-space
-      fault-to-fault kernel is a convolution, `O(N log N)` with FFTs, no volume
-      unknowns — and no `K` build, which is the part that scales worst here).
-      This is a design decision, not an increment.
-- [ ] Keep `scripts/split_node_spd.jl`'s guardrails in mind when touching any
-      of this: CG's internal recursive residual is only valid for symmetric
-      `A`, and CG run on `A[keep,keep]` (neither reduction) converges happily
-      to the wrong answer.
+- [ ] **Validate `:toeplitz` at a finer Δz** if it is ever to be relied on
+      rather than used as a preview. The centre source's ~44% coverage gap is
+      resolution-independent as a *fraction*, but the far-field-decay argument
+      behind it is not proven to be. Δz = 25 m at the small domain is ~2.4 h
+      for the reference build — the cheapest meaningful check.
+      `scripts/extra/k_toeplitz_resolution.jl` is the harness.
+- [ ] **Decide between iterative CG on this discretization and the
+      boundary-integral route** most SEAS codes take (the whole-space
+      fault-to-fault kernel is a convolution: `O(N log N)` with FFTs, no volume
+      unknowns, and no `K` build at all). A design decision, not an increment,
+      and much less pressing now that the `K` build fits one card.
+      Preconditioning is *not* the alternative — measured at ~1×,
+      `PERFORMANCE.md` §6.
+- [ ] Keep `scripts/extra/split_node_spd.jl`'s guardrails in mind when touching
+      any of this: CG's internal recursive residual is only valid for symmetric
+      `A`, and CG run on `A[keep,keep]` converges happily to the wrong answer.
 
 ## 3. Smaller items
 
 - [ ] **Order 6.** Needs Mattsson's order-6 `D1`/`D2` coefficients added to
       Diffinitive's `standard_diagonal.toml` — an upstream contribution, and a
       nontrivial derivation to get right. Blocks any higher-order convergence
-      study.
+      study. `StiffnessCache`'s `stencil_digest` already anticipates it: the
+      coefficients are in the cache key, so new stencils cannot silently reuse
+      an order-4 `K`.
 - [ ] **Variable coefficients.** The notebook's operators take λ, μ as grid
       functions; this package is constant-coefficient only. Fine for BP8's
-      homogeneous whole space, and it is what lets the factorization be reused
-      across every RHS evaluation — but a foreclosed capability.
+      homogeneous whole space, and it is what lets `K` be reused across every
+      RHS evaluation — but a foreclosed capability.
 - [ ] **Peaceman σ̄ < 0** (`PROGRESS.md` limitation 3): pressure at the well
-      cell exceeds σ, the `σ̄_min` floor binds, and eq 3's no-opening condition
-      stops applying there. Not a numerical artefact — worsens as Δz shrinks.
-- [ ] **Peaceman well-cell pressure ~10% below eq 25** (limitation 4). The
-      `r_e = 0.198Δz` calibration is for steady radial flow; this is transient.
+      cell exceeds σ, the `σ̄_min` floor binds, and eq. 3's no-opening condition
+      stops applying there. Not a numerical artefact, and the well-cell `σ̄`
+      falls as Δz shrinks — but the affected disc is ~15 m across regardless of
+      Δz, so it stays localized. `effective_stress_report` reports the extent.
 - [ ] **CRESCENT DET upload** (§5): files are written in the §4 formats but
-      nothing has been validated against the server's parser. Gated on item 2
-      anyway — the current runs are not submission-ready.
+      nothing has been validated against the server's parser. Gated on the
+      production runs above.
+- [ ] **Dead exports.** `Elasticity.unflatten` and
+      `Elasticity.inject_dirichlet!` are exported and used nowhere, as are
+      `BP8.pressure_length`, `BP8.set_pressure_history!` and
+      `RateStateFriction.friction_coefficient`. Keep or drop deliberately.
+- [ ] **Housekeeping:** `diffinitive_registry` is still in
+      `~/.julia/registries`.
+
+## Resolved, for the record
+
+Items previously tracked here, and where the evidence now lives:
+
+| was | outcome |
+|---|---|
+| Multi-node `K` parallelism | Independent processes plus a shared directory, never `Distributed`/MPI: `build_stiffness_cache.jl [shard] [nshards]` + `merge_stiffness_cache.jl`, composing with D4 via `fault_stiffness_d4_shard`. |
+| Is `K` near-block-Toeplitz? | Yes — 10 solves reproduce `V_max(t)` to 0.41% at the converged domain. `PERFORMANCE.md` §4b. |
+| Preconditioned CG | ~1×, and AMG is not mesh-independent here. Not a route. `PERFORMANCE.md` §6. |
+| Symmetrising the Toeplitz `K` | Tested — `scripts/extra/k_toeplitz_symmetrise.jl`. |
+| Validate `fault_stiffness_gpu` on real hardware | Done at the production point: 48.1 h of L40S for Δz = 10 m on (1600, 1600), mean 1599 CG iterations, 0 unconverged. |
+| `A` too large to assemble at Δz = 10 m | `A` is no longer assembled. `MATRIX_FREE_PLAN.md`. |
+| BP8-PW's `Δz⁻⁴` step count | Implicit `QNDF` with the block-diagonal Jacobian; step count is resolution-independent. `PROGRESS.md` (2026-09-12). |
+| Peaceman well-cell pressure ~10% below eq. 25 | Not a model error — it was eq. 25 evaluated at a five-point stencil's radius. `PorePressure.SBP4_RE_FACTOR` = 0.268, measured. |
+| Report the computational domain in output headers | `domain_line` in `src/BP8.jl`, in both header families. |
+| Regenerate `output/` | Deliberately deferred until the target domain *and* resolution — §1. |

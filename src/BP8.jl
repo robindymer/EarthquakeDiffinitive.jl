@@ -27,7 +27,6 @@ export BP8Params, benchmark_parameters, BP8Model, build_model, initial_state,
        effective_stress_report, analytic_pressure_gaussian, analytic_pressure_point,
        resolution_report, process_zone, fault_grid_sizes, build_fault_elasticity
 
-# ==============================================================================
 # SEAS BP8-QD-GS / -PW: the coupled problem.
 #
 #   slip      ds_j/dt = V_j                                   (eq. 5)
@@ -42,10 +41,9 @@ export BP8Params, benchmark_parameters, BP8Model, build_model, initial_state,
 # elastic response, a dense mat-vec against the fault stiffness precomputed by
 # `FaultResponse.fault_stiffness`.
 #
-# The state variable is integrated as ϕ = ln θ. θ spans ~1e8-1e12 s here while
-# slip is ~1e-6 m, so a single scalar tolerance cannot serve both; ln θ is
-# well scaled and turns the aging law into dϕ/dt = e^{-ϕ} - V/D_RS.
-# ==============================================================================
+# The state variable is integrated as ϕ = ln θ. θ spans ~1e8-1e12 s while slip
+# is ~1e-6 m, so one scalar tolerance cannot serve both; ln θ is well scaled and
+# turns the aging law into dϕ/dt = e^{-ϕ} - V/D_RS.
 
 """
     BP8Params
@@ -85,10 +83,9 @@ Base.@kwdef struct BP8Params
     Δz::Float64 = 10.0          # m
     t_off::Float64 = 100 * 3600.0     # s
     t_f::Float64 = 30 * 24 * 3600.0   # s
-    # numerical guard: `σ̄ = σ - p` must stay positive for the friction law to
-    # make sense. BP8's peak pressure is ~13 MPa against σ = 25 MPa so this
-    # should never bind; if it does, the run is outside the model's validity
-    # rather than merely under-resolved.
+    # `σ̄ = σ - p` must stay positive for the friction law to make sense. Peak
+    # pressure is ~13 MPa against σ = 25 MPa, so if this binds the run is
+    # outside the model's validity rather than merely under-resolved.
     σ̄_min::Float64 = 1.0e3      # Pa
 end
 
@@ -117,17 +114,13 @@ mutable struct Cache
     Vprev::Vector{Float64}
     σ̄_lowest::Float64   # smallest σ̄ = σ - p seen, BEFORE the floor is applied
     floor_hits::Int     # how many times that floor actually bound
-    # WHICH nodes were ever unclamped, not just how many evaluations hit the
-    # floor. `floor_hits` counts RHS evaluations, so it scales with the
-    # integrator's step count and says nothing about how much of the fault is
-    # affected — the question a reader of the limitation actually has.
+    # Which nodes were ever unclamped. `floor_hits` counts RHS evaluations, so
+    # it scales with the step count and says nothing about the affected area.
     floor_nodes::BitVector
-    # Pore pressure at the current `t`, interpolated out of the separately
-    # integrated pressure history (`solve_pressure_history`). `pbuf` is the
-    # raw subsystem state — length `nf`, or `nf+1` for the Peaceman variant,
-    # whose last entry is the well-bore pressure — and `pres` views its first
-    # `nf` entries, the fault field itself. Interpolating in place keeps the
-    # right-hand side allocation-free.
+    # Pore pressure at the current `t`, interpolated from the separately
+    # integrated history. `pbuf` is the raw subsystem state (`nf`, or `nf+1` for
+    # Peaceman, whose last entry is the well-bore pressure); `pres` views its
+    # first `nf` entries. In-place keeps the RHS allocation-free.
     pbuf::Vector{Float64}
     pres::SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true}
 end
@@ -140,10 +133,9 @@ end
 """
     PressureHistory
 
-Holds the separately integrated pore-pressure solution, or `nothing` before
-one has been computed. Mutable so `run_bp8` can attach a history to an
-otherwise immutable `BP8Model`; `sol` is deliberately untyped, and every read
-of it goes through the `pressure_at!` function barrier.
+The separately integrated pore-pressure solution, or `nothing`. Mutable so
+`run_bp8` can attach a history to an otherwise immutable `BP8Model`. `sol` is
+untyped on purpose; reads go through `pressure_at!`'s function barrier.
 """
 mutable struct PressureHistory
     sol::Any
@@ -187,10 +179,9 @@ end
     fault_grid_sizes(par, Δz, L_fault, L_normal, order) -> (; n1, n23)
 
 Validates a configuration and computes the elastic grid point counts
-`build_model` uses. Factored out so external tooling — currently
-`build_stiffness_cache.jl`'s sharding path — can reproduce exactly the `n1`,
-`n23` `build_model` would use for the same configuration, which a sharded
-`:exact` build depends on to actually match the single-process one.
+`build_model` uses. Factored out so `build_stiffness_cache.jl`'s sharding path
+can reproduce exactly the `n1`, `n23` `build_model` would use — which is what
+makes a sharded build match the single-process one.
 """
 function fault_grid_sizes(par::BP8Params, Δz, L_fault, L_normal, order)
     isapprox(par.l_f / Δz, round(par.l_f / Δz); atol=1e-9) ||
@@ -213,18 +204,15 @@ end
     build_fault_elasticity(; par, Δz, L_fault, L_normal, n1, n23, set, verbose=false,
                            solver_kwargs...) -> FaultElasticity
 
-Assembles the split-node elastic system `fault_stiffness` solves against, for
-the grids `build_model` has already sized and validated via
-[`fault_grid_sizes`](@ref). Factored out of the cache-miss path below so a `K`
-build can be **sharded across independent processes**: each shard calls this
-— minutes, not the bottleneck, PERFORMANCE.md §4c — and then
-`fault_stiffness(fe; cols=..., ...)` for its own slice of the `2·N_Ωf`
-columns, with no communication needed between shards (the columns are
-independent right-hand sides against the same `A`). `build_model` itself goes
-through this same function on every cache miss, so there is exactly one
-definition of "the elastic system for this configuration" — what makes it
-safe to assemble a `K` from shards built in separate processes and merge them
-into one cache entry (`merge_stiffness_cache.jl`).
+The split-node elastic system `fault_stiffness` solves against, for grids
+[`fault_grid_sizes`](@ref) has already sized and validated.
+
+Factored out of the cache-miss path so a `K` build can be **sharded across
+processes**: each shard calls this (minutes, not the bottleneck) and then
+`fault_stiffness(fe; cols=...)` for its own columns. `build_model` uses the
+same function on every miss, so there is one definition of "the elastic system
+for this configuration" — which is what makes shards from separate processes
+safe to merge (`merge_stiffness_cache.jl`).
 """
 function build_fault_elasticity(; par::BP8Params, Δz, L_fault, L_normal, n1, n23, set,
                                 verbose=false, representation=:kronecker, solver_kwargs...)
@@ -240,11 +228,9 @@ end
 
 # `K` for one configuration, from the cache if it is there.
 #
-# Split out of `build_model` so the two paths that produce a `K` — load, and
-# build-then-maybe-save — sit next to each other, and so `FaultElasticity` is
-# constructed inside the miss branch only. That placement is the point of the
-# whole cache: assembling the split-node system is ~15 GB and minutes at the
-# Δz = 20 m target (PERFORMANCE.md §4), and a hit has no use for it.
+# Split out of `build_model` so the load and build-then-save paths sit together,
+# and so `FaultElasticity` is constructed in the miss branch only — a hit has no
+# use for it.
 function stiffness_matrix(; par, Δz, L_fault, L_normal, n1, n23, order, set,
                           stiffness, cache, cache_dir, verbose, solver_kwargs,
                           representation=:kronecker)
@@ -270,10 +256,10 @@ function stiffness_matrix(; par, Δz, L_fault, L_normal, n1, n23, order, set,
                                 verbose, representation, solver_kwargs...)
 
     t0 = time()
-    # `symmetry=true` is safe unconditionally here: `build_fault_elasticity`
-    # always gives both fault-parallel directions the same `L_fault`/`n23`
-    # about a centre at 0, which is exactly `fault_stiffness`'s D4 precondition
-    # (PERFORMANCE.md §5 item 0b). Same K, 6.5-7.8× fewer CG solves.
+    # `symmetry=true` is unconditionally safe here: `build_fault_elasticity`
+    # always gives both fault-parallel directions the same `L_fault`/`n23` about
+    # 0, which is `fault_stiffness`'s D4 precondition. Same K, 6.5-7.8× fewer
+    # solves.
     K = stiffness === :toeplitz ? fault_stiffness_toeplitz(fe; verbose) :
                                   fault_stiffness(fe; verbose, symmetry=true)
     verbose && @info "fault stiffness built" seconds = round(time() - t0, digits=1) stiffness size = size(K) elastic_solver_report(fe)...
@@ -305,25 +291,19 @@ have to be comfortably larger than `l_f`; see the §6 domain-size study.
 The expensive part is `fault_stiffness`, which does `2·N_Ωf` CG solves of the
 assembled 3D elastic system.
 
-`stiffness` selects how `K` is built. **`:toeplitz` is the default**: it does
-**10** solves, expanding 5 sources by the whole-space kernel's translation
-invariance, instead of `2·N_Ωf`. `:exact` does all `2·N_Ωf` and remains available
-as the reference — use it whenever you are measuring the approximation itself.
+`stiffness` selects how `K` is built. `:exact` does all `2·N_Ωf` solves, cut
+6.5-7.8× by D4 symmetry, and is **what every submission run uses** — the submit
+scripts and `run_bp8.jl` all pass it, and `fault_stiffness_gpu` builds it in
+48 h on one L40S at the Δz = 10 m production point. `:toeplitz` is the current
+default here: 10 solves expanding 5 sources by the whole-space kernel's
+translation invariance, an approximation worth 0.41% in `V_max` at the converged
+domain (`PERFORMANCE.md` §4b). It dates from when `:exact` meant ~17 days on one
+CPU node; D4 symmetry and the GPU path have since removed that gap, so it is now
+a cheap preview rather than the production route.
 
-It is an approximation, and the case for defaulting to it is that its error is
-bounded and shrinks along **both** axes production moves along
-(`PERFORMANCE.md` §4b): 5.78% at the small domain and Δz = 50 m, **0.41%** at the
-converged domain, **0.87%** at Δz = 25 m. Every configuration that will actually
-be run is more favourable than the ones measured, and all of them sit far below
-the resolution error. The cost difference at the Δz = 20 m target is ~17 days
-against ~3 h on one node, which is the difference between the run happening on a
-single machine and needing a cluster.
-
-`precond` is forwarded to [`CGSolver`](@ref) and selects the preconditioner for
-each solve. It is an **independent** axis from `stiffness`: `stiffness` sets how
-*many* solves are done, `precond` how each one converges, and every combination
-is valid. `:none` (default) or `:jacobi` — the latter measures 0.92×, i.e. worse
-than none, and exists so that stays visible rather than being rediscovered.
+`precond` goes to [`CGSolver`](@ref) and is an independent axis: `stiffness`
+sets how *many* solves happen, `precond` how each converges. `:none` (default)
+or `:jacobi`, the latter measuring 0.92× and kept only to record that.
 
 ## Reusing `K` from disk
 
@@ -340,16 +320,15 @@ caching is off when that is unset. `cache` selects the mode:
 | `:refresh` | ignored | build, then overwrite |
 | `:off` | — | build |
 
-**A hit skips `FaultElasticity` as well as the solves**, which is the bulk of
-the remaining cost: the cache file carries the `Ω_f` axes, and nothing else in
-`BP8Model` needs the elastic system once `K` exists. So a cached `:exact` model
-at a production configuration builds in seconds rather than days — which is what
-makes `:exact` usable for a sweep over the *cheap* axes (injection, friction,
-`t_f`, tolerances) where `K` does not change at all.
+**A hit skips `FaultElasticity` as well as the solves** — the file carries the
+`Ω_f` axes, and nothing else in `BP8Model` needs the elastic system once `K`
+exists. So a cached `:exact` model at a production configuration builds in
+seconds rather than days, which is what makes `:exact` usable for sweeps over
+the cheap axes (injection, friction, `t_f`, tolerances).
 
-The cache key spells out every input that reaches `K` and is verified against
-the file on load, so a changed configuration misses rather than silently
-returning the wrong `K`; see `StiffnessCache`.
+The key spells out every input reaching `K` and is verified on load, so a
+changed configuration misses rather than returning the wrong `K`. See
+`StiffnessCache`.
 """
 function build_model(; par::BP8Params=benchmark_parameters(),
                      Δz=par.Δz, L_fault=3par.l_f, L_normal=2par.l_f,
@@ -363,9 +342,8 @@ function build_model(; par::BP8Params=benchmark_parameters(),
 
     set = read_stencil_set(SbpOperators.sbp_operators_path() * "standard_diagonal.toml"; order)
     n1, n23 = fault_grid_sizes(par, Δz, L_fault, L_normal, order)
-    # SBP closures need more than two closure widths of points per dimension —
-    # also used below for the pore-pressure grid, which fault_grid_sizes does
-    # not know about.
+    # Also checked below for the pore-pressure grid, which `fault_grid_sizes`
+    # does not know about.
     n_min = 2order + 1
     verbose && @info "elastic grids" points_per_side = n1 * n23^2 dofs = 6 * n1 * n23^2
 
@@ -388,9 +366,9 @@ function build_model(; par::BP8Params=benchmark_parameters(),
     Q2, Q3 = darcy_operators(g_p, set; k=par.k, viscosity=par.viscosity)
     weights = diag(sparse(inner_product(g_p, set)))
 
-    # eq. 13: locked outside Ω_f. The outer ring of Ω_f nodes is held at V=0
-    # so slip is continuous into the locked region — a finite jump there would
-    # be a stress singularity the elastic solve cannot represent.
+    # eq. 13: locked outside Ω_f. The outer ring is held at V=0 so slip is
+    # continuous into the locked region; a jump there would be a stress
+    # singularity the elastic solve cannot represent.
     active = trues(nf)
     lin = LinearIndices((n2f, n3f))
     for j in 1:n3f, i in 1:n2f
@@ -413,10 +391,9 @@ function build_model(; par::BP8Params=benchmark_parameters(),
                  (; Δz, L_fault, L_normal, n1, n23, order,
                     elastic_dofs=6 * n1 * n23^2, n2f, n3f))
 
-    # Solve the pressure history up front, over the full benchmark duration, so
-    # the model is complete: `evaluate!` works immediately and any `run_bp8`
-    # sub-interval reuses it. Seconds, against hours for `K`. `pressure=false`
-    # skips it for callers that only want `K` (the cache builder, say).
+    # Up front over the full benchmark duration, so `evaluate!` works
+    # immediately and any `run_bp8` sub-interval reuses it. Seconds, against
+    # hours for `K`. `pressure=false` is for callers that only want `K`.
     if pressure
         tspan = (0.0, par.t_f)
         set_pressure_history!(m, solve_pressure_history(m; tspan, verbose, pressure_kwargs...),
@@ -437,25 +414,20 @@ pressure_length(m::BP8Model) = m.nf + (m.injection === :peaceman ? 1 : 0)
 """
     effective_stress_report(m) -> NamedTuple
 
-Whether the effective-normal-stress floor `par.σ̄_min` ever bound, how low
-`σ̄ = σ - p` went, and — the part that decides whether it matters — **how much
-of the fault was affected**. `σ̄ ≤ 0` means fluid pressure has fully unclamped
-the fault, at which point BP8's no-opening condition (eq. 3) no longer holds and
-the model is outside its range of validity. The Peaceman-well variant reaches
-this at Table 1's parameters; the Gaussian-source variant does not.
+Whether the floor `par.σ̄_min` ever bound, how low `σ̄ = σ - p` went, and how
+much of the fault was affected. `σ̄ ≤ 0` means fluid pressure has fully unclamped
+the fault and BP8's no-opening condition (eq. 3) no longer holds. BP8-PW reaches
+this at Table 1's parameters; BP8-GS does not.
 
-`nodes` and `radius` are what bound the damage. The unclamped region is a disc
-whose *physical* radius is set by where eq. 25's pressure crosses `σ` — about
-**15 m** at Table 1's parameters — and is therefore **independent of Δz**.
-Refining the grid does not enlarge it, it only resolves it: ~0.3 cells across at
-Δz = 50 m, ~1.5 at Δz = 10 m. So the well-cell `σ̄` falls steeply with resolution
-(−0.87 MPa at 50 m, −16.3 MPa at 10 m) while the affected *area* does not grow.
+`nodes` and `radius` bound the damage. The unclamped region is a disc whose
+physical radius is set by where eq. 25's pressure crosses `σ` — about **15 m**
+at Table 1's parameters — so it is independent of `Δz`: refining resolves it
+rather than enlarging it (~0.3 cells across at Δz = 50 m, ~1.5 at 10 m).
 Against `l_f` = 400 m that is a localized defect in BP8-PW's own point-source
-specification, not a discretization problem and not one that contaminates the
-fault at large. See `PROGRESS.md` "Known limitations" 3.
+specification, not a discretization problem. `PROGRESS.md` limitation 3.
 
-`floor_hits` counts RHS **evaluations**, so it scales with the integrator's step
-count and is not a measure of extent; use `nodes` for that.
+`floor_hits` counts RHS evaluations, so it tracks step count, not extent — use
+`nodes`.
 """
 function effective_stress_report(m::BP8Model)
     idx = findall(m.cache.floor_nodes)
@@ -480,12 +452,10 @@ process_zone(par::BP8Params, σ̄=par.σ0) = par.μ * par.D_RS / (par.b * σ̄)
 """
     resolution_report(m) -> NamedTuple
 
-How well `Δz` resolves the two length scales that matter: the rate-and-state
-process zone `L_b` and the Gaussian source width `L_gauss`. Rate-and-state
-slip rate depends exponentially on `σ̄` (through `V ~ exp(τ/(aσ̄))`), so an
-under-resolved pressure field turns into an order-of-magnitude error in peak
-slip rate, not a proportional one. Treat `cells_per_Lb < 3` as "the run shows
-the right physics but the numbers are not converged".
+How well `Δz` resolves the process zone `L_b` and the source width
+`L_gauss`. `V ~ exp(τ/(aσ̄))`, so an under-resolved pressure field gives an
+order-of-magnitude error in peak slip rate, not a proportional one. Treat
+`cells_per_Lb < 3` as "right physics, unconverged numbers".
 """
 function resolution_report(m::BP8Model)
     par = m.par
@@ -498,22 +468,15 @@ function resolution_report(m::BP8Model)
             converged=Lb0 / Δz >= 3)
 end
 
-# ==============================================================================
 # Pore pressure: integrated separately, implicitly, once.
 #
-# The pressure subsystem is *autonomous* — its right-hand side reads only `p`,
-# `p_well` and `t`, never slip or state (eq. 17-23; the coupling to elasticity
-# is one-way, through `σ̄ = σ - p`). So it does not belong in the coupled state
-# vector at all: it can be integrated on its own, with a method suited to it,
-# and the elastic integration then interpolates the result.
+# The pressure subsystem is autonomous — its RHS reads only `p`, `p_well` and
+# `t`, never slip or state (eq. 17-23; the coupling is one-way through
+# `σ̄ = σ - p`). So it does not belong in the coupled state at all: integrate it
+# on its own with a method suited to it, then interpolate.
 #
-# Measured at Δz = 10 m over the full 30 days, `Rodas5P` with the analytic
-# Jacobian below: 180 steps (Gaussian) / 283 steps (Peaceman), ~6 s, and the
-# step count is **resolution-independent** (94/88/95 at Δz = 50/25/10 m).
-# Carrying `p` explicitly in the coupled system instead cost `nf` of `4nf+1`
-# state entries and needed the loosened per-block `abstol` that used to sit in
-# `run_bp8`.
-# ==============================================================================
+# `Rodas5P` with the analytic Jacobian: 180 steps (GS) / 283 (PW) over 30 days,
+# ~6 s, and resolution-independent (94/88/95 at Δz = 50/25/10 m).
 
 """
     pressure_operator(m) -> J
@@ -533,28 +496,18 @@ pressure_operator(m::BP8Model) =
 Integrates the autonomous pore-pressure subsystem over `tspan` and returns the
 `ODESolution`, whose dense output is what `evaluate!` later interpolates.
 
-The subsystem is *linear*, so its Jacobian is exactly the constant `J` from
-[`pressure_operator`](@ref); supplying it explicitly is what makes the implicit
-solve cheap (and avoids a dense Jacobian being built by finite differences —
-that alone was 400 s and 1 GB at Δz = 10 m in testing).
+The subsystem is linear, so its Jacobian is exactly the constant `J` from
+[`pressure_operator`](@ref). Supplying it is what makes the implicit solve
+cheap and avoids a finite-difference dense Jacobian (400 s and 1 GB at
+Δz = 10 m).
 
-**`save_everystep=true` is the point, not an oversight.** The solve needs only
-~180-280 steps for the whole benchmark, so the full dense output is 57 MB
-(Gaussian) / 79 MB (Peaceman) at Δz = 10 m — small enough to keep in memory,
-and the solver's own interpolant is far better than storing levels on a fixed
-grid and interpolating linearly between them. Measured against a `reltol=1e-11`
-reference at Δz = 10 m:
-
-| interpolation | max error | induced error in `V` |
-|---|---|---|
-| **dense output (this)** | **4.4 Pa** | **0.003 %** |
-| linear, hourly levels | 10.8 kPa | 7.1 % |
-| linear, 300 s levels | 85 Pa | 0.05 % |
-
-Linear interpolation is second-order and converges, but `V ~ exp(τ/(aσ̄))`
-amplifies pressure error exponentially, and the error concentrates entirely at
-the two kinks in the forcing (`t = 0` and `t_off`) — exactly where an adaptive
-solver puts steps and a fixed grid does not.
+**`save_everystep=true` is deliberate.** The solve takes only ~180-280 steps,
+so the dense output is 57-79 MB at Δz = 10 m and the solver's own interpolant
+is far better than linear interpolation on a fixed grid: 4.4 Pa max error
+(0.003% in `V`) against 10.8 kPa (7.1%) for hourly levels. `V ~ exp(τ/(aσ̄))`
+amplifies pressure error exponentially, and the error concentrates at the two
+kinks in the forcing (`t = 0`, `t_off`) — where an adaptive solver puts steps
+and a fixed grid does not.
 """
 function solve_pressure_history(m::BP8Model; tspan=(0.0, m.par.t_f), alg=Rodas5P(),
                                 reltol=1e-8, abstol=1e-3, verbose=false)
@@ -562,10 +515,9 @@ function solve_pressure_history(m::BP8Model; tspan=(0.0, m.par.t_f), alg=Rodas5P
     J = pressure_operator(m)
     n = size(J, 1)
 
-    # Both variants force through the same eq. 20 on/off switch, so the whole
-    # time dependence is one scalar times a fixed vector: the Gaussian source
-    # spread over the fault (eq. 19), or the injection rate into the well bore's
-    # storage (eq. 23).
+    # Both variants force through the same eq. 20 on/off switch, so the time
+    # dependence is one scalar times a fixed vector: the Gaussian source over
+    # the fault (eq. 19), or the rate into the well bore's storage (eq. 23).
     b = zeros(n)
     if m.injection === :gaussian
         b .= (q0_per_thickness(par) / (par.β * par.φ)) .* m.source
@@ -599,24 +551,21 @@ function set_pressure_history!(m::BP8Model, sol, tspan)
     return m
 end
 
-# Interpolation happens behind a function barrier because `PressureHistory.sol`
-# is untyped: everything inside `_interp_pressure!` specializes on the concrete
-# solution type, so the per-call cost is one dynamic dispatch, not a
-# type-unstable inner loop.
+# A function barrier, because `PressureHistory.sol` is untyped: the body
+# specializes on the concrete solution type, so the cost is one dynamic dispatch
+# rather than a type-unstable inner loop.
 _interp_pressure!(dest, sol, t) = (sol(dest, t); dest)
 
 """
     well_pressure(m, t)
 
-The Peaceman well-bore pressure `p_well` at time `t` (BP8-QD eq. 23), the extra
-unknown carried by [`well_coupled_operator`](@ref). Errors for the Gaussian
-variant, which has no well.
+The Peaceman well-bore pressure `p_well` at time `t` (BP8 eq. 23), the extra
+unknown [`well_coupled_operator`](@ref) carries. Errors for the Gaussian
+variant.
 
-It is not a §4 reported output — it is an internal unknown — but it is what the
-injected-volume balance and the eq. 25 point-source check need. After the
-initial transient it sits at `p[well_cell] + Q0/WI`; measured at `t_off`, that
-offset is 53.4 MPa at Δz = 50 m and 38.0 MPa at Δz = 10 m, against `Q0/WI` of
-53.4 and 38.0.
+Not a §4 output, but the injected-volume balance and the eq. 25 point-source
+check need it. After the initial transient it sits at `p[well_cell] + Q0/WI`,
+matching `Q0/WI` to three figures at `t_off`.
 """
 function well_pressure(m::BP8Model, t)
     m.injection === :peaceman ||
@@ -629,9 +578,8 @@ end
     pressure_at!(m, t) -> p
 
 Pore pressure on the fault at time `t`, interpolated from the stored history
-into the model cache (no allocation). Errors rather than extrapolating if `t`
-lies outside the history — silently extrapolating a diffusion solution past its
-integration window would be a quiet source of wrong answers.
+into the model cache without allocating. Errors rather than extrapolating past
+the history's window, which would be a quiet source of wrong answers.
 """
 function pressure_at!(m::BP8Model, t)
     ph = m.pressure
@@ -650,11 +598,10 @@ end
 """
     initial_state(m) -> u
 
-BP8 eq. 26-29: zero slip, zero pressure change, and the state variable that
-makes the initial slip rate exactly `V_init` under the initial shear traction
-`τ_init`. Note the strength has to balance `τ_init - η‖V‖`, not `τ_init` — the
-radiation-damping term is only ~5e-6 Pa here, but including it makes the
-initial condition exactly self-consistent.
+BP8 eq. 26-29: zero slip, zero pressure change, and the state variable making
+the initial slip rate exactly `V_init` under `τ_init`. The strength balances
+`τ_init - η‖V‖`, not `τ_init`: the damping term is only ~5e-6 Pa, but including
+it makes the initial condition exactly self-consistent.
 """
 function initial_state(m::BP8Model)
     p = m.par
@@ -669,17 +616,15 @@ end
 """
     evaluate!(m, u, t; onfail=:error) -> cache
 
-Fills the model cache with the derived fields at state `u`: the elastic
-traction change, the slip velocity from the force balance, and the total shear
-stress. Used by both the right-hand side and the output writers, so they
-cannot drift apart.
+Fills the model cache with the derived fields at state `u`: elastic traction
+change, slip velocity from the force balance, total shear stress. Used by both
+the right-hand side and the output writers, so they cannot drift apart.
 
-`onfail` is forwarded to [`solve_slip_rate`](@ref). The right-hand side and the
-Jacobian pass `:nan`, because an implicit integrator's Newton iteration will
-evaluate them at trial states it is about to throw away, and a `NaN` there is
-the signal it needs to reject the step; the output writers keep the default
-`:error`, since they only ever see accepted states and a silent `NaN` in a
-benchmark file would be worse than an exception.
+`onfail` goes to [`solve_slip_rate`](@ref). The RHS and Jacobian pass `:nan`,
+since an implicit integrator evaluates them at trial states it is about to
+discard and a `NaN` is the signal to reject the step. The writers keep
+`:error`: they only see accepted states, and a silent `NaN` in a benchmark file
+would be worse than an exception.
 """
 function evaluate!(m::BP8Model, u, t; onfail::Symbol=:error)
     p = m.par
@@ -690,9 +635,9 @@ function evaluate!(m::BP8Model, u, t; onfail::Symbol=:error)
 
     slip = @view u[1:2nf]
     ϕ = @view u[2nf+1:3nf]
-    # A non-finite `t` can only come from an integrator whose step has already
-    # gone bad (a NaN `dt`); `pressure_at!` would throw on it, and under
-    # `:nan` the contract is to hand the NaN back so the step is rejected.
+    # A non-finite `t` means the integrator's step has already gone bad;
+    # `pressure_at!` would throw, and under `:nan` the contract is to hand the
+    # NaN back so the step is rejected.
     if !isfinite(t) && onfail === :nan
         for v in (c.Δτ, c.V2, c.V3, c.Vmag, c.τ2, c.τ3)
             fill!(v, NaN)
@@ -726,7 +671,7 @@ function evaluate!(m::BP8Model, u, t; onfail::Symbol=:error)
         c.V3[i] = V[2]
         c.Vmag[i] = norm(V)
         # The warm start must survive a failed evaluation: `max(NaN, x)` is
-        # `NaN`, and a `NaN` seed would poison every later solve at this node.
+        # `NaN`, which would poison every later solve at this node.
         isfinite(c.Vmag[i]) && (c.Vprev[i] = max(c.Vmag[i], 1e-30))
         # eq. 8: the shear stress actually acting on the fault.
         c.τ2[i] = m.τ0[1] + c.Δτ[i] - η * V[1]
@@ -756,52 +701,41 @@ function rhs!(du, u, m::BP8Model, t)
     return nothing
 end
 
-# ==============================================================================
 # The block-diagonal Jacobian that makes an implicit integrator affordable.
 #
-# BP8-PW is stiff (PROGRESS.md "Known limitations" 3): once fluid pressure has
-# floored σ̄ at the well cell, that node's slip rate `V ~ exp(τ/(aσ̄))` reacts
-# to its own traction on a time scale `D/K_ww` with `D ∝ σ̄`, and an explicit
-# integrator's step count grows like `Δz⁻⁴` — 75× the Gaussian variant's at
-# Δz = 50 m and weeks-to-months extrapolated to Δz = 10 m. Splitting the
-# pressure out of the state (2026-09-09) did not touch this: the mode is on the
-# friction side.
+# BP8-PW is stiff: once pressure has floored σ̄ at the well cell, that node's
+# `V ~ exp(τ/(aσ̄))` reacts to its own traction on a time scale `D/K_ww` with
+# `D ∝ σ̄`, and an explicit step count grows like `Δz⁻⁴` (weeks-to-months
+# extrapolated to Δz = 10 m). Splitting pressure out of the state did not touch
+# it — the mode is on the friction side.
 #
-# The measured cure is implicit integration of exactly that mode, and the
-# measurement that makes it cheap (`scripts/bp8_stiffness_spectrum.jl`) is
-# that the mode is LOCAL: keeping only each node's own 3×3 block `(s2, s3, ϕ)`
-# of the full Jacobian — i.e. only `diag(K)`, no elastic coupling between
-# nodes — reproduces the stiff eigenvalue to a ratio of 1.0000. So the
-# integrator is handed this block-diagonal `J` in place of the dense one, and
-# its Newton iteration solves `nf` independent 3×3 systems per stage instead
-# of factorising a dense `3nf × 3nf` matrix.
+# The cure is implicit integration of that mode, made cheap by the mode being
+# LOCAL: each node's own 3×3 block `(s2, s3, ϕ)` — only `diag(K)`, no elastic
+# coupling — reproduces the stiff eigenvalue to a ratio of 1.0000
+# (`scripts/extra/bp8_stiffness_spectrum.jl`). So the integrator gets this
+# block-diagonal `J` and its Newton iteration solves `nf` independent 3×3
+# systems per stage instead of factorising a dense `3nf × 3nf`.
 #
-# WHY AN INEXACT JACOBIAN IS ENOUGH. The true `J` differs from this one by the
-# off-diagonal blocks `(∂V_i/∂T)·K_ij`, which are large only in the *rows* of
-# floored nodes (`1/D` is huge there). Newton's error-propagation matrix
-# `(I - γhJ_blk)⁻¹·γh·(J - J_blk)` therefore has O(1) entries confined to those
-# few rows — and a matrix whose only large entries sit in one row has
-# eigenvalues equal to that row's *diagonal* entry, which is zero. Newton still
-# contracts; it just needs a couple more iterations than with the exact `J`.
-# Crucially the converged stage solution is the same, so this is not an
-# approximation of the answer, only of how it is found. (The alternative — a
-# full finite-difference `J` — is `3nf` right-hand-side evaluations, each a
-# dense `K` mat-vec plus `nf` nested Newton solves: ~10 min *per Jacobian* at
-# Δz = 10 m, which is what sank the `Rosenbrock23` probe recorded in TODO.md.)
+# WHY AN INEXACT JACOBIAN IS ENOUGH. The true `J` differs by the off-diagonal
+# `(∂V_i/∂T)·K_ij`, large only in the rows of floored nodes. Newton's error
+# propagation `(I - γhJ_blk)⁻¹·γh·(J - J_blk)` therefore has O(1) entries in a
+# few rows only, and a matrix whose large entries sit in one row has eigenvalues
+# equal to that row's diagonal, which is zero. Newton still contracts, just with
+# a couple more iterations, and the converged stage solution is unchanged — this
+# approximates how the answer is found, not the answer. A full finite-difference
+# `J` would be ~10 min *per Jacobian* at Δz = 10 m.
 #
-# The derivatives are closed-form from the converged force balance
+# Derivatives are closed-form from the converged force balance
 # (`RateStateFriction.slip_rate_derivatives`); `test/bp8_test.jl` checks the
-# whole block against finite differences of `rhs!`.
-# ==============================================================================
+# block against finite differences of `rhs!`.
 
 """
     state_jacobian_prototype(m) -> SparseMatrixCSC
 
-The sparsity pattern of [`state_jacobian!`](@ref): `nf` independent 3×3
-blocks coupling each node's `(s2, s3, ϕ)`, which in the stacked
-`[s2; s3; ϕ]` ordering land at rows and columns `(i, nf+i, 2nf+i)`. Passed
-as `jac_prototype` so the integrator's linear solver sees a sparse `W` with
-no fill — a block-diagonal system in disguise.
+[`state_jacobian!`](@ref)'s sparsity: `nf` independent 3×3 blocks coupling each
+node's `(s2, s3, ϕ)`, which in the stacked `[s2; s3; ϕ]` ordering sit at rows
+and columns `(i, nf+i, 2nf+i)`. Passed as `jac_prototype` so the integrator's
+linear solver sees a sparse `W` with no fill.
 """
 function state_jacobian_prototype(m::BP8Model)
     nf = m.nf
@@ -832,12 +766,11 @@ slip-rate magnitude `V` and the derivatives `∂V/∂T`, `∂V/∂ϕ`:
     ∂ϕ̇/∂s_i = -(∂V/∂T)·t̂ᵀ·K_ii / D_RS
     ∂ϕ̇/∂ϕ   = -e^{-ϕ} - (∂V/∂ϕ) / D_RS
 
-where `K_ii` is the node's own 2×2 block of `K`. The first line is the
-derivative of `V⃗ = V(|T|)·T/|T|`: the magnitude responds along `t̂`, and the
-direction rotates at rate `V/|T|` in the perpendicular. Locked nodes, nodes
-with zero trial stress and nodes whose force balance failed to converge get
-only the `-e^{-ϕ}` diagonal, which is exact for the first two and the safe
-choice for the third (the step is being rejected anyway).
+where `K_ii` is the node's own 2×2 block of `K`. The first line differentiates
+`V⃗ = V(|T|)·T/|T|`: the magnitude responds along `t̂`, the direction rotates at
+`V/|T|` perpendicular to it. Locked nodes, zero trial stress and failed force
+balances get only the `-e^{-ϕ}` diagonal — exact for the first two, and safe for
+the third since the step is being rejected anyway.
 """
 function state_jacobian!(J, u, m::BP8Model, t)
     p = m.par
@@ -892,32 +825,27 @@ default_integrator(m::BP8Model) = m.injection === :peaceman ? QNDF() : Tsit5()
     run_bp8(m; tspan=(0.0, m.par.t_f), alg=default_integrator(m), reltol=1e-8,
               saveat=3600.0, verbose=false, pressure_kwargs=(;), kwargs...)
 
-Integrates slip and state. Absolute tolerances are set per block (slip, ln θ)
-because they live on wildly different scales.
+Integrates slip and state. Absolute tolerances are per block (slip, ln θ),
+which live on very different scales.
 
 **The integrator defaults per injection model** ([`default_integrator`](@ref)):
-explicit `Tsit5` for the Gaussian source, whose ~400 steps over the benchmark
-leave nothing to gain, and implicit `QNDF` with the block-diagonal
-[`state_jacobian!`](@ref) for the Peaceman well, which is stiff once the well
-cell reaches the `σ̄_min` floor. Measured over 100 h at Δz = 25 m: Tsit5
-488,788 steps / 4,901 s against QNDF 1,105 steps / 20 s, and the implicit step
-count does *not* grow under refinement (1,621 at Δz = 50 m) where the explicit
-one grew as `Δz⁻⁴`. Both land on the same solution to the tolerances asked for
-(`test/bp8_test.jl`). Pass `alg` explicitly to override — any OrdinaryDiffEq
-method works, and the Jacobian is always attached, though note Rosenbrock
-methods do *not* tolerate its dropped off-diagonal blocks (they have no Newton
-loop to absorb them and take more steps than Tsit5).
+explicit `Tsit5` for the Gaussian source, whose ~400 steps leave nothing to
+gain, and implicit `QNDF` with the block-diagonal [`state_jacobian!`](@ref) for
+the Peaceman well. Over 100 h at Δz = 25 m: Tsit5 488,788 steps / 4,901 s
+against QNDF 1,105 steps / 20 s, and the implicit count does not grow under
+refinement where the explicit one grew as `Δz⁻⁴`. Both reach the same solution
+to tolerance (`test/bp8_test.jl`). Pass `alg` to override; the Jacobian is
+always attached, but Rosenbrock methods do not tolerate its dropped off-diagonal
+blocks — they have no Newton loop to absorb them.
 
 **Pore pressure is solved first, separately and implicitly**
-([`solve_pressure_history`](@ref)), and attached to `m`; the slip integration
-then interpolates it. That costs a few seconds and removes `p` from the
-explicitly integrated state entirely. Pass `pressure_kwargs` to override that
-solve (`alg`, `reltol`, `abstol`). An already-attached history *covering* `tspan`
-is reused — `build_model` attaches one over the full `par.t_f` by default, so
-sub-interval runs and parameter sweeps over elastic settings pay for it once.
+([`solve_pressure_history`](@ref)) and attached to `m`; the slip integration
+interpolates it. An already-attached history covering `tspan` is reused, and
+`build_model` attaches one over the full `par.t_f`, so sub-interval runs and
+sweeps over elastic settings pay for it once. `pressure_kwargs` overrides that
+solve.
 
-`progress` (defaults to `verbose`) shows a `ProgressMeter` bar tracking `t/tspan[2]`,
-updated on every accepted step (ProgressMeter throttles the redraws itself).
+`progress` (defaults to `verbose`) shows a bar tracking `t/tspan[2]`.
 """
 function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=default_integrator(m), reltol=1e-8,
                  saveat=3600.0, verbose=false, progress=verbose,
@@ -933,8 +861,8 @@ function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=default_integrator(m),
     abstol[1:2nf] .= 1e-14        # slip, m
     abstol[2nf+1:3nf] .= 1e-10    # ln θ
 
-    # The Jacobian is attached unconditionally; explicit methods ignore it, and
-    # the prototype is 9nf entries. See the comment block above `state_jacobian!`.
+    # Attached unconditionally: explicit methods ignore it and the prototype is
+    # only 9nf entries. See the comment block above `state_jacobian!`.
     f = ODEFunction(rhs!; jac=state_jacobian!, jac_prototype=state_jacobian_prototype(m))
     prob = ODEProblem(f, u0, tspan, m)
     t0 = time()
@@ -948,35 +876,30 @@ function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=default_integrator(m),
         solve_kwargs = (; solve_kwargs..., callback=cb)
     end
     # `save_everystep=false`: `saveat` already defines the output grid, and
-    # storing every accepted step on top of it is what made the Peaceman variant
-    # blow up. Measured at Δz = 50 m over 100 h: 31,249 accepted steps for 101
-    # wanted outputs, 284 MB against 1.1 MB — and the stiffness that drives that
-    # step count grows steeply as Δz shrinks (a Δz = 25 m run reached 7.9 GB
-    # without finishing; see `PROGRESS.md` limitation 3).
+    # storing every accepted step on top of it is what made BP8-PW blow up —
+    # 284 MB against 1.1 MB at Δz = 50 m over 100 h, and a Δz = 25 m run reached
+    # 7.9 GB without finishing.
     #
-    # `sol(t)` still works: on the `saveat` grid it is bit-identical, and
-    # `write_profiles`' default `profile_dt` equals the default `saveat`, so the
-    # shipped path only ever asks for on-grid times. A `profile_dt` that is not
-    # a multiple of `saveat` interpolates across hour-wide gaps instead of
-    # actual steps — measured at 1.3e-5 relative, negligible here but not zero.
+    # `sol(t)` still works and is bit-identical on the `saveat` grid, which is
+    # all the shipped path asks for (`write_profiles`' default `profile_dt`
+    # equals the default `saveat`). A `profile_dt` that is not a multiple of
+    # `saveat` interpolates across hour-wide gaps: 1.3e-5 relative, not zero.
     sol = solve(prob, alg; solve_kwargs...)
     progress && finish!(prog)
     verbose && @info "integration finished" seconds = round(time() - t0, digits=1) saved = length(sol.t) steps = sol.stats.naccept retcode = sol.retcode
     return sol
 end
 
-# ==============================================================================
 # Analytic pore-pressure solutions (eq. 21 and 25), valid for t ≪ l_f²/(4α) ≈
-# 220 h — i.e. before diffusion reaches the no-flux edges of Ω_f. §6 asks
-# explicitly that the Peaceman well be checked against eq. 25.
-# ==============================================================================
+# 220 h, i.e. before diffusion reaches Ω_f's no-flux edges. §6 asks explicitly
+# that the Peaceman well be checked against eq. 25.
 
 """
     expint_e1(x)
 
 The exponential integral `E₁(x) = ∫_x^∞ e^{-s}/s ds` for `x > 0`: series for
-`x < 1`, Lentz continued fraction otherwise. Implemented here rather than
-depending on `SpecialFunctions` for this one function.
+`x < 1`, Lentz continued fraction otherwise. Here rather than a
+`SpecialFunctions` dependency for one function.
 """
 function expint_e1(x::Real)
     x > 0 || throw(DomainError(x, "E₁ is defined here for x > 0"))
@@ -1036,9 +959,7 @@ function analytic_pressure_point(r, t, p::BP8Params)
     return q0 / (4π * p.α * p.β * p.φ) * expint_e1(r^2 / (4p.α * t))
 end
 
-# ==============================================================================
 # Benchmark output (§4).
-# ==============================================================================
 
 """
     station_locations()
@@ -1102,8 +1023,8 @@ function write_outputs(m::BP8Model, sol, dir; modeler="", profile_dt=3600.0)
     times = sol.t
     nf = m.nf
 
-    # Derived fields at every saved time, computed through the same
-    # `evaluate!` the integrator used.
+    # Derived fields at every saved time, through the same `evaluate!` the
+    # integrator used.
     ns = length(times)
     V2 = Matrix{Float64}(undef, nf, ns)
     V3 = similar(V2); τ2 = similar(V2); τ3 = similar(V2)
@@ -1191,13 +1112,12 @@ function write_global(m, dir, times, Vmax, moment_rate, step_lines, modeler)
 end
 
 """
-Profile files (§4.3), in the exact layout of that section's worked example:
-an `(N_t+1) × (N_coord+2)` matrix whose first row is `0 0 <coordinates>` and
-whose remaining rows are `t  max_slip_rate  <quantity at each coordinate>`.
-The two leading zeros on the coordinate row keep every row the same width.
-The field list is four separate lines, and the header keys (`author`,
-`code_version`) differ from the time-series files' (`modeler`, `version`) —
-both follow their own section's example.
+Profile files (§4.3), in the layout of that section's worked example: an
+`(N_t+1) × (N_coord+2)` matrix whose first row is `0 0 <coordinates>` and whose
+rest are `t  max_slip_rate  <quantity at each coordinate>`. The two leading
+zeros keep every row the same width. The field list is four separate lines, and
+the header keys (`author`, `code_version`) differ from the time-series files'
+(`modeler`, `version`) — each follows its own section's example.
 """
 function write_profiles(m, sol, dir, profile_dt, modeler)
     nf = m.nf

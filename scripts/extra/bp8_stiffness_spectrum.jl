@@ -21,7 +21,7 @@
 # well exchange is ~10x stiffer than diffusion at Δz = 100 m; see the last
 # section.
 #
-# Run: julia --project=scripts scripts/bp8_stiffness_spectrum.jl [Δz]
+# Run: julia --project=scripts scripts/extra/bp8_stiffness_spectrum.jl [Δz]
 
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.BP8

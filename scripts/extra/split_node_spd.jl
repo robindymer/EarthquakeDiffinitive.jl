@@ -35,7 +35,7 @@
 # nonsymmetric matrix, so agreement with the direct solve is what stands in
 # for one. Hand-rolled CG — 25 lines, versus a new dependency.
 #
-# Run with:  julia --project=. scripts/split_node_spd.jl [n ...]
+# Run with:  julia --project=. scripts/extra/split_node_spd.jl [n ...]
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.ElasticitySplitNode
 using Diffinitive.Grids

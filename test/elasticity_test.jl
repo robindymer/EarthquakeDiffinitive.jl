@@ -48,7 +48,7 @@ end
     # normal-direction terms need the boundary derivative. An earlier
     # `traction_blocks` used `first_derivative` for everything and failed this
     # by O(1), which left `-HP(D+SAT)P` ~14% asymmetric and CG unusable.
-    # See SYMMETRIC_SAT.md; reproduce with scripts/symmetry_decomposition.jl.
+    # See SYMMETRIC_SAT.md; reproduce with scripts/extra/symmetry_decomposition.jl.
     #
     # Note the identity involves no boundary-value problem, no SAT and no
     # projection: it is a property of E and T alone, which is what makes it the

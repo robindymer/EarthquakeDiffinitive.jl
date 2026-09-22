@@ -1,6 +1,6 @@
 # WHERE does the asymmetry in `A = -H P (D+SAT) P` come from?
 #
-# `scripts/split_node_spd.jl` measures that `A` is ~14% asymmetric and that the
+# `scripts/extra/split_node_spd.jl` measures that `A` is ~14% asymmetric and that the
 # bulk is clean, which narrows it to "the fault SAT" but no further. This script
 # takes the operator apart factor by factor so the defect can be attributed to
 # one specific piece.
@@ -27,7 +27,7 @@
 #   4  TWO GRIDS          — H*(D+SAT_interface), then the two orderings from
 #                           test 2, to see which if either is symmetric.
 #
-# Run with:  julia --project=. scripts/symmetry_decomposition.jl [n ...]
+# Run with:  julia --project=. scripts/extra/symmetry_decomposition.jl [n ...]
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.Elasticity: elastic_blocks, traction_blocks
 using EarthquakeDiffinitive.ElasticitySplitNode

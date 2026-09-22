@@ -1,4 +1,3 @@
-# ==============================================================================
 # Convergence-order study.
 #
 # STANDALONE — deliberately not included from `runtests.jl`. Run it directly:
@@ -6,27 +5,19 @@
 #     julia --project=. test/convergence_test.jl
 #
 # It costs minutes rather than seconds (the split-node section alone solves a
-# 215k-DOF system), which is why it is not in the suite. Run it after touching
-# `Elasticity.jl`, `ElasticitySplitNode.jl`, or after an upstream Diffinitive
-# stencil change.
+# 215k-DOF system). Run it after touching `Elasticity.jl`,
+# `ElasticitySplitNode.jl`, or after an upstream Diffinitive stencil change.
 #
-# WHY THIS EXISTS
+# WHY THIS EXISTS. Every refinement check in the suite proper is a
+# *monotonicity* assertion, which a scheme converging at order 1 where it
+# should be 2 — or at `h^0.56` — passes. That is not hypothetical: the
+# wide/narrow `traction_blocks` bug (SYMMETRIC_SAT.md) was a consistency-order
+# defect whose asymmetry decayed as `h^0.56`. Order collapse is the failure
+# mode this codebase has actually had, and only rates detect it.
 #
-# Every refinement check in the suite proper is a *monotonicity* assertion —
-# `e5 < e10 < e20` in `pore_pressure_test.jl`, `σ11(fine) < σ11(coarse)` in
-# `elasticity_split_node_test.jl`. A scheme converging at order 1 where it
-# should be order 2, or at `h^0.56`, passes all of them. That matters here
-# specifically: the wide/narrow `traction_blocks` bug (SYMMETRIC_SAT.md) was a
-# *consistency-order* defect whose asymmetry decayed as `h^0.56`. Order
-# collapse is the failure mode this codebase has actually had, and rates are
-# what detect it.
-#
-# THE THREE ORDERS, WHICH ARE NOT THE SAME NUMBER
-#
-# The recurring confusion is between *truncation* order (how well an operator
-# reproduces a derivative pointwise) and *solution* order (how fast the answer
-# converges). They differ here by almost two orders, and in the helpful
-# direction. Measured:
+# THE THREE ORDERS, WHICH ARE NOT THE SAME NUMBER. *Truncation* order (how well
+# an operator reproduces a derivative pointwise) and *solution* order (how fast
+# the answer converges) differ here by almost two, in the helpful direction:
 #
 #   interior truncation, elastic operator     4      (§2)
 #   boundary truncation, D1 and D2 alone      2      (§1) — textbook SBP
@@ -34,69 +25,49 @@
 #   solution error, displacement            ~3       (§4)
 #   fault shear traction σ21                ~2       (§4) — the one that matters
 #
-# WHY THE BOUNDARY IS ORDER 1 AND NOT ORDER 2
-#
-# Diagonal-norm SBP of interior order 2p has boundary closure order p, so
-# order 4 → order 2 at the boundary. §1 confirms that for `first_derivative`
-# and the narrow `second_derivative` individually.
-#
-# The elastic operator drops to order 1 there, but NOT because it composes
-# operators — that would be too broad a claim, and §2b measures it false.
-# Composition costs an order only when the OUTER derivative is taken in the
-# same direction as the boundary being crossed:
+# WHY THE BOUNDARY IS ORDER 1, NOT 2. Diagonal-norm SBP of interior order 2p
+# has closure order p, so order 4 → 2 at the boundary (§1 confirms this for
+# `first_derivative` and narrow `second_derivative` individually). The elastic
+# operator drops to 1, but not merely because it composes operators — §2b
+# measures that claim false. Composition costs an order only when the OUTER
+# derivative runs in the same direction as the boundary being crossed:
 #
 #   D1x∘D1x  normal-normal          order 1     ← the only term that loses it
 #   D1x∘D1y  normal-tangential      order 2
 #   D1y∘D1y  tangential-tangential  order 4
 #   D2x      narrow, same direction order 2
 #
-# The mechanism. `D1` is order-p accurate on a SMOOTH grid function. The inner
-# `D1`'s truncation error τ is not one: it holds distinct O(h²) values on its
-# closure rows and O(h⁴) beyond, i.e. a boundary layer of fixed width in GRID
-# POINTS, so it varies by O(h²) across O(h) of the axis. Differentiating that
-# ALONG the layer's own direction divides by h and gives O(h) — the operator is
-# not being inaccurate, it is accurately differentiating something that becomes
-# discontinuous as h→0. Differentiating across it costs nothing, because τ is
-# smooth in the other direction; hence the D1x∘D1y row above.
+# The inner `D1`'s truncation error is a boundary layer of fixed width in GRID
+# POINTS, so it varies by O(h²) across O(h) of the axis. Differentiating along
+# the layer's own direction divides by h and gives O(h); differentiating across
+# it costs nothing, since the error is smooth in that direction. Splitting the
+# composed error into a smooth-input and an error-input part measures 1.99 and
+# 1.01 respectively.
 #
-# Splitting the composed error into `A = D1·u' - u''` (smooth input) and
-# `B = D1·τ` (error input), which sum to it exactly, measures A at 1.99 and
-# B at 1.01. The same split on the ORDER 2 operator is provable by hand:
-# rows `(-1,1)/h` and `(-1,0,1)/2h` give (D1(D1u))₁ = (u₁-2u₂+u₃)/(2h²) → u''/2,
-# a factor of two, i.e. not merely a lost order but inconsistent.
-#
-# DO NOT "FIX" THIS. Note from the table that the one term which loses the
-# order is exactly the one with a narrow equivalent, so `isotropic_lambda_mu`
-# could use `i == j ? λ*D2[i] : λ*(D1[i]∘D1[j])` and recover order 2. It would
-# buy nothing and cost two things:
+# DO NOT "FIX" THIS. The one term that loses the order is exactly the one with
+# a narrow equivalent, so `isotropic_lambda_mu` could recover order 2 with
+# `i == j ? λ*D2[i] : λ*(D1[i]∘D1[j])`. It would buy nothing and cost two
+# things:
 #
 #   * σ21 would not improve. It is `traction_blocks` applied to the solution,
-#     so its error is T·(U_h - u) + (T·u - σ21). The second term is the
-#     traction operator's OWN closure truncation error, order 2 (§3), and
-#     raising the elastic closure does not touch it. σ21 stays order 2 — and
-#     σ21 is the only quantity that reaches `K`, hence all of BP8.
-#   * It discards the λ/μ dispersion consistency `Elasticity.jl` documents as
-#     deliberate, and narrow `D2`'s SBP identity carries `normal_derivative`
-#     rather than `e∘D1` — so λ's normal terms in `traction_blocks` must be
-#     re-derived in lockstep or `-HP(D+SAT)P` goes asymmetric again. That is
-#     exactly the bug in SYMMETRIC_SAT.md.
+#     so its error carries the traction operator's own closure error, order 2
+#     (§3), which raising the elastic closure does not touch. σ21 is the only
+#     quantity that reaches `K`, hence all of BP8.
+#   * It discards the deliberate λ/μ dispersion consistency, and narrow `D2`'s
+#     SBP identity carries `normal_derivative` rather than `e∘D1` — so λ's
+#     normal terms in `traction_blocks` must be re-derived in lockstep or
+#     `-HP(D+SAT)P` goes asymmetric again. That is the SYMMETRIC_SAT.md bug.
 #
-# Raising σ21 past order 2 needs order 6 (closure order p=3), which is blocked
-# upstream — see TODO.md §3.
+# Raising σ21 past order 2 needs order 6 (closure order p=3), blocked upstream
+# (TODO.md §3). The order-1 closure does not propagate: §4 shows displacement
+# still converging at ~3, because the closure occupies a region of width O(h).
 #
-# The order-1 closure also does not propagate: §4 shows the displacement still
-# converging at ~3. The closure occupies O(1) points, i.e. a region of width
-# O(h), so it costs far less in the solution than in the truncation error.
-#
-# HOW THE ASSERTIONS ARE SET
-#
-# Floors, never values. Rates here scatter by ±0.3 between grid pairs, and the
-# affordable grids are PRE-ASYMPTOTIC — §4's σ21 rate measures 1.52 on the
-# n = 9,17,33 triple used below but 1.91 on n = 13,25,49, which costs ~5 min
-# for the n=49 solve alone. The floors deliberately sit below the asymptotic
-# rates. Do not tighten them to match the numbers printed on a good day; the
-# next grid triple will scatter the other way.
-# ==============================================================================
+# HOW THE ASSERTIONS ARE SET. Floors, never values. Rates scatter by ±0.3
+# between grid pairs and the affordable grids are PRE-ASYMPTOTIC — §4's σ21
+# rate measures 1.52 on the n = 9,17,33 triple used here but 1.91 on
+# n = 13,25,49 (~5 min for the n=49 solve alone). The floors sit below the
+# asymptotic rates on purpose. Do not tighten them to match the numbers
+# printed on a good day; the next triple will scatter the other way.
 
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.Elasticity

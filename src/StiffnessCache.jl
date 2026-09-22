@@ -6,70 +6,56 @@ export stiffness_cache_dir, stiffness_cache_key, stiffness_cache_path,
        save_stiffness, load_stiffness, stiffness_cache_entries, stencil_digest,
        save_stiffness_shard, load_stiffness_shard, merge_stiffness_shards
 
-# ==============================================================================
 # On-disk reuse of the fault stiffness `K`.
 #
-# `K` is ~98% of the cost of `build_model` (PERFORMANCE.md §5) and depends on
-# nothing that changes between runs of the same configuration: the elastic
-# constants, the geometry, the grid, the SBP order, the build mode
-# (`:exact`/`:toeplitz`) and the CG settings. Everything after it — the
-# pore-pressure operators, the time integration, the outputs — is cheap. So a
-# configuration that has been built once should never be built again.
+# `K` is ~98% of `build_model`'s cost (PERFORMANCE.md §5) and depends on nothing
+# that changes between runs of the same configuration, so a configuration built
+# once should never be built again.
 #
-# WHAT IS IN THE KEY is the whole correctness question. A cache that hits when
-# it should have missed silently runs the wrong physics, and `K` carries no
-# self-evident signature you could check it against afterwards. So the key
-# spells out every input that reaches `K`:
+# WHAT IS IN THE KEY is the whole correctness question: a cache that hits when
+# it should have missed runs the wrong physics silently, and `K` carries no
+# signature to check afterwards. So the key spells out every input:
 #
-#   λ, μ            elastic constants (from BP8Params μ and ν)
-#   l_f             Ω_f half-width — sets which nodes K is indexed over
-#   Δz              grid spacing
-#   L_fault, L_normal   truncation distances — K is NOT truncation-independent,
-#                       that is exactly what the domain study measures
-#   order           SBP order
-#   stencil         digest of the SBP coefficients themselves — `order` names
-#                   them, but Diffinitive is pinned by git revision and could
-#                   change them under a fixed `order`
-#   stiffness       :exact or :toeplitz — different K for the same physics,
-#                   which is why it is in the FILENAME and not just the key
-#   rtol, atol, itmax, precond   CG settings; rtol especially, since it sets
-#                   how close each column is to the exact solve
+#   λ, μ                       elastic constants
+#   l_f                        Ω_f half-width — sets which nodes K spans
+#   Δz                         grid spacing
+#   L_fault, L_normal          truncation distances; K is not independent of them
+#   order                      SBP order
+#   stencil                    digest of the SBP coefficients — `order` names
+#                              them, but Diffinitive is pinned by git revision
+#   stiffness                  :exact or :toeplitz; also in the FILENAME
+#   rtol, atol, itmax, precond CG settings
 #
-# The key string is stored in the file and re-compared on load, so the 64-bit
-# filename hash only has to make names unique-in-practice, not collision-proof:
-# a collision produces a miss, not a wrong `K`.
+# The key text is stored in the file and re-compared on load, so the 64-bit
+# filename hash only needs to be unique in practice: a collision is a miss, not
+# a wrong `K`.
 #
-# The file also carries the Ω_f axes `x2`, `x3`. That is what lets a cache hit
-# skip `FaultElasticity` — the several-GB sparse assembly — entirely, rather
-# than only skipping the solves. Nothing else in `BP8Model` needs the elastic
-# system once `K` exists.
-# ==============================================================================
+# The file also carries the Ω_f axes, which is what lets a hit skip
+# `FaultElasticity` entirely rather than only the solves.
 
 const MAGIC = "EQDKSTF1"           # bump the trailing digit on any layout change
 
 """
     stiffness_cache_dir() -> String or nothing
 
-Where cached `K` files live: `\$EQD_STIFFNESS_CACHE` if it is set and non-empty,
+Where cached `K` files live: `\$EQD_STIFFNESS_CACHE` if set and non-empty,
 otherwise `nothing`, which disables caching.
 
-Deliberately opt-in per machine rather than defaulting to some path under
-`\$HOME`: these files run from tens of MB to a few GB, and where they are put
-(scratch, project storage, node-local disk) is a decision only the person
-running knows the answer to. Set it once —
+Opt-in per machine rather than defaulting under `\$HOME`, because these files
+run from tens of MB to a few GB and only the person running knows whether that
+belongs on scratch, project storage or node-local disk. Set it once —
 
     export EQD_STIFFNESS_CACHE=/path/to/scratch/eqd-stiffness
 
-— and every `build_model` call in every script picks it up with no code change.
+— and every `build_model` call picks it up with no code change.
 """
 function stiffness_cache_dir()
     d = get(ENV, "EQD_STIFFNESS_CACHE", "")
     return isempty(d) ? nothing : d
 end
 
-# FNV-1a. Hand-rolled rather than `hash`, because `Base.hash` is only promised
-# to be stable within a Julia version — a Julia upgrade would silently rename
-# every cache file and rebuild everything. This is stable forever.
+# FNV-1a, not `Base.hash`: the latter is only stable within a Julia version, so
+# an upgrade would rename every cache file and rebuild everything.
 function fnv1a(s::AbstractString)
     h = 0xcbf29ce484222325
     for b in codeunits(s)
@@ -78,20 +64,16 @@ function fnv1a(s::AbstractString)
     return h
 end
 
-# --- canonical serialisation of the SBP operator coefficients ------------------
+# --- canonical serialisation of the SBP operator coefficients ----------------
 #
-# `order` alone does NOT pin the operators: the coefficients live in
-# Diffinitive's `standard_diagonal.toml`, and Diffinitive is a git dependency
-# pinned by revision. Bump that revision — or add the order-6 stencils that
-# `TODO.md` wants — and `K` changes while every other part of the key stays put.
-# That is precisely the silent wrong-hit this cache is built to prevent, so the
-# coefficients go in the key too.
+# `order` alone does not pin the operators: the coefficients live in
+# Diffinitive's `standard_diagonal.toml` and Diffinitive is pinned by git
+# revision, so bumping it changes `K` while the rest of the key stays put. That
+# is the silent wrong-hit this cache exists to prevent, so they go in the key.
 #
-# Recursion is structural rather than by field name, so it does not depend on
-# `StencilSet`'s internals. Dictionary keys are SORTED because the table is a
-# `Dict{String,Any}`, whose iteration order follows `Base.hash` and is therefore
-# only stable within a Julia version — unsorted, a Julia upgrade would rename
-# every cache file and silently rebuild a multi-day `K`.
+# Recursion is structural, not by field name, so it does not depend on
+# `StencilSet`'s internals. Dict keys are sorted because iteration order follows
+# `Base.hash` and is only stable within a Julia version.
 canonical(io, x::AbstractDict) =
     for k in sort!(collect(keys(x)); by=string)
         print(io, k, "=")
@@ -134,15 +116,13 @@ The full identity of a cached `K`: `(; text, name)`, where `text` is the
 canonical string stored in and verified against the file, and `name` is the
 filename it goes under.
 
-`stencil` is the `StencilSet` the operators are built from (or a digest string
-from [`stencil_digest`](@ref)). It is separate from `order` on purpose — see the
-comment above `canonical`.
+`stencil` is the `StencilSet` (or a [`stencil_digest`](@ref) string). Separate
+from `order` on purpose — see the comment above `canonical`.
 
-`solver_kwargs` are the `CGSolver` keywords `build_model` forwards. They are
-normalised against [`CG_DEFAULTS`](@ref) so that passing a value explicitly and
-letting it default produce the *same* key, and an unrecognised keyword is an
-error rather than a silent omission from the key — the failure mode being a
-cache hit for settings that were never the ones cached.
+`solver_kwargs` are the `CGSolver` keywords `build_model` forwards, normalised
+against [`CG_DEFAULTS`](@ref) so an explicit value and a defaulted one give the
+same key. An unrecognised keyword errors rather than being silently left out of
+the key, which would mean a hit for settings that were never cached.
 """
 function stiffness_cache_key(; λ, μ, l_f, Δz, L_fault, L_normal, order, stiffness,
                              stencil, solver_kwargs...)
@@ -192,9 +172,8 @@ stiffness_cache_path(dir, key) = joinpath(dir, key.name)
 #   nrow,ncol Int64            = (2nf, 2nf)
 #   K         nrow*ncol Float64, column-major
 #
-# Every field is 8 bytes or a multiple of 8 (hence the padded key), so the
-# Float64 payloads stay 8-aligned and the file could be mmapped later without a
-# layout change.
+# Every field is a multiple of 8 bytes (hence the padded key), so the Float64
+# payloads stay 8-aligned and the file could be mmapped without a layout change.
 
 pad8(n) = (8 - n % 8) % 8
 
@@ -203,10 +182,9 @@ pad8(n) = (8 - n % 8) % 8
 
 Write `K` and the `Ω_f` axes to `path`, tagged with `key`.
 
-Written to a temporary name in the same directory and `mv`d into place, so a
-run that dies mid-write — or two runs racing on the same configuration, which
-is exactly what a shared cache directory invites — cannot leave a truncated
-file that a later run would read as valid.
+Written to a temp name in the same directory and `mv`d into place, so a run
+that dies mid-write — or two runs racing on one configuration, which a shared
+cache directory invites — cannot leave a truncated file that reads as valid.
 """
 function save_stiffness(path, key, K::AbstractMatrix{Float64}, x2, x3)
     mkpath(dirname(path))
@@ -235,14 +213,12 @@ end
 """
     load_stiffness(path, key) -> (K, x2, x3) or nothing
 
-Read back a `K` saved under `key`. Returns `nothing` — never throws — if the
-file is absent, truncated, written by a different layout version, or carries a
-different key: all of those mean "no usable cache entry", and the caller's
-response to every one of them is the same, to build `K`.
+Read back a `K` saved under `key`. Returns `nothing`, never throws, for
+absent, truncated, wrong-layout or wrong-key files — all of which mean "build
+`K`".
 
-A key *mismatch* on an existing file is a hash collision, and is worth a warning
-rather than a silent rebuild: it would otherwise present as a cache that never
-hits, for no visible reason.
+A key mismatch on an existing file is a hash collision and is warned about,
+since it would otherwise look like a cache that never hits for no reason.
 """
 function load_stiffness(path, key)
     isfile(path) || return nothing
@@ -277,9 +253,9 @@ end
 """
     stiffness_cache_entries(dir=stiffness_cache_dir()) -> Vector{NamedTuple}
 
-What is in the cache: `(; name, path, bytes, key)` per entry, newest last. For
-looking at a cache directory without opening the files by hand — the key text
-is the readable record of what each `K` actually is.
+What is in the cache: `(; name, path, bytes, key)` per entry. For inspecting a
+cache directory without opening files by hand — the key text is the readable
+record of what each `K` is.
 """
 function stiffness_cache_entries(dir=stiffness_cache_dir())
     (dir === nothing || !isdir(dir)) && return NamedTuple[]
@@ -301,43 +277,33 @@ function stiffness_cache_entries(dir=stiffness_cache_dir())
     return out
 end
 
-# ==============================================================================
-# Sharding an `:exact` build across independent processes (e.g. cluster nodes).
+# Sharding an `:exact` build across independent processes.
 #
-# `fault_stiffness`'s `2·N_Ωf` columns are independent right-hand sides against
-# the same assembled `A`: no communication is needed between them, only a
-# private copy of `A` per shard (`FaultElasticity` assembly is minutes,
-# PERFORMANCE.md §4c) and a slice of the columns. That is enough to spread an
-# otherwise multi-node-days build across many single-node jobs with nothing
-# fancier than the filesystem as the coordination point — see
+# `fault_stiffness`'s columns are independent right-hand sides against one `A`,
+# so a shard needs only its own `fe` (minutes to build) and a slice of the
+# columns. The filesystem is the whole coordination mechanism — see
 # `build_stiffness_cache.jl [shard] [nshards]` and `merge_stiffness_cache.jl`.
 #
-# A shard file is smaller than the final cache entry (only its columns, not
-# the full `2N_Ωf × 2N_Ωf` matrix) and carries the *global* column indices it
-# covers, so merging does not trust a claimed `nshards` — it trusts the union
-# of `cols` actually found on disk. That is what lets a failed or re-run shard
-# job be dropped in without renumbering anything else.
+# A shard file holds only its columns and carries their *global* indices, so
+# merging trusts the union of `cols` found on disk rather than a claimed
+# `nshards`. A failed or re-run shard can therefore be dropped in without
+# renumbering anything.
 #
-# This format is agnostic to *how* a shard picked its columns, which is what
-# lets `FaultResponse.fault_stiffness_d4_shard` (PERFORMANCE.md §5 item 0b)
-# reuse it unchanged: it splits D4 orbit *representatives* rather than raw
-# columns across shards, so each solve fixes up to 8 columns instead of 1, and
-# hands back whichever global columns that turned out to cover. The coverage
-# check below only cares that the union across shards is exactly `1:2N_Ωf`
-# with no gaps or duplicates — true either way, since `column_orbits`
-# partitions that whole range regardless of how the representatives
-# themselves are split.
-# ==============================================================================
+# The format does not care how a shard picked its columns, which is what lets
+# `FaultResponse.fault_stiffness_d4_shard` reuse it: it splits D4 orbit
+# representatives, so each solve fixes up to 8 columns and the covered set is
+# only known afterwards. The coverage check below only needs the union across
+# shards to be exactly `1:2N_Ωf`, which holds either way.
 
 const SHARD_MAGIC = "EQDKSHD1"
 
 """
     save_stiffness_shard(path, key, cols, Kshard, x2, x3)
 
-Write one shard of a `K` build: the global column indices `cols` (into
-`1:2N_Ωf`) and the corresponding `2N_Ωf × length(cols)` slice `Kshard`, tagged
-with the same `key` the final assembled cache entry will carry. Same
-write-to-temp-then-`mv` safety as [`save_stiffness`](@ref).
+Write one shard: the global column indices `cols` (into `1:2N_Ωf`) and the
+matching `2N_Ωf × length(cols)` slice, tagged with the same `key` the final
+cache entry will carry. Same temp-then-`mv` safety as
+[`save_stiffness`](@ref).
 """
 function save_stiffness_shard(path, key, cols::AbstractVector{<:Integer},
                               Kshard::AbstractMatrix{Float64}, x2, x3)
@@ -370,10 +336,9 @@ end
 """
     load_stiffness_shard(path, key) -> (; cols, K, x2, x3) or nothing
 
-Read back one shard written by [`save_stiffness_shard`](@ref). Returns
-`nothing` — never throws — for anything that means "not a usable shard for
-this `key`": absent, truncated, wrong magic, or a key mismatch (warned, since
-that would otherwise look like a shard that silently never merges).
+Read back one shard. Returns `nothing`, never throws, for absent, truncated,
+wrong-magic or wrong-key files. A key mismatch is warned about, since it would
+otherwise look like a shard that silently never merges.
 """
 function load_stiffness_shard(path, key)
     isfile(path) || return nothing
@@ -409,10 +374,9 @@ end
 """
     merge_stiffness_shards(dir, key) -> (K, x2, x3)
 
-Assemble the full `K` for `key` from shard files `<key.name>.shard*` under
-`dir`. Errors — rather than silently returning a partial matrix — if the
-union of columns found across shards is not exactly `1:2N_Ωf` with no gaps and
-no duplicates, or if no shards are found at all.
+Assemble the full `K` for `key` from `<key.name>.shard*` files under `dir`.
+Errors rather than returning a partial matrix if no shards are found or if
+their columns are not exactly `1:2N_Ωf` with no gaps or duplicates.
 """
 function merge_stiffness_shards(dir, key)
     paths = filter(p -> startswith(basename(p), key.name * ".shard"),

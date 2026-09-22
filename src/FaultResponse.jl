@@ -18,46 +18,39 @@ export FaultElasticity, fault_grid_axes, frictional_node_count,
        shear_traction, shear_traction!, fault_stiffness, fault_stiffness_toeplitz,
        fault_stiffness_d4_shard, fault_stiffness_gpu, elastic_solver_report
 
-# ==============================================================================
 # The slip → shear-traction map on the fault.
 #
-# `ElasticitySplitNode` solves `-HP(D+SAT)P u = HP(D+SAT)χ(s)` for a given
-# slip distribution, by CG on `A` directly (no factorization — see
-# `ElasticitySplitNode.CGSolver`). `A` is by default the matrix-free
-# `SplitNodeOperator` (Kronecker 1D operators, nothing of size `nnz(A)` ever
-# formed — `MATRIX_FREE_PLAN.md`); `representation=:assembled` builds the
-# explicit sparse matrices instead, for comparison. Since λ and μ are constant
-# `A` never changes as slip evolves, so this module builds it once and then either
+# `ElasticitySplitNode` solves `-HP(D+SAT)P u = HP(D+SAT)χ(s)` by CG on `A`
+# directly. `A` defaults to the matrix-free `SplitNodeOperator`;
+# `representation=:assembled` builds the explicit matrices for comparison.
+# λ and μ are constant, so `A` never changes as slip evolves: build it once,
+# then either
 #
-#   * solves per evaluation (`shear_traction`), or
-#   * precomputes the dense fault stiffness `K : slip ↦ Δτ` once
-#     (`fault_stiffness`) so the time loop is a single dense mat-vec.
+#   * solve per evaluation (`shear_traction`), or
+#   * precompute the dense fault stiffness `K : slip ↦ Δτ` (`fault_stiffness`)
+#     so the time loop is one dense mat-vec.
 #
-# The latter is what makes a 30-day integration tractable: an adaptive
-# integrator evaluates the right-hand side thousands of times, and one CG
-# solve per evaluation on a 3D system dominates everything else. Its cost is
-# `2*N_Ωf` CG solves up front, which only pays off because slip is confined to
-# `Ω_f` (BP8 eq. 13) — a small subset of the fault plane, and the only place
-# tractions are needed. Those `2*N_Ωf` solves are independent right-hand sides
-# against the same `A`, so `fault_stiffness` threads the build across them —
-# see `duplicate`/`merge_stats!`.
+# The second is what makes a 30-day integration tractable — an adaptive
+# integrator evaluates the RHS thousands of times, and a 3D CG solve per
+# evaluation dominates everything else. It costs `2*N_Ωf` solves up front,
+# which only pays because slip is confined to `Ω_f` (BP8 eq. 13). Those solves
+# are independent right-hand sides against one `A`, so the build threads across
+# them (`duplicate`/`merge_stats!`).
 #
-# SIGN. `traction_blocks` returns σ_i1 on the fixed +x₁ axis, which is exactly
-# BP8's τ_i (eq. 6 makes it side-independent; both sides agree here to machine
-# precision and are averaged). No sign flip: a positive slip patch produces
-# Δσ21 < 0 at its centre, i.e. slip relieves the driving shear stress.
-# ==============================================================================
+# SIGN. `traction_blocks` returns σ_i1 on the fixed +x₁ axis, which is BP8's
+# τ_i (eq. 6 makes it side-independent; both sides agree to machine precision
+# and are averaged). No sign flip: a positive slip patch gives Δσ21 < 0 at its
+# centre, i.e. slip relieves the driving shear stress.
 
 """
     boundary_selection(g, stencil_set, bid)
 
-Linear indices into `g` of the boundary nodes of `bid`, ordered to match both
-`boundary_grid(g, bid)`'s own linear ordering and the row ordering of the
-operators returned by `traction_blocks`.
+Linear indices into `g` of `bid`'s boundary nodes, ordered to match both
+`boundary_grid(g, bid)` and `traction_blocks`' row ordering.
 
-Note this is deliberately *not* `boundary_indices`, whose iteration order does
-not agree with either. It is read straight off `boundary_restriction`, which
-is the operator the traction blocks are actually built from.
+Deliberately not `boundary_indices`, whose order agrees with neither. Read
+straight off `boundary_restriction`, the operator the traction blocks are
+built from.
 """
 function boundary_selection(g, stencil_set, bid)
     e = sparse(boundary_restriction(g, stencil_set, bid))
@@ -75,14 +68,13 @@ end
 """
     FaultElasticity(g_minus, g_plus, λ, μ, stencil_set; l_f)
 
-Assembles and factorizes the split-node system for the two grids, and works
-out the fault-node ↔ DOF bookkeeping. `l_f` is the half-length of the
-frictional domain `Ω_f = (-l_f,l_f)²`; the grids must have nodes exactly on
-`±l_f` in both fault directions.
+Builds the split-node system for the two grids and the fault-node ↔ DOF
+bookkeeping. `l_f` is the half-length of `Ω_f = (-l_f,l_f)²`; the grids must
+have nodes exactly on `±l_f` in both fault directions.
 
-Slip and traction vectors are indexed over the `Ω_f` nodes only, in
-column-major order (x2 fastest) over an `(n2f, n3f)` grid — the same ordering
-`PorePressure`'s grid uses, so the two couple entry-wise.
+Slip and traction vectors span the `Ω_f` nodes only, column-major (x2 fastest)
+over an `(n2f, n3f)` grid — the ordering `PorePressure`'s grid uses, so the two
+couple entry-wise.
 """
 struct FaultElasticity{TOp}
     op::TOp                            # SplitNodeOperator or AssembledSplitNode; also rs.A
@@ -103,11 +95,11 @@ end
 
 The elastic system behind the slip → traction map, ready to solve.
 `representation=:kronecker` (default) applies `A` matrix-free through
-[`SplitNodeOperator`](@ref) — seconds to build, a handful of vectors to
-hold; `:assembled` forms the explicit `A`, `HP_DSAT`, `P` of
-[`split_node_system`](@ref) — hours and tens of GB at production size, kept
-for validation and for the `precond=:jacobi` option, which needs `diag(A)`.
-The two give the same `K` to CG tolerance and share one cache key.
+[`SplitNodeOperator`](@ref): seconds to build, a handful of vectors to hold.
+`:assembled` forms [`split_node_system`](@ref)'s explicit matrices — hours and
+tens of GB at production size — and is kept for validation and for
+`precond=:jacobi`, which needs `diag(A)`. Both give the same `K` to CG
+tolerance and share one cache key.
 """
 function FaultElasticity(g_minus, g_plus, λ, μ, stencil_set; l_f,
                          representation::Symbol=:kronecker, solver_kwargs...)
@@ -193,8 +185,8 @@ frictional_node_count(fe::FaultElasticity) = length(fe.omega)
 """
     build_chi!(χ, fe, s2, s3)
 
-In-place `χ(s)`: `±s_j/2` on the two sides at the `Ω_f` fault nodes, zero
-elsewhere (BP8 eq. 13 gives zero slip outside `Ω_f`).
+In-place `χ(s)`: `±s_j/2` on the two sides at the `Ω_f` nodes, zero elsewhere
+(BP8 eq. 13 gives zero slip outside `Ω_f`).
 """
 function build_chi!(χ, fe::FaultElasticity, s2, s3)
     fill!(χ, 0.0)
@@ -223,8 +215,8 @@ end
 
 function shear_traction!(Δτ2, Δτ3, fe::FaultElasticity, s2, s3, χ, solver=fe.rs)
     build_chi!(χ, fe, s2, s3)
-    # `solver.A`, not `fe.op`: a duplicated solver owns its own operator scratch
-    # (`duplicate_operator`), which is what makes the threaded build race-free.
+    # `solver.A`, not `fe.op`: a duplicated solver owns its operator scratch,
+    # which is what makes the threaded build race-free.
     op = solver.A
     b = hp_dsat!(similar(χ), op, χ)
     U = apply_P!(similar(χ), op, split_node_solve(solver, b)) .+ χ
@@ -240,12 +232,11 @@ end
 """
     square_symmetry_group(n) -> (perms, Qs)
 
-The 8 elements of `D4`, the symmetry group of a square, acting on the flat
-column-major index `a + (b-1)*n` of an `n × n` grid, paired with the 2×2
-signed permutation each element induces on the fault-parallel vector
-components `(v2, v3)` — e.g. reflecting `x2 → −x2` fixes `b`, reverses `a`,
-and flips the sign of `v2` alone. `perms[k][i]` is where element `k` sends
-node `i`; `Qs[k]` is its component action. See `PERFORMANCE.md` §5 item 0b.
+The 8 elements of `D4` acting on the flat column-major index `a + (b-1)*n` of
+an `n × n` grid, each paired with the 2×2 signed permutation it induces on
+`(v2, v3)` — reflecting `x2 → −x2`, say, reverses `a` and flips `v2` alone.
+`perms[k][i]` is where element `k` sends node `i`, `Qs[k]` its component
+action. `PERFORMANCE.md` §5 item 0b.
 """
 function square_symmetry_group(n)
     idx(a, b) = a + (b - 1) * n
@@ -268,10 +259,9 @@ function square_symmetry_group(n)
 end
 
 # One representative source column per orbit of the `2n²` source columns
-# (node × {s2,s3}) under `square_symmetry_group(n)`, plus, for each
-# representative, the `(group index, target column)` pairs its single solve
-# determines. Purely combinatorial — no CG solve here — so it can run once,
-# up front, before any threading decision.
+# (node × {s2,s3}) under `square_symmetry_group(n)`, plus the
+# `(group index, target column)` pairs each representative's solve determines.
+# Purely combinatorial, so it runs once up front.
 function column_orbits(n, perms, Qs)
     nf = n * n
     ncols = 2nf
@@ -300,50 +290,33 @@ end
 """
     fault_stiffness(fe; verbose=false, cols=nothing, symmetry=false) -> K
 
-The dense fault stiffness `K` mapping stacked slip `[s2; s3]` on `Ω_f` to
-stacked traction change `[Δτ2; Δτ3]`, built one column at a time from unit
-slip at each `Ω_f` degree of freedom. Costs `2*N_Ωf` CG solves against the
-already-assembled system; afterwards each right-hand-side evaluation in the
-time loop is a single dense mat-vec.
+The dense fault stiffness `K`, mapping stacked slip `[s2; s3]` on `Ω_f` to
+stacked traction change `[Δτ2; Δτ3]`, one column per unit slip DOF. Costs
+`2*N_Ωf` CG solves up front; afterwards each RHS evaluation in the time loop
+is one dense mat-vec. `K[i,i] < 0` — slip relieves the stress driving it.
 
-`K` is negative-definite in the physically meaningful sense that slip relieves
-the stress driving it — `K[i,i] < 0`.
+Columns are independent, so the build threads across `Threads.nthreads()` by
+default (`julia -t auto`); `threaded=false` forces serial.
 
-The columns are independent, so this build is **embarrassingly parallel** and
-threads across `Threads.nthreads()` by default (start Julia with `-t auto`).
-Pass `threaded=false` to force the serial path.
+`cols` restricts the build to a subset of `1:2*N_Ωf`, returning a
+`2N_Ωf × length(cols)` slice in the order given, which is what makes the build
+shardable across processes (`build_stiffness_cache.jl [shard] [nshards]`).
+Each shard rebuilds `fe` (minutes) and computes only its columns.
 
-`cols` restricts the build to a subset of the `1:2*N_Ωf` column indices —
-`nothing` (default) builds all of them and returns the usual `2N_Ωf × 2N_Ωf`
-matrix. Passing a range or vector instead returns a `2N_Ωf × length(cols)`
-matrix holding just those columns, in the order given — this is what makes
-the build shardable across independent processes (`build_stiffness_cache.jl`
-`[shard] [nshards]`) at a resolution where a single node's worth of solves is
-not tractable: each shard rebuilds `fe` (cheap — minutes, PERFORMANCE.md §4)
-and computes only its slice of columns, since the columns need no
-communication with each other.
+## `symmetry=true`: `K`'s `D4` symmetry instead of sharding
 
-## `symmetry=true`: exploit `K`'s `D4` symmetry instead of sharding
+When `Ω_f` and the elastic grid are square and centred in both fault-parallel
+directions — as `BP8.jl` always builds them — the discretization is invariant
+under the 8 symmetries of the square acting jointly on node position and on
+`(s2,s3)`/`(τ2,τ3)`. That is an **exact** discrete identity, unlike
+[`fault_stiffness_toeplitz`](@ref): `K[g·i, g·j] = Q·K[i,j]·Qᵀ`, verified
+against a full build to 1e-16. One solve pair then fixes up to 8 column pairs,
+cutting solves by **6.5-7.8×** (more at higher resolution). Threads over the
+orbit representatives, safe for the same reason the plain build is — distinct
+orbits fill disjoint columns.
 
-`PERFORMANCE.md` §5 item 0b. When `Ω_f` and the surrounding elastic grid are
-square and centred in the two fault-parallel directions (as `BP8.jl` always
-builds them: same `L_fault`, same node count, on both axes), the whole
-discretization is invariant under the 8 symmetries of the square acting
-jointly on node position and on `(s2,s3)`/`(τ2,τ3)`. That gives an **exact**
-discrete identity — not an approximation like [`fault_stiffness_toeplitz`](@ref) —
-`K[g·i, g·j] = Q·K[i,j]·Qᵀ`, verified against a full build to 1e-16
-(Frobenius, relative). One CG solve pair therefore determines up to 8 column
-pairs instead of 1, cutting the number of solves needed by **6.5–7.8×**
-(growing with resolution, since fewer nodes sit on the symmetry axes/diagonal
-as a fraction of the total). Still threads across `Threads.nthreads()`
-exactly like the plain build, over the *orbit representatives* rather than
-the raw columns — the two are compatible for the same reason plain threading
-is: distinct orbits fill disjoint columns of `K`.
-
-Requires a square, centred `Ω_f` (checked; throws otherwise) and is not
-compatible with `cols` (it builds the whole matrix by construction — combine
-with the `EQD_STIFFNESS_CACHE` mechanism in `PERFORMANCE.md` §4c instead of
-sharding if a single node still isn't enough).
+Needs a square, centred `Ω_f` (checked) and is incompatible with `cols`, since
+it builds the whole matrix. `PERFORMANCE.md` §5 item 0b.
 """
 function fault_stiffness(fe::FaultElasticity; verbose=false,
                          threaded=Threads.nthreads() > 1, cols=nothing, symmetry=false)
@@ -359,15 +332,12 @@ function fault_stiffness(fe::FaultElasticity; verbose=false,
     K = Matrix{Float64}(undef, 2nf, ncols)
     t0 = time()
 
-    # Fills the assigned (position, column) pairs of K using `solver`, with
-    # buffers private to this call.
+    # Fills the assigned (position, column) pairs of K, with private buffers.
     #
-    # This MUST be a function rather than a `begin` block inside the spawn:
-    # `if`/`else` and `begin` do not introduce scope in Julia, so buffers
-    # assigned there would be locals of `fault_stiffness` and every task would
-    # share the same `χ`/`s2`/`Δτ` arrays. A function body is a real scope, so
-    # each invocation gets its own. (Learned the hard way — the threaded `K`
-    # came out 2.35 relative off before this was a function.)
+    # MUST be a function, not a `begin` block in the spawn: `if`/`else` and
+    # `begin` are not scopes in Julia, so the buffers would be locals of
+    # `fault_stiffness` and every task would share them. The threaded `K` came
+    # out 2.35 relative off before this was a function.
     function run_columns!(items, solver; progress=false)
         s2, s3 = zeros(nf), zeros(nf)
         Δτ2, Δτ3 = zeros(nf), zeros(nf)
@@ -393,17 +363,13 @@ function fault_stiffness(fe::FaultElasticity; verbose=false,
     if threaded
         nt = min(Threads.nthreads(), ncols)
         verbose && @info "fault_stiffness: threaded build" columns = ncols threads = nt
-        # Strided partition: iteration counts vary a little between columns, so
-        # interleaving balances the chunks better than contiguous blocks.
-        # Only task 1 reports, or 12 threads interleave their progress lines.
-        # Its ETA is representative of the whole build even though it sees just
-        # its own slice: the slices are equal-sized and run concurrently, so the
-        # time for one to finish IS the time for all of them. Without this the
-        # progress reporting only worked on the serial path, which is the one
-        # nobody runs at production size — a 2.1 h build with no visible progress.
+        # Strided partition: iteration counts vary between columns, so
+        # interleaving balances better than contiguous blocks. Only task 1
+        # reports, or the threads interleave their progress lines; its ETA still
+        # covers the whole build, since the slices are equal and concurrent.
         tasks = [Threads.@spawn run_columns!(indexed[t:nt:end], duplicate(fe.rs);
                                              progress=(verbose && t == 1)) for t in 1:nt]
-        # Fold each worker's counters back so `solver_report` totals the build.
+        # Fold the workers' counters back so `solver_report` totals the build.
         for task in tasks
             merge_stats!(fe.rs, fetch(task))
         end
@@ -414,10 +380,9 @@ function fault_stiffness(fe::FaultElasticity; verbose=false,
     return K
 end
 
-# Common precondition check + orbit setup for both `symmetry=true` entry
-# points (`fault_stiffness_d4`, `fault_stiffness_d4_shard`): a square, centred
-# `Ω_f`, and the D4 group/orbit tables for its side length. `caller` names the
-# public function in error messages.
+# Precondition check + orbit setup shared by `fault_stiffness_d4` and
+# `fault_stiffness_d4_shard`: a square, centred `Ω_f` and the D4 group/orbit
+# tables. `caller` names the public function in error messages.
 function d4_setup(fe::FaultElasticity, caller)
     n2, n3 = length(fe.x2f), length(fe.x3f)
     n2 == n3 ||
@@ -436,10 +401,8 @@ function d4_setup(fe::FaultElasticity, caller)
     return perms, Qs, reps, targets
 end
 
-# The `symmetry=true` path of `fault_stiffness`: one CG solve pair per D4
-# orbit representative, propagated to the rest of the orbit by symmetry
-# instead of solved for. See that docstring and PERFORMANCE.md §5 item 0b for
-# the identity this implements and its preconditions.
+# The `symmetry=true` path of `fault_stiffness`: one CG solve pair per D4 orbit
+# representative, propagated to the rest of the orbit by symmetry.
 function fault_stiffness_d4(fe::FaultElasticity; verbose=false,
                             threaded=Threads.nthreads() > 1)
     nf = frictional_node_count(fe)
@@ -448,12 +411,10 @@ function fault_stiffness_d4(fe::FaultElasticity; verbose=false,
     K = zeros(ncols, ncols)
     t0 = time()
 
-    # Solves the assigned representatives and, for each, fills every column
-    # its orbit determines. Distinct representatives' orbits fill disjoint
-    # columns of K (column_orbits partitions 1:ncols), so this is safe to run
-    # concurrently across tasks exactly like `run_columns!` above — and for
-    # the same reason must be a function, not a `begin` block, so each task's
-    # buffers are private (see the comment on `run_columns!`).
+    # Solves the assigned representatives and fills every column their orbits
+    # determine. `column_orbits` partitions `1:ncols`, so distinct
+    # representatives fill disjoint columns and this is concurrency-safe. Must
+    # be a function for private buffers — see `run_columns!`.
     function run_reps!(items, solver; progress=false)
         s2, s3 = zeros(nf), zeros(nf)
         Δτ2, Δτ3 = zeros(nf), zeros(nf)
@@ -507,32 +468,23 @@ end
     fault_stiffness_d4_shard(fe, shard, nshards; verbose=false,
                              threaded=Threads.nthreads() > 1) -> (cols, Kshard)
 
-D4 symmetry (`fault_stiffness(fe; symmetry=true)`, PERFORMANCE.md §5 item 0b)
-combined with cross-node sharding, for a resolution where even the
-symmetry-reduced solve count does not fit one node's wall-clock budget (e.g.
-Δz = 10 m: `:exact` needs `2·N_Ωf` solves, D4 cuts that ~6.5-7.8×, and that
-can still be node-days). Splits the D4 orbit **representatives** — not the
-raw columns — `shard:nshards:end` across `nshards` independent processes;
-`shard` is 1-based.
+D4 symmetry plus cross-node sharding, for a resolution where even the
+symmetry-reduced solve count exceeds one node's walltime. Splits the D4 orbit
+**representatives** — not the raw columns — `shard:nshards:end` across
+`nshards` processes; `shard` is 1-based.
 
-Returns `(cols, Kshard)`: the *global* column indices (into `1:2·N_Ωf`) this
-shard's representatives determine, and the corresponding `2·N_Ωf ×
-length(cols)` slice. This is deliberately the same shape
-[`save_stiffness_shard`](@ref) takes for the plain (non-symmetric) shard
-build, so a shard from this function drops straight into the existing
-`merge_stiffness_shards` with no format change — each representative's single
-solve fixes up to 8 columns of its symmetry orbit, so unlike a raw-column
-shard, which columns a shard covers isn't known until after the orbit tables
-are built, which is why it's returned rather than passed in.
+Returns `(cols, Kshard)`: the global column indices (into `1:2·N_Ωf`) this
+shard's representatives determine, and the matching `2·N_Ωf × length(cols)`
+slice. That is the same shape [`save_stiffness_shard`](@ref) takes for the
+plain shard build, so these shards merge unchanged. `cols` is returned rather
+than passed in because which columns a shard covers is only known once the
+orbit tables exist.
 
-`column_orbits` partitions the *whole* `1:2·N_Ωf` range across representatives
-regardless of how those representatives are split across shards, so the union
-of `cols` across all `nshards` shards is still exactly `1:2·N_Ωf` with no gaps
-or duplicates — `merge_stiffness_shards`'s coverage check is unaffected by
-switching to this builder.
+`column_orbits` partitions all of `1:2·N_Ωf` across representatives however
+they are split, so the union of `cols` over all shards is exactly `1:2·N_Ωf` —
+`merge_stiffness_shards`' coverage check still holds.
 
-Same square, centred `Ω_f` precondition as `fault_stiffness(fe; symmetry=true)`
-(checked; throws otherwise).
+Same square, centred `Ω_f` precondition as `symmetry=true`.
 """
 function fault_stiffness_d4_shard(fe::FaultElasticity, shard::Integer, nshards::Integer;
                                   verbose=false, threaded=Threads.nthreads() > 1)
@@ -551,9 +503,7 @@ function fault_stiffness_d4_shard(fe::FaultElasticity, shard::Integer, nshards::
     Kshard = zeros(2nf, length(mycols))
     t0 = time()
 
-    # Same private-buffers-via-function-scope requirement as `run_columns!`/
-    # `run_reps!` above (see the comment on `run_columns!`): `if`/`else` and
-    # `begin` are not scopes in Julia.
+    # Must be a function for private buffers — see `run_columns!`.
     function run_reps!(items, solver; progress=false)
         s2, s3 = zeros(nf), zeros(nf)
         Δτ2, Δτ3 = zeros(nf), zeros(nf)
@@ -607,52 +557,34 @@ end
 """
     fault_stiffness_toeplitz(fe; verbose=false) -> K
 
-`K` built from **5 sources** — 10 CG solves instead of `2·N_Ωf` — by exploiting
-the translation invariance of the whole-space kernel.
+`K` from **5 sources** — 10 CG solves instead of `2·N_Ωf` — using the
+translation invariance of the whole-space kernel. An **approximation**, kept as
+a cheap fallback; D4 symmetry plus the GPU build (see
+[`fault_stiffness_gpu`](@ref)) made the exact build affordable and is the
+production route.
 
-In a homogeneous whole-space the traction at node `i` from unit slip at node `j`
-depends only on the separation `x_i − x_j`, so `K` is block-Toeplitz with
-Toeplitz blocks and one source column determines the rest. The far-field `u=0`
-truncation breaks that exactly — nodes near the boundary see a different medium
-— but the departure is small and, crucially, concentrated where the kernel is
-already negligible.
+In a homogeneous whole-space the traction at `i` from unit slip at `j` depends
+only on `x_i − x_j`, so `K` is block-Toeplitz and one source column determines
+the rest. The far-field `u=0` truncation breaks that, but only where the kernel
+is already negligible.
 
-## Priority, not averaging — this distinction is the whole design
+## Priority, not averaging
 
-Sources are consulted in order and **the first one to supply a separation wins**.
-Averaging them together instead is a ~500× regression: corner and edge sources
-sit against the truncation boundary and the locked `Ω_f` ring, so their kernels
-are contaminated, and averaging lets that contamination into the near field that
-drives the solution.
+Sources are consulted in order and **the first to supply a separation wins**.
+Averaging instead is a ~500× regression: corner and edge sources sit against
+the truncation boundary and the locked `Ω_f` ring, so averaging lets their
+contaminated kernels into the near field.
 
-Measured end-to-end against the full build at Δz = 50 m (`PERFORMANCE.md` §4b),
-worst relative error in `V_max(t)` over the run:
+The corners are needed despite that contamination because the centre cannot
+reach separations beyond half the grid (~44% of entries). Those are negligible
+during injection (centre-only: 0.03% in `V_max`) but not during the relaxation
+after `t_off`, where centre-only degrades to 97%. The corners supply exactly
+those separations and leave the near field untouched — so the ordering must not
+be changed to put a boundary source first.
 
-| sources | solves | 100 h | 30 days | **30 d, converged domain** |
-|---|---|---|---|---|
-| centre only | 2 | 0.030% | 138% | **96.9%** |
-| **centre + 4 corners (priority)** | **10** | 0.005% | 5.8% | **0.41%** |
-| 4 corners, *averaged* | 8 | 16.5% | 162% | 213% |
-
-**Why the corners are needed despite being contaminated.** The centre alone
-cannot reach separations larger than half the grid (pairs on opposite edges,
-~44% of entries). Through the injection phase those are genuinely negligible —
-centre-only scores 0.03%. After injection stops at `t_off`, `V_max` falls an
-order of magnitude and the relaxation phase is far more sensitive to them:
-centre-only degrades to 97%. Adding the corners *for those separations only*
-fixes it while leaving the near field untouched.
-
-Hence ordered, not averaged, and the ordering must not be changed to put a
-boundary source first. Note also that the last column is the only one describing
-the configuration that will actually be run — a change validated at 100 h alone,
-or at the small domain alone, is not validated.
-
-## This is an approximation
-
-It introduces ~0.03% in `V_max`, against a ~53% domain-truncation bias
-(`PROGRESS.md` "Results") and a larger resolution error — so it is far from the
-accuracy-limiting step. But it *is* opt-in for that reason: [`fault_stiffness`](@ref)
-remains the exact build and the default.
+Worst relative error in `V_max(t)` against the full build, converged domain:
+**0.41%** for centre + 4 corners, against 96.9% centre-only and 213% averaged.
+`PERFORMANCE.md` §4b has the full table and the Δz dependence.
 """
 function fault_stiffness_toeplitz(fe::FaultElasticity; verbose=false)
     n2, n3 = length(fe.x2f), length(fe.x3f)
@@ -714,46 +646,37 @@ end
     fault_stiffness_gpu(fe; verbose=false) -> K
     fault_stiffness_gpu(fe; shard, nshards, verbose=false) -> (cols, Kshard)
 
-GPU-accelerated `symmetry=true` build: same D4-orbit reduction as
-[`fault_stiffness`](@ref)`(fe; symmetry=true)` (PERFORMANCE.md §5 item 0b),
-but each orbit representative's CG solve runs on the GPU against the elastic
-system held resident there for the whole build, rather than CPU-threaded.
+The production `K` build. Same D4-orbit reduction as
+[`fault_stiffness`](@ref)`(fe; symmetry=true)`, but each representative's CG
+solve runs on the GPU against an elastic system resident there for the whole
+build, rather than CPU-threaded.
 
-With the default matrix-free representation (`SplitNodeOperator`,
-`MATRIX_FREE_PLAN.md`) "resident" means the 1D operators, `P`'s index data,
-the small SAT block and ~9 vectors of system length — about 9 GB at Δz = 10 m
-on (1600, 1600), where the assembled `A` alone would be ~85 GB — so any
-datacenter card holds any BP8 configuration. `representation=:assembled`
+With the default matrix-free representation "resident" means the 1D operators,
+`P`'s index data, the SAT block and ~9 system-length vectors — ~9 GB at
+Δz = 10 m on (1600, 1600), where the assembled `A` alone would be ~85 GB — so
+any datacenter card holds any BP8 configuration. `representation=:assembled`
 uploads the CSR `A` and `P` instead and is limited by their size (~23 GB at
-Δz = 10 m on (1150, 1150), measured).
+Δz = 10 m on (1150, 1150)).
 
 `shard`/`nshards` split the representatives exactly as
 [`fault_stiffness_d4_shard`](@ref) does and return its `(cols, Kshard)`, so
-`merge_stiffness_cache.jl` reassembles GPU shards unchanged. Use it to spread
-a build over several cards, or to keep one job inside a walltime limit.
+`merge_stiffness_cache.jl` reassembles GPU shards unchanged. Use it to spread a
+build over cards or to fit a walltime limit.
 
-**Why sequential, not threaded like the CPU path.** A single GPU has one
-memory-bandwidth budget; the whole motivation for this path is that a
-bandwidth-bound sparse mat-vec runs faster on a GPU's much higher raw
-bandwidth (measured 1.9-8.4× on a consumer RTX 2060 at up to 56k DOF,
-*growing* with problem size — `PERFORMANCE.md` §5 item 0c). Running several
-solves concurrently on the same device would have them contend for that same
-bandwidth rather than add to it, unlike CPU threads, which each have their
-own cache and share a comparatively larger aggregate memory channel count.
+**Sequential, not threaded like the CPU path.** One GPU has one bandwidth
+budget, and this path exists because the bandwidth-bound mat-vec is faster
+there. Concurrent solves on one device would contend for that bandwidth rather
+than add to it, unlike CPU threads with their own caches.
 
-**Validation status — measured at small scale, extrapolated beyond it.**
-Correctness (agreement with the CPU build) is verified at problem sizes up to
-56k DOF on consumer (Turing, sm_75) hardware — see
-`test/fault_response_gpu_test.jl`, gated behind `CUDA.functional()`. The
-*speedup* at production DOF counts and on datacenter (Hopper/Ada) hardware is
-**not yet measured** — only extrapolated from the observed trend and the
-bandwidth ratio between tested and target hardware. Re-measure on the actual
-target GPU before relying on a specific speedup number.
+Measured at the production point: Δz = 10 m on (1600, 1600), 99.5 M DOF, 8
+shards of 211 representatives on one L40S each, 6.01 h per shard — 48.1 h of
+card time, mean 1599 CG iterations, none unconverged. Correctness against the
+CPU build is covered by `test/fault_response_gpu_test.jl` (gated behind
+`CUDA.functional()`, up to 56k DOF).
 
-Requires `using CUDA` first (loads `EarthquakeDiffinitiveCUDAExt`); calling
-this without it loaded is a `MethodError`, not a graceful fallback, since
-falling back silently to the CPU path would hide a missing `using CUDA` that
-the caller almost certainly wants to know about.
+Requires `using CUDA` first (loads `EarthquakeDiffinitiveCUDAExt`). Without it
+this is a `MethodError` rather than a silent CPU fallback, which would hide a
+missing `using CUDA` the caller wants to know about.
 """
 function fault_stiffness_gpu end
 

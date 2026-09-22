@@ -15,7 +15,7 @@
 #
 # Reference at Δz = 50 m, small domain, 30 days: 5.7767%.
 #
-# Run:  julia --project=. -t auto scripts/k_toeplitz_resolution.jl [Δz] [L_fault] [L_normal] [T_hours]
+# Run:  julia --project=. -t auto scripts/extra/k_toeplitz_resolution.jl [Δz] [L_fault] [L_normal] [T_hours]
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.BP8
 using Printf, LinearAlgebra

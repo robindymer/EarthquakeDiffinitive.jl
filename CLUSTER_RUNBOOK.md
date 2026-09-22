@@ -1,49 +1,45 @@
-# Running BP8-QD-GS on UPPMAX
+# Running BP8-QD on UPPMAX
 
 Step-by-step for producing a SEAS BP8 submission on a cluster. Written to be
 read over SSH.
 
-Background for the numbers here: `PERFORMANCE.md` §4 (cost model),
-`PROGRESS.md` "Domain requirement relaxes with resolution", and §4/§5/§6 of
+Background for the numbers here: `PERFORMANCE.md` §5 and §7,
+`MATRIX_FREE_PLAN.md`, and §4/§5/§6 of
 `context/SEAS_BP8_Benchmark_Description.pdf`.
 
 ---
 
-## TL;DR — the whole thing is one command per resolution
+## TL;DR — use the GPU path
 
-Edit the config block at the top of `scripts/submit_bp8.sh` **once** — project
-id, cache directory, partition names, mail address. It refuses to run while the
-`CHANGE-ME` placeholders are still there. Then:
+One card does what ~100 CPU shards do. Edit the config block at the top of
+`scripts/submit_bp8_gpu.sh` **once** — project id, cache directory, partition
+names, mail address; it refuses to run while the `CHANGE-ME` placeholders are
+there. Read "Running it on a GPU instead" below first: CUDA.jl has to be
+provisioned from inside a GPU allocation once, and skipping that is the single
+most likely way for the chain to fail. Then:
 
 ```bash
-./scripts/submit_bp8.sh 20      # Δz = 20 m
-./scripts/submit_bp8.sh 10      # Δz = 10 m
+./scripts/submit_bp8_gpu.sh 20 1600 1600            # Δz = 20 m, ~1 h
+./scripts/submit_bp8_gpu.sh 10 1600 1600 l40s 8     # Δz = 10 m, 8 x 6 h
+./scripts/submit_bp8_pw.sh  10 1600 1600            # the PW run, reusing that K
 ```
 
-Each call submits three chained SLURM jobs and returns immediately:
+Each call submits chained SLURM jobs and returns immediately: the `K` build
+(one job, or an array plus a merge if sharded), then the run, which reads that
+`K` and writes the §4 output files. Both resolutions can be in flight at once —
+different cache keys, different output directories. §6 of the PDF allows at
+most two resolutions and two domain sizes.
 
-1. an **array job** building `K`'s columns in independent shards
-2. a **merge** job stitching them into one cache entry
-3. the **run**, which reads that `K` and writes the §4 output files
+**Measured, not estimated**, for the Δz = 10 m (1600, 1600) build: 8 L40S
+shards of 6.01 h each, 48.1 h of card time, mean 1599 CG iterations, none
+unconverged. A single unsharded job would want ~48 h against the 47 h cap, so
+shard it or ask for an h100.
 
-You submit once and collect results when the last one finishes. Both
-resolutions can be in flight at the same time — they use different cache keys
-and different output directories, so they never collide. §6 of the PDF allows
-**at most two resolutions and two domain sizes**, so exactly these two is the
-plan.
+Watch: `squeue -u $USER`. Outputs:
+`output/BP8-QD-<GS|PW>_dz<N>_Lf<N>_Ln<N>_exact_gpu/`. Logs: `logs/`.
 
-Watch: `squeue -u $USER`. Outputs: `output/BP8-QD-GS_dz<N>_Lf<N>_Ln<N>_exact/`.
-Logs: `logs/`.
-
-Defaults the script picks:
-
-| Δz | domain | shards | RAM/node | total `K` build |
-|---|---|---|---|---|
-| 20 m | (1600, 1200) | 32 | ~15 GB | ~12.8 node-days |
-| 10 m | (1200, 1200) | 440 | ~65 GB | ~415 node-days |
-
-Override any of them: `./scripts/submit_bp8.sh 10 1600 1200 600`
-(`<Δz> <L_fault> <L_normal> <nshards>`).
+`scripts/submit_bp8.sh` is the CPU equivalent — a large array job plus a merge.
+Keep it for a node with no GPU available; it is not the production route.
 
 ---
 
@@ -125,21 +121,20 @@ sinfo -o "%P %D %c %m %f"        # partitions, cores, MB per node
 
 ## Does it fit in memory on UPPMAX?
 
-**Sharding parallelises time, not memory.** Every shard assembles its own copy
-of `A`+`HP_DSAT`, so more nodes never reduces what each one needs. This is the
-first thing to check.
+**Since 2026-09-14, yes, everywhere.** `A` is applied matrix-free
+(`MATRIX_FREE_PLAN.md`), so no shard assembles anything of size `nnz(A)`:
+`submit_bp8.sh` asks for 16-32 GB per shard at any Δz, and `submit_bp8_gpu.sh`
+for ~9 GB of VRAM at the largest configuration. The table below is the
+**assembled** path (`representation=:assembled`), kept because it explains why
+`L_normal` was ever halved:
 
-| run | RAM/node | on a 128 GB node |
+| run | RAM/node, assembled | on a 128 GB node |
 |---|---|---|
-| **Δz = 20 m, (1600, 1200)** | **~15 GB** | trivial, any standard node |
-| Δz = 10 m, (1200, 1200) | ~65 GB | fits with real headroom |
-| Δz = 10 m, (1600, 1200) | ~116 GB | **too tight** — needs a fat node |
+| Δz = 20 m, (1600, 1200) | ~15 GB | trivial |
+| Δz = 10 m, (1200, 1200) | ~65 GB | fits with headroom |
+| Δz = 10 m, (1600, 1200) | ~116 GB | **too tight** — needed a fat node |
 
-So Δz = 20 m is comfortable anywhere. Δz = 10 m fits standard nodes **only** with
-the relaxed (1200, 1200) domain — which was measured sufficient at Δz = 25 m and
-is an **extrapolation** at 10 m (`PROGRESS.md` says so; (1200, 800) was never
-tested). The conservative domain at 10 m needs fat nodes and a `-C mem256GB`-style
-constraint; pass it explicitly if you want it.
+Nothing needs a fat node or a `-C mem256GB`-style constraint any more.
 
 Per-shard extras are negligible — a shard's slice of `K` is a few MB — and the
 merge needs only ~2x the final `K` (~2.8 GB at Δz = 10 m), which is why it runs
@@ -179,23 +174,29 @@ matters now:
 | VRAM | ~1 GB | ~3 GB | ~9 GB |
 | host RAM | < 4 GB | < 8 GB | < 12 GB |
 | assembly | none (seconds) | none (was 17.5 h) | none (would have been ~73 h) |
-| solve, L40S (est.) | ~1 h | ~7 h (was 23 h) | ~1 day |
+| solve, L40S | ~1 h | 11.89 h (was 40.4 h) | **48.1 h, measured** |
 
-Every configuration fits an L40S; `submit_bp8_gpu.sh` defaults to one.
+Every configuration fits an L40S; `submit_bp8_gpu.sh` defaults to one. The
+Δz = 10 m (1600, 1600) figure is 8 shards x 6.01 h, from
+`logs/Kgpu_dz10_Lf1600_Ln1600_6889974_*.out` — and it is **24% above** what the
+script's own `EST_H` predicts (38.8 h), so treat that estimate as a floor until
+its anchor is updated (`TODO.md`).
 
 **Walltime is derived, not fixed.** The script requests `2 x EST_H / nshards`
 (floor 2 h, cap 47 h, `EST_H` the table above), because a 47 h request queues
 far worse than a 12 h one — SLURM backfills short jobs into gaps ahead of long
 ones — and because an array task does `1/nshards` of the work. So
 
-    scripts/submit_bp8_gpu.sh 10 1150 1150          ->  14 h requested
-    scripts/submit_bp8_gpu.sh 10 1600 1600          ->  42 h
-    scripts/submit_bp8_gpu.sh 10 1600 1600 l40s 4   ->  11 h per shard
-    scripts/submit_bp8_gpu.sh 10 1600 1600 h100     ->  14 h
+    scripts/submit_bp8_gpu.sh 10 1150 1150          ->  24 h  (measured 11.9 h)
+    scripts/submit_bp8_gpu.sh 10 1600 1600          ->  47 h, capped — too tight
+    scripts/submit_bp8_gpu.sh 10 1600 1600 l40s 8   ->  10 h  (measured 6.0 h)
+    scripts/submit_bp8_gpu.sh 10 1600 1600 h100     ->  26 h  (unmeasured)
 
-Sharding is therefore the way to *start* sooner as well as finish sooner. Pass
-a 6th argument (`… l40s 1 30:00:00`) to override; a previous log's `done in X h`
-beats the built-in estimate, which is scaled from laptop measurements.
+Sharding is therefore the way to *start* sooner as well as finish sooner, and
+at Δz = 10 m on (1600, 1600) it is also the way to fit inside the 47 h cap at
+all — the real build is 48.1 h of card time. Pass a 6th argument
+(`… l40s 1 30:00:00`) to override; **a previous log's `done in X h` beats the
+built-in estimate**, which measured 24% low at that point.
 
 ### One-time setup, on top of the CPU setup above
 

@@ -9,7 +9,7 @@
 # ρ ∂²u/∂t² = ∇·σ = E*u, leapfrog (central-difference) time integration,
 # clamped (injected u=0) boundaries, animated with CairoMakie.
 #
-# Run with: julia --project=scripts scripts/elastic_wave_2d.jl
+# Run with: julia --project=scripts scripts/extra/elastic_wave_2d.jl
 
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.Elasticity

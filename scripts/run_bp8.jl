@@ -2,23 +2,16 @@
 #
 #   julia --project=. scripts/run_bp8.jl [gs|pw] [Δz] [L_fault] [L_normal] [stiffness]
 #
-# `$BP8_OUTPUT_SUFFIX`, if set, is appended to the output directory name. The
-# GPU chain (`submit_bp8_gpu.sh`) sets it to `gpu` so its results land beside
-# a CPU run of the same configuration instead of silently overwriting it —
-# the directory name is otherwise built only from Δz, the domain and the
-# stiffness mode, none of which distinguish the two.
+# `$BP8_OUTPUT_SUFFIX`, if set, is appended to the output directory name; the
+# GPU chain sets it to `gpu` so its results land beside a CPU run of the same
+# configuration rather than overwriting it. It is deliberately NOT in the `K`
+# cache key — both build paths produce the same `K`, so keying on it would
+# force a redundant multi-hour rebuild of a matrix already on disk.
 #
-# Deliberately NOT part of the `K` cache key: the GPU and CPU builds produce
-# the same `K` for the same configuration (that is the point of them sharing a
-# key), so keying the cache on this would force a redundant multi-hour rebuild
-# to obtain a matrix that is already on disk. It affects where results are
-# written and nothing else.
-#
-# `stiffness` is `exact` (default here — the submission route, matching
-# `build_stiffness_cache.jl`) or `toeplitz`. Pass `exact` only once `K` for
-# this configuration is already sitting in `$EQD_STIFFNESS_CACHE` (built
-# separately with `build_stiffness_cache.jl`, which is sized for a standalone
-# cluster job) — otherwise this run pays the `:exact` build cost inline.
+# `stiffness` is `exact` (default, and the submission route) or `toeplitz`.
+# With `exact`, build `K` first via `build_stiffness_cache.jl` (or its GPU
+# counterpart) so this run reads it from `$EQD_STIFFNESS_CACHE`; otherwise the
+# build cost lands inline here, which is hours to days at production size.
 #
 # Δz = 20 m, L_fault = 1600 m, L_normal = 1200 m is the coarsest grid that
 # resolves the process zone (`L_b/Δz ≥ 3`) at the domain size the §6 study

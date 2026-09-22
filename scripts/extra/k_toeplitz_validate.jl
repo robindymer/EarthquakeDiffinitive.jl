@@ -6,7 +6,7 @@
 # error is amplified — measured at ~370× here. This sweeps the number of source
 # columns and reports what each buys in the outputs the benchmark asks for.
 #
-# Run:  julia --project=. -t auto scripts/k_toeplitz_validate.jl [Δz] [L_fault] [L_normal]
+# Run:  julia --project=. -t auto scripts/extra/k_toeplitz_validate.jl [Δz] [L_fault] [L_normal]
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.BP8
 using Printf, Statistics, LinearAlgebra

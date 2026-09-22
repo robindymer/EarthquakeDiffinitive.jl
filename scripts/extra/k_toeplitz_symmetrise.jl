@@ -16,7 +16,7 @@
 # sources are literally columns of the exact K, so deriving them is identical to
 # running the 10 CG solves, and the reference is needed anyway.
 #
-# Run:  julia --project=. -t auto scripts/k_toeplitz_symmetrise.jl [Δz] [L_fault] [L_normal] [T_hours]
+# Run:  julia --project=. -t auto scripts/extra/k_toeplitz_symmetrise.jl [Δz] [L_fault] [L_normal] [T_hours]
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.BP8
 using Printf, LinearAlgebra

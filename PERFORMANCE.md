@@ -1,18 +1,26 @@
-# Performance: what costs what, and why the operators are assembled
+# Performance: what costs what in the elastic solve
 
 Reference material for the cost side of the elastic solve, in the same spirit
 as `SYMMETRIC_SAT.md`. Read it when a code comment cites it, or when deciding
 what to optimize next. Everything here is measured, not estimated, unless a
 line says otherwise.
 
-Measurements were taken on a 12-core workstation, Julia 1.12, SBP order 4,
-against `Diffinitive` at the pinned rev in `Project.toml`.
+**Sections are kept at their original numbers so code citations stay valid, and
+they are in rough chronological order.** The production path is described by
+§4b/§4c (`K` reuse), §5 (where the time goes) and §7 (matrix-free); **§7
+supersedes every memory and assembly figure in §1-§4**, which describe the
+assembled path that `representation=:assembled` still provides but nothing
+runs by default. §6 records a dead end.
 
-## 1. Why the operators are assembled rather than applied matrix-free
+Measurements were taken on a 12-core workstation, SBP order 4, against
+`Diffinitive` at the pinned rev in `Project.toml`; GPU figures name their card.
 
-Diffinitive is a matrix-free library, so assembling its operators into
-`SparseMatrixCSC` looks like it works against the design. It does not — it is
-the intended trade, and the margin is large.
+## 1. Why Diffinitive's *lazy* operators are assembled rather than applied
+
+Historical, and the reason §7 exists. Diffinitive is a matrix-free library, so
+assembling its operators into `SparseMatrixCSC` looks like it works against the
+design. Against the *lazy composition* it does not — and the margin is large.
+Hand-written matrix-free is a different thing entirely, and §7 is that.
 
 `Diffinitive`'s operators **compose**: `isotropic_lambda_mu` builds terms like
 `D1[i] ∘ D1[j]`. Applying a composition at a point re-evaluates the inner
@@ -47,7 +55,9 @@ Two corollaries worth recording, because both are tempting and both are wrong:
 Genuine matrix-free here would mean hand-writing the collapsed elastic stencil
 as an explicit kernel, and doing the same for the interface SAT. That is a
 different project from using the library's composition, and it is the only
-route that would change this conclusion.
+route that would change this conclusion. **It was done — see §7.** `A` is no
+longer formed on the production path, and the figures below describe the
+assembled path only.
 
 `Krylov.cg!` also needs `mul!`/`size`/`eltype`, none of which `LazyTensor`
 defines — so even the composite route needs a hand-written adapter first.
@@ -164,8 +174,8 @@ scales. That is exactly why §5 item 1 is the blocker.
 
 ## 4b. `K` is block-Toeplitz, and that changes the scaling
 
-**Measured, not conjectured** (`scripts/k_toeplitz_structure.jl`,
-`scripts/k_toeplitz_validate.jl`). In a homogeneous whole-space the
+**Measured, not conjectured** (`scripts/extra/k_toeplitz_structure.jl`,
+`scripts/extra/k_toeplitz_validate.jl`). In a homogeneous whole-space the
 slip→traction kernel is translation invariant, so `K[i,j]` should depend only on
 the separation `x_i − x_j`. It very nearly does, even at the *small* production
 domain where truncation is worst:
@@ -231,7 +241,7 @@ parallel work it was meant to distribute no longer exists.
 
 ### Resolution transferability: settled, and it improves
 
-The last open gate. `scripts/k_toeplitz_resolution.jl`, **matched pair at fixed
+The last open gate. `scripts/extra/k_toeplitz_resolution.jl`, **matched pair at fixed
 small domain**, full 30 days — holding the domain fixed so resolution is the only
 variable, because the converged domain at Δz = 25 m is 4.9 M DOF and ~77 h:
 
@@ -273,7 +283,9 @@ covers ~56% of separations (the rest far-field, set to zero) and that fraction
 is resolution-independent, but the decay argument behind it is not proven to be.
 And it is an approximation — a controlled ~0.004% against a ~53% domain bias and
 a much larger resolution error, so it is nowhere near the accuracy-limiting
-step, but `:exact` stays the default until the finer-Δz check lands.
+step, but every submission run uses `:exact` anyway, now that D4 symmetry and
+the GPU build have made it affordable. (`build_model`'s own default is still
+`:toeplitz`; see `TODO.md` "Open now".)
 
 ### Symmetrising the reconstruction: tested, rejected
 
@@ -281,7 +293,7 @@ Reciprocity says the whole-space kernel is even, so the exact `K` should be
 symmetric — it is, to 0.2003%. The reconstruction reads the kernel off sampled
 columns and does not enforce that, so `(K + Kᵀ)/2` looked like a free
 improvement. It is not an improvement, and it is not free.
-`scripts/k_toeplitz_symmetrise.jl`, Δz = 50 m, small domain, full 30 days:
+`scripts/extra/k_toeplitz_symmetrise.jl`, Δz = 50 m, small domain, full 30 days:
 
 | `K` variant | asymmetry | Frob. err | `V_max(t)` worst |
 |---|---|---|---|
@@ -355,6 +367,232 @@ hash.
 
 Caching is off unless `EQD_STIFFNESS_CACHE` is set, so the test suite and CI
 never read or write it.
+
+## 5. Where the time goes, and what to attack
+
+At any converged resolution, `fault_stiffness` is ~98% of the cost. Assembly is
+minutes since §2.2; the time integration is a dense `K` mat-vec per RHS
+evaluation and is comparatively cheap.
+
+Ranked by expected payoff at the time each was written, and kept in that
+order. **What actually shipped as the production path is 0b + 0c**: `D4`
+symmetry (an exact identity, 6.5-7.8× fewer solves) on top of the matrix-free
+operator of §7, on one GPU. Item 0's Toeplitz route and item 1's multi-node
+sharding both became avoidable rather than necessary.
+
+0. **Implement the Toeplitz `K` build** (§4b). Turns `2·N_Ωf` solves into 10,
+   at ~0.41% cost in `V_max`. **Implemented** and still available as
+   `stiffness=:toeplitz`, but superseded for the submission by 0b + 0c, which
+   cost nothing in accuracy.
+0b. **Exploit `K`'s square symmetry (`D4`) in the `:exact` build — an exact
+   discrete identity, not an approximation.** **Implemented** —
+   `fault_stiffness(fe; symmetry=true)` (`src/FaultResponse.jl`), and it is
+   what `build_model`'s `:exact` path uses by default now (`stiffness_matrix`
+   in `src/BP8.jl`), since the domain it builds is always square and centred.
+   Verified against the plain build on a 7×7 `Ω_f`: agrees to `rtol=1e-8`
+   (solver tolerance), 16 solves instead of 98
+   (`test/fault_response_test.jl` "D4 symmetry build agrees with the plain
+   exact build"). `Ω_f` and the elastic grids are
+   square and centred in the two fault-parallel directions, the medium is
+   homogeneous, and all four fault-parallel far-field faces carry the same
+   `u=0` condition. So the whole discretization is invariant under the eight
+   symmetries of the square, acting on positions and on the slip/traction
+   components together: reflecting `x2 → −x2` flips `s2` and `τ2` and leaves
+   `s3`, `τ3` alone; reflecting about the diagonal swaps the two. In block form,
+   with `Q` one of the eight signed permutations and `g` its action on node
+   indices,
+
+       K[g·i, g·j] = Q · K[i, j] · Qᵀ
+
+   Rebuilding the whole `K` from one node per orbit and differencing against a
+   full `:exact` build: **1.09e-16** at Δz = 100 m, **1.51e-16** at Δz = 80 m
+   (Frobenius, relative; worst single entry 4.3e-16).
+
+   **Why that is roundoff and not a small error.** `A` commutes with the
+   symmetry and the symmetry is orthogonal, so CG started from zero produces
+   *exactly* the mapped iterates — same Krylov space, same stopping test, same
+   iteration count. The symmetry therefore survives in the CG **error**, not
+   just in the converged solution. Measured by loosening the tolerance until the
+   columns are visibly wrong:
+
+   | `rtol` | `K` error vs `rtol` = 1e-12 | `D4` residual |
+   |---|---|---|
+   | 1e-12 | — | 1.09e-16 |
+   | 1e-6 | 1.9e-7 | 1.22e-16 |
+   | **1e-3** | **1.5e-4** | **1.04e-16** |
+
+   A badly converged `K` is still symmetric to the last bit. An approximation
+   would track *something* — the tolerance, `Δz`, the domain size; this tracks
+   only the machine epsilon. Contrast reciprocity, `K = Kᵀ`, which sits at
+   **1.8e-3**: that one is a physical near-symmetry spoiled by the interface-SAT
+   asymmetry, and it is what a real approximation looks like here.
+
+   **Contrast with §4b.** `:toeplitz` assumes *translation* invariance, which
+   the truncation boundary genuinely breaks — hence its 0.41–5.8%. `D4` assumes
+   only *reflection* invariance, which the truncation boundary **preserves**,
+   because the boundary is itself square and centred. Same idea, and the
+   difference between the two is exactly why one costs accuracy and the other
+   does not.
+
+   **The payoff.** The group does not act freely — nodes on the axes and
+   diagonals have stabilizers — so the reduction is 8× only asymptotically:
+
+   | Δz | `2·N_Ωf` | solves needed | speedup |
+   |---|---|---|---|
+   | 50 m | 578 | 81 | 6.5–7.1× |
+   | 25 m | 2,178 | 289 | 7.5× |
+   | **20 m** | **3,362** | **441** | **7.6×** |
+   | 10 m | 13,122 | 1,681 | 7.8× |
+
+   That turns §4b's ~17 days at the Δz = 20 m target into **~2.2 days**, with no
+   approximation at all — and combined with §4c it is a one-off job for a `K`
+   that is then reused indefinitely. It is what makes `:toeplitz` *avoidable*
+   for the submission rather than merely defensible.
+
+   **What it depends on**, in case the geometry ever changes: square and centred
+   `Ω_f` *and* elastic grid (a rectangular fault or `L_fault` differing between
+   `x2` and `x3` loses the diagonal reflection — 4× not 8×, still exact);
+   homogeneous λ, μ; the same boundary condition on all four fault-parallel
+   faces; a uniform grid with mirror-image SBP closures. The fault-normal
+   direction is untouched by these maps, so `L_normal` and the `x1`
+   discretization are unconstrained. Crucially it is a property of the
+   **operator and geometry only** — the injection source, the initial
+   conditions, and how asymmetrically slip evolves during the run are all
+   irrelevant, because `K` never sees them. A **free-surface** problem (BP1/BP3
+   rather than BP8's whole space) would break the depth reflection and leave
+   2×; that is the change most likely to cost this.
+
+0c. **GPU offload for the CG solve itself — implemented (2026-09-10), and
+   this plus 0b is the production path.** Every other speedup in this section
+   attacks the *number* of solves; this attacks the cost of *each* solve, and
+   composes with 0b (same D4 reduction, GPU instead of CPU threads
+   underneath). `fault_stiffness_gpu` (`EarthquakeDiffinitiveCUDAExt`, loaded
+   by `using CUDA`) holds the system resident on one GPU for the whole build
+   and runs the D4 representatives' CG solves against it sequentially — not
+   concurrently, because the premise is a single bandwidth budget: two solves
+   at once would contend for it rather than add to it, unlike CPU threads with
+   their own caches.
+
+   **Measured at the production point** (Δz = 10 m, (1600, 1600), 99.5 M DOF,
+   matrix-free): 8 shards of 211 representatives, 6.01 h per shard on one
+   L40S = **48.1 h** of card time, mean 1599 CG iterations, none unconverged
+   (`logs/Kgpu_dz10_Lf1600_Ln1600_6889974_*.out`). `shard`/`nshards` split the
+   representatives exactly as the CPU path does, so a build can be spread over
+   cards or fitted to a walltime limit.
+
+   The VRAM table below is **obsolete for the default representation**: §7
+   removed `A` entirely, so the resident set is ~9 GB at Δz = 10 m on
+   (1600, 1600) and every card listed fits every BP8 configuration. It still
+   describes `representation=:assembled`.
+
+   **Measured**, on a consumer RTX 2060 (Turing, 336 GB/s, correctness
+   checked against the CPU D4 build each time, agreement at CG-tolerance
+   level ~1e-13 – 1e-12, not merely close):
+
+   | n | DOF | CPU | GPU | speedup |
+   |---|---|---|---|---|
+   | 11 | 7,986 | 0.019 s | 0.010 s | 1.89× |
+   | 15 | 20,250 | 0.070 s | 0.017 s | 4.13× |
+   | 21 | 55,566 | 0.296 s | 0.035 s | 8.43× |
+
+   The speedup **grows with problem size**, consistent with the
+   memory-bandwidth-bound mechanism this whole document is built around (§1):
+   a GPU's raw bandwidth advantage over a CPU compounds once the working set
+   exceeds CPU cache. Production DOF is 100-1000× larger than n=21.
+
+   These small-scale numbers are from the assembled path on a consumer card;
+   the production figure above supersedes them. `verbose=true` reports
+   per-representative timing, which is what the walltime estimates in
+   `scripts/submit_bp8_gpu.sh` are anchored on.
+
+   **Fit against UPPMAX Pelle's GPUs**, using this section's own `A`+`HP_DSAT`
+   memory figures (§4: ~15 GB at Δz = 20 m, ~65 GB at Δz = 10 m at the
+   currently-targeted relaxed domain, ~116 GB at the nominal spec domain):
+
+   | GPU | VRAM | bandwidth | fits Δz=10m (~65 GB)? | fits Δz=10m (~116 GB)? |
+   |---|---|---|---|---|
+   | H100 NVL | 94 GB | 3,900 GB/s | **yes**, ~29 GB headroom | no |
+   | L40S | 48 GB | 864 GB/s | no | no |
+   | T4 | 16 GB | 300 GB/s | no (same ballpark as the 15 GB workstation limit) | no |
+
+   Under `representation=:assembled` the H100 NVL is the only one of the three
+   that holds the whole Δz = 10 m `A` on one card. **§7 makes this moot**: the
+   matrix-free default needs ~9 GB, so an L40S runs the nominal-spec domain,
+   and multi-GPU matrix splitting — never built — is no longer a route anyone
+   needs.
+
+### Also tried on the `:exact` CG solve, and rejected (2026-09-10)
+
+Kept here so none of these get re-proposed from first principles. All
+measured on the real assembled `A`, not reasoned about in the abstract.
+
+- **Mixed precision** (Float32 CG + Float64 iterative refinement): **0.59×**
+  (slower), and did not reach `rtol=1e-10` in 10 refinement rounds. This
+  matrix's conditioning hits Float32's roundoff floor too early for
+  refinement rounds to amortize.
+- **Block Krylov methods** (`Krylov.block_minres`, solving several columns as
+  one block — no `block_cg` exists in Krylov.jl): returns **all-NaN** while
+  reporting `solved=true` — a silent wrong answer, not a slow one. Confirmed
+  the cause is `A`'s ~40% null space (`P`'s far-field/tangential-pair
+  structure) by running the identical call on a non-singular test matrix,
+  where it works correctly. Also slower even ignoring correctness: 126 block
+  iterations cost 2.5× the wall-clock of 913 total single-column iterations,
+  since each block iteration is far more expensive here.
+- **Matrix reordering** (hand-rolled RCM, no fill-reducing/bandwidth-reducing
+  package was already a dependency): **~1.0×**, no effect, despite cutting
+  nominal bandwidth 17,314→2,361. A first pass showed 7×, which was a Julia
+  JIT-compilation timing artifact from not warming up the timed call before
+  measuring — corrected and reproduced at ~1.0× on both raw `mul!` throughput
+  and full CG solve time. The SBP+SAT sparsity pattern on a structured grid
+  already has enough locality that bandwidth-reducing reordering has nothing
+  left to gain.
+- **Warm-starting CG** from a neighbouring column's converged solution:
+  **~1.0×**, no iteration reduction, on realistic `Ω_f`-node columns (an
+  earlier pass showed apparent iteration blowup and huge disagreement, but
+  that traced to a degenerate all-zero RHS in the synthetic test, not a real
+  hazard for genuine columns). Even the null result isn't worth taking: warm
+  starting forces columns to solve sequentially, which would forfeit the
+  existing embarrassingly-parallel CPU threading for a measured ~0% gain.
+- **Exact dimension reduction** (drop far-field DOFs and merge tangential
+  pairs into one unknown before CG, via the same congruence transform the
+  removed `factorize_reduced` used — but skipping its Cholesky factorization,
+  which is what was actually rejected before, not the reduction itself):
+  mathematically exact and verified (`P*u` agrees with the full-system CG
+  answer), cuts the DOF count 1.48× — but **~1.0×** wall-clock. Far-field
+  rows were already all-zero (0 stored nonzeros — nothing to save by dropping
+  them), and merging tangential pairs *increases* density in the surviving
+  rows enough to cancel the DOF reduction. `nnz`, not DOF count, is what
+  tracks mat-vec cost here, and `nnz` barely moved (563,882 → 498,789).
+
+1. **Multi-node parallelism — implemented, and now composes with item 0b.**
+   `fault_stiffness`'s columns (or, with item 0b, its D4 orbit representatives)
+   are independent right-hand sides against a shared `A`, which distributes
+   without `Distributed`/MPI: each node rebuilds its own copy of `A` (minutes,
+   §4c) and takes a slice of the work, coordinating through nothing fancier
+   than a shared directory — `build_stiffness_cache.jl [shard] [nshards]` +
+   `merge_stiffness_cache.jl`, backed by `fault_stiffness_d4_shard` so sharding
+   splits *representatives* rather than raw columns and does not give up item
+   0b's ~7.8× (see that function's docstring for why the shard-file format
+   needed no change to support this). Within a node, threading is still only
+   sublinear (2.13× on 16 threads at production, PROGRESS.md) because the
+   sparse mat-vec is **memory-bandwidth bound** — independent **nodes**, each
+   with their own bandwidth, are what scales, which is why this axis matters at
+   all even after item 0b's per-node win.
+2. **Exploit structure in `K` (untested, potentially the largest win).** In a
+   homogeneous medium `K[i,j]` should depend mainly on the separation
+   `x_i − x_j`, making `K` near-block-Toeplitz — one solve could populate most
+   of it, collapsing thousands of solves to a handful. Far-field truncation
+   breaks this exactly, which is why it needs testing rather than assuming.
+   Cheaply testable: build `K` at Δz = 50 m and check how well entries collapse
+   onto separation alone.
+3. **A CG preconditioner.** Attacks the iteration count directly (236 already at
+   Δz = 50 m, extrapolating to ~450 at Δz = 20 m). Not shipped unvalidated: it
+   preserves the `range(A)` invariant CG relies on here only if it commutes with
+   `P` — see `CGSolver`'s docstring.
+4. **The boundary-integral route.** What most SEAS codes do: the fault-to-fault
+   kernel is a convolution, `O(N log N)` with FFTs, no volume unknowns and no
+   `K` build at all. A design decision, not an increment — but it is the only
+   option here that changes the Δz⁻⁶·⁷ scaling rather than its constant.
 
 ## 6. Preconditioning: measured, and it does not pay
 
@@ -455,225 +693,3 @@ sparsifying the lazy `D` was 40-69% and the `P[r,:] .= 0` CSC row loops 27-59%
 lost that term. A fused single-kernel stencil was measured *slower* (0.5× the
 axis-pass) on Ada-class GPUs — FP64 at 1/64 rate makes it FLOP-bound — and is
 not used. Full account, plan and status: `MATRIX_FREE_PLAN.md`.
-
-## 5. Where the time goes, and what to attack
-
-At any converged resolution, `fault_stiffness` is ~98% of the cost. Assembly is
-minutes since §2.2; the time integration is a dense `K` mat-vec per RHS
-evaluation and is comparatively cheap.
-
-Ranked by expected payoff. **§4b reorders this list**: the Toeplitz result
-attacks the `K` build's *scaling*, so it dominates everything below, and it
-largely dissolves item 1 rather than competing with it.
-
-0. **Implement the Toeplitz `K` build** (§4b). Turns `2·N_Ωf` solves into 2, at
-   ~0.03% cost in `V_max`. Purely local work, no cluster needed.
-0b. **Exploit `K`'s square symmetry (`D4`) in the `:exact` build — an exact
-   discrete identity, not an approximation.** **Implemented** —
-   `fault_stiffness(fe; symmetry=true)` (`src/FaultResponse.jl`), and it is
-   what `build_model`'s `:exact` path uses by default now (`stiffness_matrix`
-   in `src/BP8.jl`), since the domain it builds is always square and centred.
-   Verified against the plain build on a 7×7 `Ω_f`: agrees to `rtol=1e-8`
-   (solver tolerance), 16 solves instead of 98
-   (`test/fault_response_test.jl` "D4 symmetry build agrees with the plain
-   exact build"). `Ω_f` and the elastic grids are
-   square and centred in the two fault-parallel directions, the medium is
-   homogeneous, and all four fault-parallel far-field faces carry the same
-   `u=0` condition. So the whole discretization is invariant under the eight
-   symmetries of the square, acting on positions and on the slip/traction
-   components together: reflecting `x2 → −x2` flips `s2` and `τ2` and leaves
-   `s3`, `τ3` alone; reflecting about the diagonal swaps the two. In block form,
-   with `Q` one of the eight signed permutations and `g` its action on node
-   indices,
-
-       K[g·i, g·j] = Q · K[i, j] · Qᵀ
-
-   Rebuilding the whole `K` from one node per orbit and differencing against a
-   full `:exact` build: **1.09e-16** at Δz = 100 m, **1.51e-16** at Δz = 80 m
-   (Frobenius, relative; worst single entry 4.3e-16).
-
-   **Why that is roundoff and not a small error.** `A` commutes with the
-   symmetry and the symmetry is orthogonal, so CG started from zero produces
-   *exactly* the mapped iterates — same Krylov space, same stopping test, same
-   iteration count. The symmetry therefore survives in the CG **error**, not
-   just in the converged solution. Measured by loosening the tolerance until the
-   columns are visibly wrong:
-
-   | `rtol` | `K` error vs `rtol` = 1e-12 | `D4` residual |
-   |---|---|---|
-   | 1e-12 | — | 1.09e-16 |
-   | 1e-6 | 1.9e-7 | 1.22e-16 |
-   | **1e-3** | **1.5e-4** | **1.04e-16** |
-
-   A badly converged `K` is still symmetric to the last bit. An approximation
-   would track *something* — the tolerance, `Δz`, the domain size; this tracks
-   only the machine epsilon. Contrast reciprocity, `K = Kᵀ`, which sits at
-   **1.8e-3**: that one is a physical near-symmetry spoiled by the interface-SAT
-   asymmetry, and it is what a real approximation looks like here.
-
-   **Contrast with §4b.** `:toeplitz` assumes *translation* invariance, which
-   the truncation boundary genuinely breaks — hence its 0.41–5.8%. `D4` assumes
-   only *reflection* invariance, which the truncation boundary **preserves**,
-   because the boundary is itself square and centred. Same idea, and the
-   difference between the two is exactly why one costs accuracy and the other
-   does not.
-
-   **The payoff.** The group does not act freely — nodes on the axes and
-   diagonals have stabilizers — so the reduction is 8× only asymptotically:
-
-   | Δz | `2·N_Ωf` | solves needed | speedup |
-   |---|---|---|---|
-   | 50 m | 578 | 81 | 6.5–7.1× |
-   | 25 m | 2,178 | 289 | 7.5× |
-   | **20 m** | **3,362** | **441** | **7.6×** |
-   | 10 m | 13,122 | 1,681 | 7.8× |
-
-   That turns §4b's ~17 days at the Δz = 20 m target into **~2.2 days**, with no
-   approximation at all — and combined with §4c it is a one-off job for a `K`
-   that is then reused indefinitely. It is what makes `:toeplitz` *avoidable*
-   for the submission rather than merely defensible.
-
-   **What it depends on**, in case the geometry ever changes: square and centred
-   `Ω_f` *and* elastic grid (a rectangular fault or `L_fault` differing between
-   `x2` and `x3` loses the diagonal reflection — 4× not 8×, still exact);
-   homogeneous λ, μ; the same boundary condition on all four fault-parallel
-   faces; a uniform grid with mirror-image SBP closures. The fault-normal
-   direction is untouched by these maps, so `L_normal` and the `x1`
-   discretization are unconstrained. Crucially it is a property of the
-   **operator and geometry only** — the injection source, the initial
-   conditions, and how asymmetrically slip evolves during the run are all
-   irrelevant, because `K` never sees them. A **free-surface** problem (BP1/BP3
-   rather than BP8's whole space) would break the depth reflection and leave
-   2×; that is the change most likely to cost this.
-
-0c. **GPU offload for the CG solve itself — implemented (2026-09-10),
-   measured positive at small scale, extrapolated beyond it.** Every other
-   speedup in this section attacks the *number* of solves; this attacks the
-   cost of *each* solve, and composes with 0b (same D4 reduction, GPU instead
-   of CPU threads underneath). `fault_stiffness_gpu`
-   (`EarthquakeDiffinitiveCUDAExt`, loaded by `using CUDA`) holds `A`, `P`,
-   `T2`, `T3` resident on one GPU for the whole build and runs the D4
-   representatives' CG solves against it sequentially — sequentially, not
-   concurrently, because the whole premise is a single bandwidth budget: two
-   solves at once would contend for it rather than add to it, unlike CPU
-   threads with their own caches. **No sharding** — the whole `A` must fit in
-   one GPU's memory.
-
-   **Measured**, on a consumer RTX 2060 (Turing, 336 GB/s, correctness
-   checked against the CPU D4 build each time, agreement at CG-tolerance
-   level ~1e-13 – 1e-12, not merely close):
-
-   | n | DOF | CPU | GPU | speedup |
-   |---|---|---|---|---|
-   | 11 | 7,986 | 0.019 s | 0.010 s | 1.89× |
-   | 15 | 20,250 | 0.070 s | 0.017 s | 4.13× |
-   | 21 | 55,566 | 0.296 s | 0.035 s | 8.43× |
-
-   The speedup **grows with problem size**, consistent with the
-   memory-bandwidth-bound mechanism this whole document is built around (§1):
-   a GPU's raw bandwidth advantage over a CPU compounds once the working set
-   exceeds CPU cache. Production DOF is 100-1000× larger than n=21.
-
-   **What is and is not validated.** Correctness is real and checked, at
-   every size tested, on this hardware — that is not extrapolated. The
-   *speedup number* at production DOF counts, and on any datacenter GPU
-   (Hopper/Ada, not the Turing card measured), **is** extrapolated — from the
-   observed size trend and from the two architectures' bandwidth ratio, not
-   measured directly. cuSPARSE kernel behaviour does not necessarily scale
-   linearly with raw bandwidth across architecture generations. Re-measure on
-   the actual target GPU before relying on a specific number; `verbose=true`
-   reports per-representative timing for exactly that purpose.
-
-   **Fit against UPPMAX Pelle's GPUs**, using this section's own `A`+`HP_DSAT`
-   memory figures (§4: ~15 GB at Δz = 20 m, ~65 GB at Δz = 10 m at the
-   currently-targeted relaxed domain, ~116 GB at the nominal spec domain):
-
-   | GPU | VRAM | bandwidth | fits Δz=10m (~65 GB)? | fits Δz=10m (~116 GB)? |
-   |---|---|---|---|---|
-   | H100 NVL | 94 GB | 3,900 GB/s | **yes**, ~29 GB headroom | no |
-   | L40S | 48 GB | 864 GB/s | no | no |
-   | T4 | 16 GB | 300 GB/s | no (same ballpark as the 15 GB workstation limit) | no |
-
-   The H100 NVL is the only one of the three that holds the whole Δz = 10 m
-   `A` at the relaxed domain on one card — which is what makes "GPU without
-   sharding" a real option there rather than needing multi-GPU matrix
-   splitting on top of everything else in this section.
-
-   **Not built**: multi-GPU matrix splitting (for the ~116 GB nominal-spec
-   domain, or for L40S/T4-class cards) — would need `A` itself divided across
-   devices, a materially bigger project than the column-sharding this
-   document already covers, and not attempted since the relaxed-domain H100
-   case doesn't need it.
-
-### Also tried on the `:exact` CG solve, and rejected (2026-09-10)
-
-Kept here so none of these get re-proposed from first principles. All
-measured on the real assembled `A`, not reasoned about in the abstract.
-
-- **Mixed precision** (Float32 CG + Float64 iterative refinement): **0.59×**
-  (slower), and did not reach `rtol=1e-10` in 10 refinement rounds. This
-  matrix's conditioning hits Float32's roundoff floor too early for
-  refinement rounds to amortize.
-- **Block Krylov methods** (`Krylov.block_minres`, solving several columns as
-  one block — no `block_cg` exists in Krylov.jl): returns **all-NaN** while
-  reporting `solved=true` — a silent wrong answer, not a slow one. Confirmed
-  the cause is `A`'s ~40% null space (`P`'s far-field/tangential-pair
-  structure) by running the identical call on a non-singular test matrix,
-  where it works correctly. Also slower even ignoring correctness: 126 block
-  iterations cost 2.5× the wall-clock of 913 total single-column iterations,
-  since each block iteration is far more expensive here.
-- **Matrix reordering** (hand-rolled RCM, no fill-reducing/bandwidth-reducing
-  package was already a dependency): **~1.0×**, no effect, despite cutting
-  nominal bandwidth 17,314→2,361. A first pass showed 7×, which was a Julia
-  JIT-compilation timing artifact from not warming up the timed call before
-  measuring — corrected and reproduced at ~1.0× on both raw `mul!` throughput
-  and full CG solve time. The SBP+SAT sparsity pattern on a structured grid
-  already has enough locality that bandwidth-reducing reordering has nothing
-  left to gain.
-- **Warm-starting CG** from a neighbouring column's converged solution:
-  **~1.0×**, no iteration reduction, on realistic `Ω_f`-node columns (an
-  earlier pass showed apparent iteration blowup and huge disagreement, but
-  that traced to a degenerate all-zero RHS in the synthetic test, not a real
-  hazard for genuine columns). Even the null result isn't worth taking: warm
-  starting forces columns to solve sequentially, which would forfeit the
-  existing embarrassingly-parallel CPU threading for a measured ~0% gain.
-- **Exact dimension reduction** (drop far-field DOFs and merge tangential
-  pairs into one unknown before CG, via the same congruence transform the
-  removed `factorize_reduced` used — but skipping its Cholesky factorization,
-  which is what was actually rejected before, not the reduction itself):
-  mathematically exact and verified (`P*u` agrees with the full-system CG
-  answer), cuts the DOF count 1.48× — but **~1.0×** wall-clock. Far-field
-  rows were already all-zero (0 stored nonzeros — nothing to save by dropping
-  them), and merging tangential pairs *increases* density in the surviving
-  rows enough to cancel the DOF reduction. `nnz`, not DOF count, is what
-  tracks mat-vec cost here, and `nnz` barely moved (563,882 → 498,789).
-
-1. **Multi-node parallelism — implemented, and now composes with item 0b.**
-   `fault_stiffness`'s columns (or, with item 0b, its D4 orbit representatives)
-   are independent right-hand sides against a shared `A`, which distributes
-   without `Distributed`/MPI: each node rebuilds its own copy of `A` (minutes,
-   §4c) and takes a slice of the work, coordinating through nothing fancier
-   than a shared directory — `build_stiffness_cache.jl [shard] [nshards]` +
-   `merge_stiffness_cache.jl`, backed by `fault_stiffness_d4_shard` so sharding
-   splits *representatives* rather than raw columns and does not give up item
-   0b's ~7.8× (see that function's docstring for why the shard-file format
-   needed no change to support this). Within a node, threading is still only
-   sublinear (2.13× on 16 threads at production, PROGRESS.md) because the
-   sparse mat-vec is **memory-bandwidth bound** — independent **nodes**, each
-   with their own bandwidth, are what scales, which is why this axis matters at
-   all even after item 0b's per-node win.
-2. **Exploit structure in `K` (untested, potentially the largest win).** In a
-   homogeneous medium `K[i,j]` should depend mainly on the separation
-   `x_i − x_j`, making `K` near-block-Toeplitz — one solve could populate most
-   of it, collapsing thousands of solves to a handful. Far-field truncation
-   breaks this exactly, which is why it needs testing rather than assuming.
-   Cheaply testable: build `K` at Δz = 50 m and check how well entries collapse
-   onto separation alone.
-3. **A CG preconditioner.** Attacks the iteration count directly (236 already at
-   Δz = 50 m, extrapolating to ~450 at Δz = 20 m). Not shipped unvalidated: it
-   preserves the `range(A)` invariant CG relies on here only if it commutes with
-   `P` — see `CGSolver`'s docstring.
-4. **The boundary-integral route.** What most SEAS codes do: the fault-to-fault
-   kernel is a convolution, `O(N log N)` with FFTs, no volume unknowns and no
-   `K` build at all. A design decision, not an increment — but it is the only
-   option here that changes the Δz⁻⁶·⁷ scaling rather than its constant.

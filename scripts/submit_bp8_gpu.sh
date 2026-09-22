@@ -61,43 +61,23 @@ DZ="${1:?usage: submit_bp8_gpu.sh <dz> [L_fault] [L_normal] [gpu_type] [nshards]
 
 # Defaults per resolution.
 #
-# DOMAIN. Δz = 10 m defaults to the (1600, 1600) domain — the domain sweep at
-# Δz = 20 m (`scripts/bp8_compare_runs.jl`, 2026-09-14) shows the post-shut-in
-# `V_max` still moving 2-5 % between 1200² and 1600², so (1200, 1200) is not
-# domain-converged and there is no longer a memory reason to prefer it.
+# DOMAIN. Δz = 10 m defaults to (1600, 1600): the Δz = 20 m domain sweep shows
+# post-shut-in `V_max` still moving 2-5% between 1200² and 1600², and
+# matrix-free there is no memory reason to prefer the smaller one.
 #
-# GPU TYPE. `sinfo` on Pelle:
-#     gpu  gpu:l40s:10(S:0-1)  386000
-#     gpu  gpu:h100:2(S:1)     386000
-# Matrix-free, every configuration fits either card with a wide margin, so the
-# choice is purely queue length vs bandwidth (L40S 864 GB/s, H100 NVL 3.9 TB/s):
+# GPU TYPE. Pelle has ten L40S (864 GB/s) and two H100 NVL (3.9 TB/s). Every
+# configuration fits either card with wide margin (~9 GB at the largest), so
+# the choice is queue length vs bandwidth. Measured on L40S, matrix-free:
 #
-#   run                          VRAM    L40S                H100
-#   Δz = 20 m (1600, 1600)      ~1 GB   ~1.5 h (extrap.)   ~30 min
-#   Δz = 10 m (1150, 1150)      ~3 GB   **11.89 h measured** ~4 h (extrap.)  (assembled path: 40.4 h measured)
-#   Δz = 10 m (1600, 1600)      ~9 GB   ~32 h (extrap.)     ~11 h (extrap.)
+#   Δz = 10 m (1150, 1150)   11.89 h   (assembled path was 40.4 h)
+#   Δz = 10 m (1600, 1600)   48.1 h    (8 shards x 6.01 h)
 #
-# Calibrated 2026-09-16 from the one real cluster figure above
-# (Kgpu_dz10_Lf1150_Ln1150_6839867.out, L40S, matrix-free): grid DOF scales
-# almost exactly as (L_fault/Δz)^3 (measured ratio 1.1354 for 1150->1200 m at
-# Δz=10, predicted (1200/1150)^3=1.1362), representative count as 1/Δz^2 (Ω_f
-# is the physical fault patch, independent of the padding domain — 1681 at
-# Δz=10 vs 441 at Δz=20 m is 3.81x, matching (20/10)^2=4x), and mean CG
-# iterations move only mildly with Δz (1194 at Δz=10 vs 951 at Δz=20 m,
-# 1150-1800 m domains). Multiplying those factors through calibrates every
-# other cell in the table to within the same laptop-scaled assumption used
-# before, now anchored to one cluster measurement instead of zero. **Still
-# extrapolated for every cell but the one in bold** — the (1600, 1600) row is
-# the production target and has not itself been measured; treat 32 h as
-# central, not a ceiling, and shard it (see EST_H below).
+# CORES: the host only does per-solve RHS bookkeeping and the D4 orbit fill;
+# 8 is plenty.
 #
-# CORES: the host does the per-solve right-hand side bookkeeping and the D4
-# orbit fill, nothing heavier; 8 is plenty.
-#
-# EST_H is the estimated *solve* time in hours for the whole build on one L40S
-# — there is no assembly phase any more, so this is the whole job. It is what
-# the walltime is derived from below, and the only thing to update once the
-# cluster has measured a real figure.
+# EST_H is the estimated solve time in hours for the whole build on one L40S.
+# There is no assembly phase, so that is the whole job, and the walltime below
+# is derived from it.
 case "$DZ" in
   10) DEF_LF=1600; DEF_LN=1600; CORES=8; DEF_GPU=l40s ;;
   *)  DEF_LF=1600; DEF_LN=1600; CORES=8; DEF_GPU=l40s ;;
@@ -105,13 +85,10 @@ esac
 L_FAULT="${2:-$DEF_LF}"
 L_NORMAL="${3:-$DEF_LN}"
 GPU_TYPE="${4:-$DEF_GPU}"
-# `nshards` accepts `N` or `N%C`: N independent shards, at most C of them
-# running at once (SLURM's own `--array=1-N%C` throttle). The two are separate
-# concerns and conflating them is what makes sharding look antisocial — N sets
-# how small each task is (and so how easily it backfills), C sets how much of
-# the partition you occupy. Pelle has ten L40S, so `8%2` is eight ~5 h tasks
-# that never hold more than two cards: friendlier than one 47 h job, and it
-# starts sooner.
+# `nshards` accepts `N` or `N%C`: N independent shards, at most C running at
+# once (SLURM's `--array=1-N%C` throttle). N sets how small each task is, and
+# so how easily it backfills; C sets how much of the partition you occupy. With
+# ten L40S, `8%2` is eight ~6 h tasks holding at most two cards.
 NSHARDS_SPEC="${5:-1}"
 NSHARDS="${NSHARDS_SPEC%%\%*}"          # count, for sizing the walltime
 NSHARDS_CONC="${NSHARDS_SPEC#*%}"       # concurrency cap, or == NSHARDS_SPEC if absent
@@ -123,24 +100,23 @@ if [[ "$NSHARDS_CONC" != "$NSHARDS_SPEC" ]]; then
 fi
 
 # EST_H scales from a MEASURED anchor per resolution, by DOF — not a per-domain
-# constant. A single constant for every `L_fault > 1200` under-sizes the larger
-# domains badly: it gave 2000^2 the same 32 h as 1600^2, so a 4-way shard asked
-# 16 h per task for ~23 h of work and would have been killed with nothing
-# written (job 6861315, cancelled).
+# constant, which under-sizes the larger domains badly (it once gave 2000^2 the
+# same estimate as 1600^2 and a 4-way shard would have been killed).
 #
-# Anchors, both measured on an L40S on this matrix-free path:
-#   Δz = 10 m  11.89 h at 37.1 M DOF  (1150, 1150)  Kgpu_dz10_Lf1150_Ln1150_6839867.out
-#   Δz = 20 m   1.79 h at 24.5 M DOF  (2000, 2000)  Kgpu_dz20_Lf2000_Ln2000_6857776.out
-# Separate anchors per Δz because the *number* of solves is set by Δz alone
-# (441 at 20 m, 1681 at 10 m — Ω_f is a fixed 400 m patch), while DOF is set by
-# the domain; one global law cannot carry both.
+# Anchors, both L40S, matrix-free:
+#   Δz = 10 m  11.89 h at 37.1 M DOF  (1150, 1150)
+#   Δz = 20 m   1.79 h at 24.5 M DOF  (2000, 2000)
+# Separate per Δz because the *number* of solves is set by Δz alone (Ω_f is a
+# fixed 400 m patch) while DOF is set by the domain; one law cannot carry both.
 #
-# Exponent 1.2, not 1.0: cost is DOF x iterations, and mean CG iterations climb
-# with domain size too — 665 -> 858 from (1200,1200) to (1600,1600) at Δz = 20 m,
-# and 730 -> 1042 across the new 7.1 M -> 24.5 M sweep. Checked back against the
-# four Δz = 20 m measurements it predicts 0.41/0.53/0.98/1.79 h against 0.33/
-# 0.43/0.80/1.79 measured — 10-25% high, which is the safe direction for a
-# walltime request.
+# Exponent 1.2, not 1.0, because cost is DOF x iterations and mean CG iterations
+# climb with domain size too. Against the four Δz = 20 m measurements that runs
+# 10-25% high — the safe direction.
+#
+# !! KNOWN LOW AT Δz = 10 m. This predicts 38.8 h for (1600, 1600), which
+# !! measured 48.1 h — 24% under, the unsafe direction. The two Δz = 10 m points
+# !! imply an exponent of ~1.42. Until that is fixed, shard Δz = 10 m or pass an
+# !! explicit walltime; see TODO.md.
 case "${DZ%.*}" in
   10) DOF_REF=37139256; T_REF=11.89 ;;
   *)  DOF_REF=24483006; T_REF=1.79  ;;
@@ -151,27 +127,21 @@ DOF=$(( 6 * N1 * N23 * N23 ))
 EST_H=$(LC_ALL=C awk -v t="$T_REF" -v d="$DOF" -v r="$DOF_REF" 'BEGIN{printf "%.1f", t*(d/r)^1.2}')
 
 # An H100 NVL has 4.5x an L40S's bandwidth and the build is bandwidth-bound, but
-# only 3x is claimed here: the estimates themselves are unmeasured, and there
-# are only two H100s, so the walltime that gets the job *started* matters more
-# than shaving the last hour off the request.
+# only 3x is claimed: no H100 run has been measured, and with only two cards the
+# walltime that gets the job *started* matters more than shaving an hour off.
 [[ "$GPU_TYPE" == "h100" ]] && EST_H=$(LC_ALL=C awk -v e="$EST_H" 'BEGIN{printf "%.1f", e/3}')
 
-# WALLTIME IS DERIVED, NOT FIXED PER RESOLUTION, for two reasons that both cost
-# queue time when got wrong:
+# WALLTIME IS DERIVED, NOT FIXED PER RESOLUTION, for two reasons:
 #
-#  1. **A 47 h request queues far worse than a 12 h one.** SLURM backfills short
+#  1. A 47 h request queues far worse than a 12 h one — SLURM backfills short
 #     jobs into gaps ahead of long ones, so asking for the partition maximum
-#     "to be safe" can cost more waiting than the job takes to run. A Δz = 10 m
-#     (1150, 1150) build is ~7 h — asking 47 h for it is pure queue penalty.
-#  2. **A shard does 1/nshards of the work**, so with `nshards` the per-job
-#     walltime must shrink too. Handing every array task the whole build's
-#     walltime is the same mistake, multiplied.
+#     "to be safe" can cost more waiting than the job takes to run.
+#  2. A shard does 1/nshards of the work, so its walltime must shrink too.
 #
-# So: 2x the estimate (the estimates are scaled from laptop measurements and
-# have not been checked on an L40S yet), divided across the shards, floored at
-# 2 h so a small build still has room to precompile, capped at the partition's
-# 47 h. Override with the 6th argument when the estimate is wrong — the one
-# number to trust more than this arithmetic is a previous log's `done in X h`.
+# So: 2x the estimate, divided across the shards, floored at 2 h so a small
+# build has room to precompile, capped at the partition's 47 h. Override with
+# the 6th argument — a previous log's `done in X h` beats this arithmetic, and
+# at Δz = 10 m it has to (see the EST_H note above).
 if [[ -n "${6:-}" ]]; then
     TIME="$6"
 else

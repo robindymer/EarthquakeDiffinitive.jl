@@ -19,12 +19,20 @@ exploring `src/` cold. It explains the module dependency chain (each module comp
 before it, `src/EarthquakeDiffinitive.jl` include order):
 
 ```
-PorePressure → Elasticity → ElasticitySplitNode → RateStateFriction → FaultResponse → BP8
+PorePressure → Elasticity → ElasticitySplitNode → RateStateFriction
+            → FaultResponse → StiffnessCache → BP8
 ```
 
 ...and that each module's test file should be read alongside its source, not after — the tests
 carry "why this assertion, why this tolerance" comments that explain design decisions the source
 doesn't.
+
+## Comment style
+
+Keep comments short and to the point. State the what and the non-obvious why in as few lines as
+possible; cite `PERFORMANCE.md` §N rather than restating its measurements inline, and skip
+justifications of paths not taken. Keep the load-bearing notes — why a tolerance, why a sign
+convention, why an assertion is written that way.
 
 ## Answering style
 
@@ -48,6 +56,7 @@ they change a decision — one line each, not a section.
 - `scripts/` and `context/demo/`, `context/notebooks/` are separate Julia environments (own
   `Project.toml`, pull in `EarthquakeDiffinitive` as a dep rather than living inside it) — run
   their scripts with `julia --project=scripts scripts/foo.jl` etc., not `--project=.`.
+  `scripts/extra/` holds settled one-off investigations, not part of any workflow.
 - Minimum supported Julia version is 1.10 (see `Project.toml` `[compat]`); CI also tests 1.11 and
   `pre`.
 

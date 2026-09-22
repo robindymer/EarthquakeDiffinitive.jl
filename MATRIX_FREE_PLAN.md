@@ -1,13 +1,29 @@
-# Matrix-free split-node operator: plan and status (2026-09-14)
+# Matrix-free split-node operator: design and status
 
 Goal: build `K` for **Δz = 10 m on the (1600, 1600) domain** — 100 M DOF — in
 about a day on **one L40S**, without the assembled `A`.
 
-## Status
+## Status: done, and it is the default
 
-Steps 1-7 are **implemented and tested** (355/355, `JULIA_NUM_THREADS=4`;
-GPU tests 8/8 with `EQD_TEST_GPU=1`); step 8's local validation is recorded
-at the end of this file; step 9 (the cluster runs) is what remains.
+The matrix-free operator is **production code**, not a prototype:
+`representation=:kronecker` is `FaultElasticity`'s and `build_model`'s default,
+and it is what every GPU `K` build runs on. Steps 1-8 below are implemented and
+tested (355/355 with `JULIA_NUM_THREADS=4`; GPU tests with `EQD_TEST_GPU=1`).
+
+The goal above was **met and measured**: Δz = 10 m on (1600, 1600), 99.5 M DOF,
+8 shards of 6.01 h on one L40S each = 48.1 h of card time, mean 1599 CG
+iterations, none unconverged
+(`logs/Kgpu_dz10_Lf1600_Ln1600_6889974_*.out`). That is 24% above what
+`scripts/submit_bp8_gpu.sh`'s `EST_H` predicts for the same point (38.8 h), so
+its Δz = 10 m anchor wants updating — two Δz = 10 m measurements now imply a
+DOF exponent of ~1.42 rather than the 1.2 in the script.
+
+Note `scripts/extra/matrix_free_prototype.jl` is **not** this code. It is the
+standalone feasibility study that preceded it, with its own `Ops1D`,
+`axpass!` and `navier!`; nothing in `src/` or `ext/` loads it. Kept for
+reproducibility only.
+
+What remains is the production runs themselves (step 9), not the operator.
 
 | where | what |
 |---|---|
@@ -33,7 +49,7 @@ Measured from the five GPU builds in `logs/Kgpu_*.out` and extrapolated:
 | CG solves, 1681 D4 representatives | 23 h on L40S | ~4 days H100 / ~8 days L40S |
 | total | 40 h | **~1 week, on the wrong side of the 47 h walltime** |
 
-Where the assembly time goes (`scripts/matrix_free_prototype.jl`, (1600,1200)):
+Where the assembly time goes (`scripts/extra/matrix_free_prototype.jl`, (1600,1200)):
 
 | step | Δz=50, 634 k DOF | Δz=40, 1.2 M DOF | scaling |
 |---|---|---|---|
@@ -48,7 +64,7 @@ boundary-local sparse matrices they already are.
 
 ## What the prototype established
 
-`scripts/matrix_free_prototype.jl` (+ `_fused.jl`), run on the laptop RTX 2000 Ada:
+`scripts/extra/matrix_free_prototype.jl` (+ `_fused.jl`), run on the laptop RTX 2000 Ada:
 
 1. **Diffinitive's 3D `D1`/`D2` on an equidistant `TensorGrid` are exact
    Kronecker products of the 1D operators** (`max|diff| = 0.0`). The whole
@@ -141,9 +157,9 @@ each `TensorGrid`'s 1D factor grids — 6 tiny matrices per side, milliseconds.
 
 ## Steps
 
-**0. Prototype in the repo (done).** `scripts/matrix_free_prototype.jl`
+**0. Prototype in the repo (done).** `scripts/extra/matrix_free_prototype.jl`
 reproduces every number above: `julia --project=scripts
-scripts/matrix_free_prototype.jl 50 1600 1200 gpu`.
+scripts/extra/matrix_free_prototype.jl 50 1600 1200 gpu`.
 
 **1. `src/ElasticitySplitNode.jl` — the operator, CPU first.**
 - `SideOps`, `SplitNodeOperator`, `split_node_operator(g_minus, g_plus, λ, μ, set)`.
@@ -219,7 +235,7 @@ Ada, `scripts/build_stiffness_cache_gpu.jl 20 1200 1200` rebuilt the cluster's
 own cache entry `K_exact_o4_dz20_lf400_Lf1200_Ln1200_1d794b2be6168695`
 matrix-free:
 
-| | cluster, assembled (L40S, `logs/Kgpu_dz20_Lf1200_Ln1200_6713705.out`) | here, matrix-free (laptop RTX 2000 Ada) |
+| | cluster, assembled (L40S) | here, matrix-free (laptop RTX 2000 Ada) |
 |---|---|---|
 | assembly | 3811 s (1.06 h) | **23 s** (operator build) |
 | solves | 441 reps, mean 665 CG iterations, 0 unconverged | 441 reps, **mean 665**, 0 unconverged |
@@ -243,17 +259,17 @@ representations and build paths to 1e-9, GPU shards vs whole to 1e-8, and one
 `K` built three ways (one GPU job, two GPU shards + merge, threaded CPU)
 agreeing to 1e-16.
 
-**Still to do on the cluster**: rerun Δz = 10 m (1150, 1150) on an L40S and
-compare against the 40.4 h in `logs/Kgpu_dz10_Lf1150_Ln1150_6713776.out`
-(expected ~7 h) — that calibrates the (1600, 1600) estimate before it is
-queued. `submit_bp8_gpu.sh` derives its walltime request from `EST_H`, so
-that measurement is the one number to update there afterwards.
+**Done on the cluster**: Δz = 10 m (1150, 1150) matrix-free on an L40S took
+11.89 h against 40.4 h assembled, and that measurement is `submit_bp8_gpu.sh`'s
+Δz = 10 m `EST_H` anchor. The (1600, 1600) run then came in at 48.1 h against
+the 38.8 h that anchor predicts — see "Status" above.
 
-**9. Production.** `scripts/submit_bp8_gpu.sh 10 1600 1600` (one L40S, ~1 day,
-requests 42 h) or `… 10 1600 1600 l40s 4` (four shards, 11 h each — usually
-*starts* sooner, since SLURM backfills short jobs ahead of long ones), then
-`run_bp8.jl gs/pw` against the cache entry as today. Then the domain question from the compare
-script is answered directly instead of extrapolated.
+**9. Production — what remains.** The (1600, 1600) Δz = 10 m `K` has been
+built as 8 L40S shards; merge them (`merge_stiffness_cache.jl 10 1600 1600`)
+and run `run_bp8.jl gs/pw 10 1600 1600 exact` against the cache entry. On
+measured timings a single job wants ~48 h of L40S, over the 47 h cap, so either
+shard it or use an h100 (`… 10 1600 1600 h100`), where the script's /3
+bandwidth heuristic puts it near 16 h.
 
 ## Risks and what bounds them
 

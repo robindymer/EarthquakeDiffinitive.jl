@@ -16,7 +16,7 @@
 # excluded? If the interior collapses tightly, a hybrid is possible — Toeplitz
 # for the interior, explicit solves for a boundary ring.
 #
-# Run:  julia --project=. -t auto scripts/k_toeplitz_structure.jl [Δz] [L_fault] [L_normal]
+# Run:  julia --project=. -t auto scripts/extra/k_toeplitz_structure.jl [Δz] [L_fault] [L_normal]
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.BP8
 using Printf, Statistics

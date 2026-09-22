@@ -8,10 +8,10 @@ as a Gaussian source or a Peaceman well. Built on the `Diffinitive` SBP-FD
 library, pinned in `Project.toml`'s `[sources]`.
 
 **Both injection models run end to end** and write the §4 output files; see
-"Results" below. The implementation is complete and validated, but the shipped
-runs are **not resolution-converged** and are not submission-ready. What blocks
-that has changed twice and is now a single, concrete thing — see "Known
-limitations" 1.
+"Results" below. The implementation is complete and validated. The `output/`
+runs recorded here are **not** at the converged domain and resolution — see
+"Known limitations" 1 — but that is now a matter of running the production
+jobs, not of anything being blocked. `TODO.md` "Open now" is the current list.
 
 The discrete operator `A = -HP(D+SAT)P` is **symmetric positive definite** (it
 was ~14% asymmetric). That closed the project's main correctness question.
@@ -31,12 +31,18 @@ an approximation — cutting the reference build's CG solves by 6.5-7.8×
 unconditionally now, since `build_fault_elasticity` always produces a square,
 centred domain.
 
-**The remaining blocker is memory for `A` itself at Δz = 20 m (~15 GB), not
-compute and not the `K` build.** With `:toeplitz` the target run is ~3 h on one
-node. Full suite green at **200/200**.
+**Nothing is blocked any more (2026-09-14 onwards).** `A` is no longer
+assembled — `SplitNodeOperator` applies it matrix-free from the 1D operators,
+so the ~15 GB ceiling this file records below is gone
+(`MATRIX_FREE_PLAN.md`). With D4 symmetry on a GPU, the Δz = 10 m
+(1600, 1600) `K` measured 48.1 h of L40S time. BP8-PW's stiffness is handled
+by implicit integration (see the 2026-09-12 section). Full suite green at
+**355/355**.
 
 Sections below that describe `factorize_reduced`, `prolongation`, Cholesky
-fallbacks or a 176/176 suite are **history, not current API**.
+fallbacks, an assembled `A`'s memory as a ceiling, or a suite smaller than
+355 tests are **history, not current API**. Dated section headings say when
+each was written; where two disagree, the later one wins.
 
 ## Done
 
@@ -108,7 +114,7 @@ traction.
   allocation-free 2D/3D `apply` methods (mirroring the notebook's own
   non-allocating specializations, needed because Diffinitive's generic
   D-dimensional `apply` doesn't infer well) — confirmed 0 bytes/point for a
-  full in-place `E*u`. Used directly by `scripts/elastic_wave_2d.jl` (a 2D
+  full in-place `E*u`. Used directly by `scripts/extra/elastic_wave_2d.jl` (a 2D
   elastic wave simulation validating the operator qualitatively — clean
   P/S wavefront separation at the right speed ratio, correct non-circular
   S-wave radiation pattern, stable reflections).
@@ -222,7 +228,7 @@ half-space shortcut.
   "Iterative solver" below for why the singularity is benign and what it costs.
 - **Symmetry: root cause found and fixed.** `A` used to be ~14% asymmetric, so
   the reference note's assertion that it is SPD did not hold and CG was
-  unusable. `scripts/split_node_spd.jl` remains the standing diagnostic; run it
+  unusable. `scripts/extra/split_node_spd.jl` remains the standing diagnostic; run it
   before revisiting any of this. Measured on cubes of side `n` (order 4), before
   and after the traction fix:
 
@@ -279,7 +285,7 @@ half-space shortcut.
      which a single sparse factorization does not.
 
   **ROOT CAUSE — see `SYMMETRIC_SAT.md` for the full diagnosis.**
-  `scripts/symmetry_decomposition.jl` takes the operator apart factor by
+  `scripts/extra/symmetry_decomposition.jl` takes the operator apart factor by
   factor. The defect reproduces on a *single grid with a plain free surface*
   — no interface, no projection — so none of the split-node machinery is
   implicated. Within the elastic operator, λ-only is exactly symmetric
@@ -927,7 +933,7 @@ coupling.
 
 The section above establishes *that* the floor causes the stiffness and what
 raising it buys. This one identifies the eigenvalue, which changes what a
-solver fix has to look like. `scripts/bp8_stiffness_spectrum.jl` reproduces
+solver fix has to look like. `scripts/extra/bp8_stiffness_spectrum.jl` reproduces
 everything here. Measured at Δz = 50 m, default `σ̄_min` = 1 kPa; the ODE state
 is only `N = 4·nf+1 = 1157`, so full eigendecompositions are affordable.
 
@@ -1137,15 +1143,14 @@ digits. The test uses `1e-8`.
 
 These are properties of the current approach, not loose ends to tidy.
 
-1. **The runs are not resolution-converged.** *(Status as of 2026-08-20: the
-   compute obstacle is gone, a memory one remains. Δz = 20 m clears the
-   `L_b/Δz ≥ 3` criterion. With `:toeplitz` — now `build_model`'s default — its
-   `K` is 10 solves, ~2.5-3 h on one node, against `:exact`'s ~17 days; the
-   multi-node requirement is removed, not deferred. What binds instead is
-   ~15 GB for `A`+`HP_DSAT` at that resolution, which this 15 GB workstation
-   cannot hold. The earlier "~5.5 GB and ~182 core-hours" here is **stale** —
-   it predates the domain-convergence correction, which raised every cost
-   ~4.5× in compute and ~2.6× in memory. See `PERFORMANCE.md` §4 and §4b.)*
+1. **The recorded runs are not at the converged resolution.** *(Status as of
+   2026-09-14: no obstacle remains, only the production jobs. Δz = 20 m clears
+   the `L_b/Δz ≥ 3` criterion and the benchmark's nominal Δz = 10 m has been
+   built: `A` is never assembled, so the ~15 GB memory ceiling this entry used
+   to cite is gone, and D4 symmetry on one GPU brought the Δz = 10 m
+   (1600, 1600) `K` to 48.1 h of L40S time. The "~5.5 GB and ~182 core-hours"
+   and "~15 GB for `A`+`HP_DSAT`" figures below are both **stale**. See
+   `MATRIX_FREE_PLAN.md` and `PERFORMANCE.md` §5, §7.)*
    The rate-and-state process zone is `L_b = μD_RS/(bσ̄) ≈ 64 m` at
    σ̄ = 25 MPa. The benchmark's Δz = 10 m gives ~6 cells per `L_b`; the
    Δz = 50 m used here gives 1.3, and Δz = 100 m gives 0.6. Because slip rate

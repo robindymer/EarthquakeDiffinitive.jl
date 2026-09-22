@@ -1,6 +1,6 @@
 # Does the notebook's traction operator preserve BP8's interface conditions?
 #
-# `scripts/symmetry_decomposition.jl` shows that restoring the narrow/wide split
+# `scripts/extra/symmetry_decomposition.jl` shows that restoring the narrow/wide split
 # in the traction operator (the way `context/notebooks/elastic_clean.jl`'s
 # `IsotropicTractionOperator` does) makes `-HP(D+SAT)P` symmetric. Symmetry is
 # worthless if it costs the physics, so this script re-runs
@@ -10,7 +10,7 @@
 # `elastic_blocks` is NOT touched by this fix, so `D` is identical in both
 # columns; only the SAT's traction operator and the traction extraction change.
 #
-# Run with:  julia --project=. scripts/verify_notebook_traction.jl [n ...]
+# Run with:  julia --project=. scripts/extra/verify_notebook_traction.jl [n ...]
 using EarthquakeDiffinitive
 using EarthquakeDiffinitive.Elasticity: elastic_blocks, traction_blocks,
                                        dof_index

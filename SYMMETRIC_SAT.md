@@ -2,8 +2,8 @@
 
 Diagnosis, fix, and verification. **The fix is in `src/Elasticity.jl`** and both
 verification gates have passed — see "Verification gates" at the end. Reproduce
-the diagnosis with `julia --project=. scripts/symmetry_decomposition.jl 9`, and
-the downstream consequences with `julia --project=. scripts/split_node_spd.jl`.
+the diagnosis with `julia --project=. scripts/extra/symmetry_decomposition.jl 9`, and
+the downstream consequences with `julia --project=. scripts/extra/split_node_spd.jl`.
 
 ## The one-paragraph version
 
@@ -143,7 +143,7 @@ boundary rows so `D̂` is replaced by `D₁`:
 D₂_FC = D₂ + H⁻¹e₀e₀ᵀ(D̂ - D₁) - H⁻¹e_N e_Nᵀ(D̂ - D₁)
 ```
 
-Implemented as `adapted_narrow` in `scripts/symmetry_decomposition.jl`, using
+Implemented as `adapted_narrow` in `scripts/extra/symmetry_decomposition.jl`, using
 `ElasticitySplitNode._prolongation` (= `-H⁻¹∘e'∘Hᵧ`) so the signs fold in:
 
 ```julia
@@ -219,7 +219,7 @@ cleared afterwards by re-running the four production configurations.
 
 ### Gate 1: the interface physics — PASSED
 
-`scripts/verify_notebook_traction.jl` re-runs
+`scripts/extra/verify_notebook_traction.jl` re-runs
 `test/elasticity_split_node_test.jl`'s interface checks against both traction
 operators, using each one *both* in the SAT and for extracting σ_i1:
 
