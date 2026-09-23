@@ -2,10 +2,19 @@
 #
 #   julia --project=scripts scripts/bp8_compare_runs.jl [dir ...]
 #
-# With no arguments it picks up every `output/BP8-QD-*` directory. The
-# **reference is the last directory listed** (with no arguments: the one whose
-# name sorts last, which for a domain sweep is the largest); pass them
-# explicitly to choose.
+# With no arguments it picks up every `output/BP8-QD-*` directory and takes the
+# **finest Δz** as the reference, ties broken by the largest elastic domain.
+# Naming directories explicitly keeps the old contract — the **last one listed**
+# is the reference — so a deliberate comparison against a chosen run is still
+# possible.
+#
+# WHY NOT "WHATEVER SORTS LAST", WHICH IS WHAT THIS USED TO DO. `sort` puts
+# `dz20` after `dz10`, so the auto-picked reference was the *coarsest* grid and
+# every finer run was scored on how far it had moved away from an under-resolved
+# answer. That inverts the table's meaning. At Δz = 20 m, `L_b/Δz` = 3.2, which
+# `resolution_report` calls marginal ("right physics, unconverged numbers"), and
+# the Δz = 10 m runs duly came out "19% off" — the 19% being the *reference's*
+# own discretisation error, reported as if it were theirs.
 #
 # WHY THIS EXISTS RATHER THAN `bp8_domain_convergence.jl`. That script and
 # `bp8_resolution_convergence.jl` *run the models themselves*, at Δz = 100 m
@@ -16,7 +25,7 @@
 # GPU path and ones whose `K` came from different builds.
 #
 # ---------------------------------------------------------------------------
-# WHAT TO COMPARE, AND WHEN — the two traps this script exists to avoid
+# WHAT TO COMPARE, AND WHEN — the three traps this script exists to avoid
 #
 # 1. **`V_max` is the metric, and it amplifies.** `PERFORMANCE.md` §4b measured
 #    that an error in `K` shows up in `V_max` 2-3 orders of magnitude larger
@@ -36,6 +45,16 @@
 #    post-injection column is much larger than the injection one, the 100 h
 #    figure was hiding the answer.
 #
+# 3. **Δz and domain size are different error axes, and Δz dominates.**
+#    Measured on the BP8-QD-GS runs in `output/`: halving the domain moves
+#    `V_max` ~0.6% through injection and ~5% in the tail, and it does that at
+#    *either* resolution — while Δz 20 -> 10 m moves it 20-24% through
+#    injection, in the very window where the domain variants agree to 0.00%.
+#    Total slip lands within 0.8% either way, so the Δz difference is a wrong
+#    creep *rate* on the ramp, not a different solution. One table cannot
+#    collapse both axes into one number, so Δz is now a column and a mixed-Δz
+#    set is flagged.
+#
 # Runs may differ in `saveat` (it was corrected 300 -> 200 s partway through
 # this project), so everything is linearly interpolated onto the reference's
 # own time grid, restricted to the overlap. Comparing row-by-row would silently
@@ -54,6 +73,32 @@ datarows(path) = [r for r in (tryparse.(Float64, split(l)) for l in eachline(pat
                   if !isempty(r) && !any(isnothing, r)]
 
 """
+    headermatch(path, re) -> Union{String,Nothing}
+
+First capture of `re` over the comment block of a SEAS output file. The runs
+report their own `Δz` and domain in that block, which is what the model
+actually built; the directory name is only a label someone typed, and these
+tables now make a decision (which run is the reference) on the answer.
+"""
+function headermatch(path, re)
+    for (i, l) in enumerate(eachline(path))
+        i > 40 && break
+        m = match(re, l)
+        m === nothing || return m.captures[1]
+    end
+    return nothing
+end
+
+const RE_DZ  = r"^#\s*element_size\s*=\s*([0-9.eE+-]+)"
+const RE_DOF = r"^#\s*elastic_domain=.*?([0-9]+)\s+elastic DOF"
+
+"`Δz` in m from the header, or `NaN` if the run predates that header line."
+gridsize(path) = (v = headermatch(path, RE_DZ); v === nothing ? NaN : parse(Float64, v))
+
+"Elastic DOF count from the header (a proxy for domain size), or `NaN`."
+elasticdof(path) = (v = headermatch(path, RE_DOF); v === nothing ? NaN : parse(Float64, v))
+
+"""
     series(dir) -> NamedTuple
 
 `t`, `Vmax` (m/s, undoing `global.dat`'s log10) and `moment_rate` from
@@ -66,7 +111,8 @@ function series(dir)
     G = datarows(g)
     isempty(G) && error("global.dat in $dir has no data rows")
     t = [r[1] for r in G]
-    out = (; dir, t, Vmax = [10.0^r[2] for r in G], moment = [r[3] for r in G],
+    out = (; dir, t, Δz = gridsize(g), dof = elasticdof(g),
+           Vmax = [10.0^r[2] for r in G], moment = [r[3] for r in G],
            slip = Float64[], stress = Float64[])
     if isfile(s)
         S = datarows(s)
@@ -111,6 +157,7 @@ function worstrel(ref, cmp, field, window)
     return (100worst, at)
 end
 
+explicit = !isempty(ARGS)
 dirs = isempty(ARGS) ?
        sort(filter(isdir, [joinpath("output", d) for d in
                            (isdir("output") ? readdir("output") : String[])
@@ -120,10 +167,47 @@ length(dirs) >= 2 || error("""
     Pass them explicitly, or copy the cluster's `output/` down first.""")
 
 runs = series.(dirs)
-ref = runs[end]
 
-println("reference (last listed): ", basename(ref.dir))
-@printf("            %d rows, t = 0 .. %.2f d\n\n", length(ref.t), ref.t[end] / DAY)
+"""
+    pick_reference(runs)
+
+Finest `Δz`, ties broken by the largest elastic domain — the two axes along
+which the answer only improves, so this is the run the others should be scored
+against. Falls back to the last listed if no run reports its `Δz`.
+"""
+function pick_reference(runs)
+    finest = minimum(r -> isnan(r.Δz) ? Inf : r.Δz, runs)
+    isfinite(finest) || return runs[end]
+    return argmax(r -> isnan(r.dof) ? -Inf : r.dof, filter(r -> r.Δz == finest, runs))
+end
+
+# Explicit directories mean the caller chose; auto-discovery must not hand back
+# the coarsest grid as truth (see the header).
+ref = explicit ? runs[end] : pick_reference(runs)
+dzlabel(r) = isnan(r.Δz) ? "?" : @sprintf("%g", r.Δz)
+
+@printf("reference (%s): %s   [Δz = %s m]\n",
+        explicit ? "last listed" : "finest Δz", basename(ref.dir), dzlabel(ref))
+@printf("            %d rows, t = 0 .. %.2f d\n", length(ref.t), ref.t[end] / DAY)
+
+# Two separate things to say, and they are not the same thing: the set mixes
+# resolutions at all (so no single column is one error axis), and the reference
+# is not the finest run in it (so "difference from the reference" is not
+# "distance from the truth").
+Δzs = sort(unique(filter(!isnan, [r.Δz for r in runs])))
+if length(Δzs) > 1
+    @printf("\nNOTE  this set mixes Δz = %s m. A row at a different Δz from the reference is\n",
+            join(map(v -> @sprintf("%g", v), Δzs), " / "))
+    println("      not measuring the same thing as a row at equal Δz — see trap 3: Δz moved")
+    println("      20-24% where halving the domain moved 0.6%. Read the Δz column first.")
+end
+if !isnan(ref.Δz) && any(r -> !isnan(r.Δz) && r.Δz < ref.Δz, runs)
+    @printf("\nWARNING  the reference is NOT the finest run here (a Δz < %s m run is listed).\n",
+            dzlabel(ref))
+    println("         Its column is then that run's distance from a coarser answer, which is")
+    println("         not its error. Re-run with no arguments, or list the finest run last.")
+end
+println()
 
 windows = [("injection (t<=100h)", (0.0, T_OFF)),
            ("post-shutin (t>100h)", (T_OFF, Inf)),
@@ -133,10 +217,12 @@ for (field, label) in ((:Vmax, "V_max  [the deciding metric, amplified ~1e2-1e3x
                        (:slip, "slip_2 [control: NOT amplified]"),
                        (:moment, "moment_rate [control: NOT amplified]"))
     println(label)
-    @printf("  %-42s %14s %14s %14s\n", "run", "injection", "post-shutin", "FULL RUN")
-    for r in runs[1:end-1]
+    @printf("  %-42s %5s %14s %14s %14s\n", "run", "Δz",
+            "injection", "post-shutin", "FULL RUN")
+    for r in runs
+        r.dir == ref.dir && continue
         vals = [worstrel(ref, r, field, w)[1] for (_, w) in windows]
-        @printf("  %-42s %13s %13s %13s\n", basename(r.dir),
+        @printf("  %-42s %5s %13s %13s %13s\n", basename(r.dir), dzlabel(r),
                 map(v -> isnan(v) ? "n/a" : @sprintf("%.3f%%", v), vals)...)
     end
     println()
@@ -146,7 +232,8 @@ end
 # injection and is not converged over the full 30 days is the exact failure
 # §4b documents, and it is invisible in any table that stops at 100 h.
 println("-"^80)
-for r in runs[1:end-1]
+for r in runs
+    r.dir == ref.dir && continue
     inj, _ = worstrel(ref, r, :Vmax, (0.0, T_OFF))
     full, at = worstrel(ref, r, :Vmax, (0.0, Inf))
     (isnan(inj) || isnan(full) || inj <= 0) && continue
@@ -161,6 +248,8 @@ end
         basename(ref.dir))
 println("Convergence means the numbers SHRINK as runs approach the reference, in the")
 println("FULL RUN column. A single small number proves nothing on its own.")
+println("Compare equal-Δz rows to each other for the domain axis; a row at a different")
+println("Δz from the reference is reporting the resolution axis, which is ~4x larger.")
 
 # ---------------------------------------------------------------------------
 # Overlay plot. The table above is what you make the decision on; this is what
