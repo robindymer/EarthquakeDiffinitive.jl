@@ -8,6 +8,7 @@ using StaticArrays
 using LinearAlgebra: mul!, norm, diag
 using OrdinaryDiffEq
 using OrdinaryDiffEqBDF: QNDF
+using SciMLBase: u_modified!
 using ProgressMeter: Progress, update!, finish!
 using Printf
 using Dates: today
@@ -870,8 +871,22 @@ function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=default_integrator(m),
                      tstops=[m.par.t_off], kwargs...)
     if progress
         prog = Progress(100; desc="bp8: ")
+        # `u_modified!(integrator, false)` is NOT optional. A `DiscreteCallback`
+        # leaves `integrator.u_modified == true` unless told otherwise, which
+        # makes the integrator assume the callback changed `u` and reinitialise
+        # after EVERY step — refactorising `W` and discarding the multistep
+        # history. `Tsit5` is explicit and single-step, so it barely notices
+        # (BP8-GS: 664 steps either way); `QNDF` is an implicit BDF method and
+        # is destroyed by it. Measured at Δz = 10 m on (1600, 1600), t = 2 h:
+        # 241 steps / 16.7 s without the callback against >40x slower with it,
+        # which is why every BP8-PW run through `run_bp8.jl` sat at 0% forever
+        # while the same model solved fine from the REPL.
         cb = DiscreteCallback((u, t, integrator) -> true,
-            integrator -> update!(prog, floor(Int, 100 * (integrator.t - tspan[1]) / (tspan[2] - tspan[1])));
+            function (integrator)
+                update!(prog, floor(Int, 100 * (integrator.t - tspan[1]) / (tspan[2] - tspan[1])))
+                u_modified!(integrator, false)
+                return nothing
+            end;
             save_positions=(false, false))
         solve_kwargs = (; solve_kwargs..., callback=cb)
     end
