@@ -846,10 +846,15 @@ interpolates it. An already-attached history covering `tspan` is reused, and
 sweeps over elastic settings pay for it once. `pressure_kwargs` overrides that
 solve.
 
+`land_on_saveat` (default: on for the Peaceman well) adds the `saveat` grid to
+`tstops`, so every saved row is a step solution rather than the interpolant. At
+a `σ̄_min`-floored node V is ill-conditioned in (τ, θ), and interpolated rows
+showed V spikes >1 decade above the true slip rate; see `PEACEMAN_SPIKES.md`.
+
 `progress` (defaults to `verbose`) shows a bar tracking `t/tspan[2]`.
 """
 function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=default_integrator(m), reltol=1e-8,
-                 saveat=3600.0, verbose=false, progress=verbose,
+                 saveat=3600.0, land_on_saveat=m.injection === :peaceman, verbose=false, progress=verbose,
                  pressure_kwargs=(;), kwargs...)
     covers = m.pressure.sol !== nothing &&
              m.pressure.tspan[1] <= tspan[1] && tspan[2] <= m.pressure.tspan[2]
@@ -867,8 +872,12 @@ function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=default_integrator(m),
     f = ODEFunction(rhs!; jac=state_jacobian!, jac_prototype=state_jacobian_prototype(m))
     prob = ODEProblem(f, u0, tspan, m)
     t0 = time()
-    solve_kwargs = (; reltol, abstol, saveat, save_everystep=false,
-                     tstops=[m.par.t_off], kwargs...)
+    tstops = [m.par.t_off]
+    if land_on_saveat
+        grid = saveat isa Number ? collect(tspan[1]:saveat:tspan[2]) : collect(saveat)
+        tstops = sort!(unique!(vcat(tstops, grid)))
+    end
+    solve_kwargs = (; reltol, abstol, saveat, save_everystep=false, tstops, kwargs...)
     if progress
         prog = Progress(100; desc="bp8: ")
         # `u_modified!(integrator, false)` is NOT optional. A `DiscreteCallback`

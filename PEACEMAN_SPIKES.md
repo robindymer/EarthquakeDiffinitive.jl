@@ -61,19 +61,28 @@ Station (0, 0) around the peak (every third 200 s row):
 - GS has no spike: σ̄ never approaches the floor, so a·σ̄ is ~10⁴ times larger and
   the same drifts do not matter.
 
-## 4. Source of the drifts — hypothesis, not yet tested
+## 4. Source of the drifts — confirmed: the `saveat` interpolant
 
 The `saveat` points between integrator steps are filled in by the integrator's
 interpolant. With 3,369 QNDF steps over 720 h, a step often spans several save
 points. The pattern fits a step boundary: a smooth drift inside the step, then a
 snap back at 73.28 h.
 
-**Test:** rerun with `tstops` equal to the save times, which forces the integrator to
-land on every output time, so no interpolation. Expect ~4× more steps (≈ 1 h).
+**Test** (`run_bp8(...; land_on_saveat)`, which puts the save times in `tstops`).
+Δz = 10 m, (400, 400), `toeplitz`, 0–100 h, `saveat = 200`:
 
-- If the spikes disappear, use that setting for PW submissions.
-- If they remain, the drift is in the step solutions themselves, and the next thing
-  to look at is the nonlinear-solve tolerance at floored nodes.
+| `land_on_saveat` | steps | well max log₁₀V derived | well max log₁₀(Δslip/Δt) | global `V_max` |
+|---|---|---|---|---|
+| false | 2,711 | −5.62 | −6.73 | 8.4e-6 at 63.9 h, node (0, −10) |
+| true | 4,776 | **−6.73** | −6.73 | 1.8e-6 at 0.5 h, well (pre-floor) |
+
+The spikes are gone, and so is the spurious global `V_max`. `land_on_saveat` now
+defaults to on for PW. Cost is 1.8× the steps, not the 4× guessed.
+
+Caveat: the row-by-row max |derived − Δslip| (t > 10 h) fell from 14.7 to 4.2
+decades but is not zero. That metric compares |V| against the x₂ component only,
+and takes the log of Δslip over near-stationary rows, so it is loose. It is not
+evidence of a remaining spike.
 
 ## 5. Why the floor is needed at all
 
@@ -133,7 +142,10 @@ In this order. The σ̄_min sweep comes last: a larger floor would hide the spik
 PROGRESS.md "σ̄_min as a regularization" already argues against changing the physics
 this way.
 
-- [ ] **`tstops` test.** Add an option to `run_bp8.jl` that passes `tstops` equal to
+- [x] **`tstops` test.** Done on (400, 400), see §4: the spikes disappear, and
+      `land_on_saveat` is now the PW default. **Remaining:** regenerate the PW
+      outputs (`pw 10 1150 1150`, `pw 10 1600 1600`) with the new default.
+      Original plan: Add an option to `run_bp8.jl` that passes `tstops` equal to
       the `saveat` times, then rerun `pw 10 1150 1150`. Compare the reported log₁₀V₂
       against log₁₀(Δslip/Δt) at station (0, 0) around 72–74 h (§3), and compare the
       global `max_slip_rate`. Expect ~4× more steps (≈ 1 h).
@@ -141,9 +153,9 @@ this way.
     outputs.
   - If they remain: the drift is in the step solutions themselves; look at the
     nonlinear-solve tolerance at floored nodes.
-- [ ] **Update `PROGRESS.md`** "σ̄_min as a regularization" and "Known limitations" 3
+- [x] **Update `PROGRESS.md`** "σ̄_min as a regularization" and "Known limitations" 3
       with the Δz = 10 m finding and the mechanism, once settled.
 - [ ] **σ̄_min sensitivity (only after the above).** Rerun with 1 kPa, 10 kPa and
       100 kPa and check that slip, moment rate and the off-well stations do not depend
-      on the ε. This needs σ̄_min settable from `run_bp8.jl`; it is currently
-      `par.σ̄_min` in `src/BP8.jl`.
+      on the ε. σ̄_min can now be set with `BP8_SIGMA_MIN=<Pa>` for `run_bp8.jl`;
+      output goes to `..._smin<N>`, and the `K` cache is reused.

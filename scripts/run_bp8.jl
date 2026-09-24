@@ -8,6 +8,9 @@
 # cache key — both build paths produce the same `K`, so keying on it would
 # force a redundant multi-hour rebuild of a matrix already on disk.
 #
+# `$BP8_SIGMA_MIN` (Pa) overrides the `σ̄_min` floor, for the sensitivity check
+# in PEACEMAN_SPIKES.md; a non-default value is tagged onto the output directory.
+#
 # `stiffness` is `exact` (default, and the submission route) or `toeplitz`.
 # With `exact`, build `K` first via `build_stiffness_cache.jl` (or its GPU
 # counterpart) so this run reads it from `$EQD_STIFFNESS_CACHE`; otherwise the
@@ -31,17 +34,21 @@ stiffness = length(ARGS) >= 5 ? Symbol(ARGS[5]) : :exact
 stiffness ∈ (:exact, :toeplitz) ||
     error("stiffness must be exact or toeplitz, got $stiffness")
 
+par = haskey(ENV, "BP8_SIGMA_MIN") ?
+      benchmark_parameters(σ̄_min=parse(Float64, ENV["BP8_SIGMA_MIN"])) : benchmark_parameters()
+σtag = par.σ̄_min == benchmark_parameters().σ̄_min ? "" : "_smin$(round(Int, par.σ̄_min))"
+
 tag = injection === :gaussian ? "GS" : "PW"
 suffix = get(ENV, "BP8_OUTPUT_SUFFIX", "")
 outdir = joinpath(@__DIR__, "..", "output",
                   "BP8-QD-$(tag)_dz$(Int(Δz))_Lf$(Int(L_fault))_Ln$(Int(L_normal))_$(stiffness)" *
-                  (isempty(suffix) ? "" : "_$(suffix)"))
+                  σtag * (isempty(suffix) ? "" : "_$(suffix)"))
 
-@info "BP8-QD-$tag" Δz L_fault L_normal stiffness outdir
+@info "BP8-QD-$tag" Δz L_fault L_normal stiffness σ̄_min = par.σ̄_min outdir
 flush(stdout)
 
 t0 = time()
-m = build_model(; Δz, L_fault, L_normal, injection, stiffness, verbose=true)
+m = build_model(; par, Δz, L_fault, L_normal, injection, stiffness, verbose=true)
 @info "model built" seconds = round(time() - t0, digits=1) frictional_nodes = m.nf
 flush(stdout)
 

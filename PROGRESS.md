@@ -839,6 +839,11 @@ its influence on the fault decreases, while the stiffness it generates worsens.
 Regularizing it is therefore **both more valuable and less harmful** at finer
 resolution — the favourable direction for a Δz = 10 m run.
 
+**Δz = 10 m caveat (2026-09-24).** Result 1 held at 50 m and 25 m. At 10 m the
+*reported* `V_max` did come from floored nodes, but only as an interpolation
+artefact in the saved rows, gone with `land_on_saveat` (Known limitations 3,
+`PEACEMAN_SPIKES.md`).
+
 **Suggested value: `σ̄_min` = 100 kPa.** 113× at Δz = 25 m for zero change in
 `V_max` and 0.14% in slip — below the Toeplitz error. 1 MPa gives 748× but moves
 slip 1.42%, which exceeds it; slip is itself a §4.1 reported output.
@@ -1221,6 +1226,14 @@ These are properties of the current approach, not loose ends to tidy.
    bounded because slip relieves shear stress as fast as strength drops.
    `effective_stress_report` now reports `nodes`, `fraction` and `radius` rather
    than only an evaluation count; the GS variant never reaches the floor.
+
+   **Output artefact at floored nodes (2026-09-24).** There `a·σ̄` = 16 Pa, so
+   V(τ, θ) is extremely ill-conditioned, and `saveat` rows filled by the
+   integrator's interpolant showed V spikes the slip does not have. Δz = 10 m,
+   (400, 400), 0–100 h: well-node V peaked at 10^−5.62 derived vs 10^−6.73 from
+   Δslip/Δt, and global `V_max` came from that artefact at (0, −10). With
+   `land_on_saveat=true` (now the PW default) both peaks read 10^−6.73, for
+   1.8× the steps. See `PEACEMAN_SPIKES.md`.
 
    **~~It also has a runtime cost~~ — RESOLVED 2026-09-12: `run_bp8` now
    integrates BP8-PW implicitly (`QNDF` with the block-diagonal analytic
