@@ -1116,9 +1116,10 @@ function write_global(m, dir, times, Vmax, moment_rate, step_lines, modeler)
         end
         println(io, "# Column #1 = Time (s)")
         println(io, "# Column #2 = Max_slip_rate (log10 m/s)")
-        println(io, "# Column #3 = Moment_rate (N.m/s)")
+        println(io, "# Column #3 = Moment_density_rate (N.m/s)")
         println(io, "# The line below lists the names of the data fields")
-        println(io, "t max_slip_rate moment_rate")
+        # SEAS uploader expects `moment_density_rate`, not the description PDF's `moment_rate`.
+        println(io, "t max_slip_rate moment_density_rate")
         println(io, "# Here is the time-series data.")
         for (n, t) in enumerate(times)
             @printf(io, "%21.13E %14.6E %14.6E\n", t, safelog10(Vmax[n]), moment_rate[n])
