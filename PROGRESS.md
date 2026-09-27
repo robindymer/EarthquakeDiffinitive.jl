@@ -841,8 +841,8 @@ resolution — the favourable direction for a Δz = 10 m run.
 
 **Δz = 10 m caveat (2026-09-24).** Result 1 held at 50 m and 25 m. At 10 m the
 *reported* `V_max` did come from floored nodes, but only as an interpolation
-artefact in the saved rows, gone with `land_on_saveat` (Known limitations 3,
-`PEACEMAN_SPIKES.md`).
+artefact in the saved rows, gone with `land_on_saveat` plus the max error norm
+(Known limitations 3, `PEACEMAN_SPIKES.md`).
 
 **Suggested value: `σ̄_min` = 100 kPa.** 113× at Δz = 25 m for zero change in
 `V_max` and 0.14% in slip — below the Toeplitz error. 1 MPa gives 748× but moves
@@ -1234,6 +1234,13 @@ These are properties of the current approach, not loose ends to tidy.
    Δslip/Δt, and global `V_max` came from that artefact at (0, −10). With
    `land_on_saveat=true` (now the PW default) both peaks read 10^−6.73, for
    1.8× the steps. See `PEACEMAN_SPIKES.md`.
+
+   **Second artefact, in the step solutions (2026-09-27).** At (1150, 1150)
+   `land_on_saveat` alone still left V₂ dips of up to 10 decades and sign-flipping
+   τ₃ at the floored nodes: the default RMS error norm lets one node of 3·6561
+   carry ~140× the tolerance, ≈ 150 Pa in τ₂. `internalnorm = max_norm` (now the
+   PW default): over 0–60 h, bad rows 22 → 0 and τ₃ sign flips 324 → 0, for +47%
+   steps. `PEACEMAN_SPIKES.md` §6.
 
    **~~It also has a runtime cost~~ — RESOLVED 2026-09-12: `run_bp8` now
    integrates BP8-PW implicitly (`QNDF` with the block-diagonal analytic

@@ -125,6 +125,50 @@ and the run reproduces it: τ ≈ 0.6 kPa at the well. `σ̄_min` = 1 kPa is onl
 that keeps the friction law defined. The §3 spike is a cost of evaluating V near
 that limit, not a reason to remove the floor.
 
+## 6. Remaining spikes after §4 — fixed: the RMS error norm
+
+With `land_on_saveat`, the production run (`pw 10 1150 1150`) still had spikes at the
+well, now in the step solutions themselves:
+
+- **V₂ dips:** 10 rows before `t_off` where reported V₂ sat 0.5–10 decades *below*
+  Δslip/Δt, which stayed flat at ~2e-7 m/s. At 4.39 h τ₂ even went negative
+  (−206 Pa), against ~570 Pa in the neighbouring rows.
+- **V₃ noise:** log₁₀V₃ jumped between −12 and −16. τ₃ should be ~1e-8·τ₂ ≈ 6e-6 Pa
+  (the prestress ratio), but it flipped sign at the 1e-3 Pa level, and V₃/V₂ = τ₃/τ₂.
+
+**Cause:** OrdinaryDiffEq measures the step error, and QNDF's Newton convergence, in
+an RMS norm over all 3·6561 states. One node can therefore carry ~√19683 ≈ 140× the
+requested tolerance.
+
+- Slip: reltol 1e-8 × 0.05 m × K_ii (2.2e9 Pa/m) × 140 ≈ **150 Pa** in τ₂, which is
+  4 decades of V at a·σ̄ = 16 Pa.
+- s₃: abstol 1e-14 m × K_ii × 140 ≈ **3e-3 Pa** in τ₃, which is 500× the signal.
+
+**Fix:** `internalnorm = max_norm` (max over components), so every node has to meet
+the tolerance on its own. It is now the PW default in `run_bp8`.
+
+**Test:** Δz = 10 m, (1150, 1150), exact `K`, 0–60 h, `saveat = 200`, both runs with
+`land_on_saveat`. "Bad" means |log₁₀|V| − log₁₀(Δslip/Δt)| > 0.3 decades (from
+t > 0.5 h for V₂, at all nodes; from t > 2 h for V₃, at (0, 0)):
+
+| norm | steps | wall | bad V₂ rows | bad V₃ rows at (0,0) | τ₃ sign flips | min τ₂ at (0,0) |
+|---|---|---|---|---|---|---|
+| RMS (old default) | 3,901 | 445 s | 22 (5 floored nodes) | 528 | 324 | −206 Pa |
+| **max** | 5,725 | 522 s | **0** | **0** | **0** | 586 Pa |
+
+Cost: +47% steps, +17% wall time. Tightening `reltol` instead would slow every node
+to fix five.
+
+**Full run** (0–720 h), station (0, 0), same metric:
+
+| norm | steps | integration | bad V₂ rows | bad V₃ rows | τ₃ sign flips | final slip (0,0) |
+|---|---|---|---|---|---|---|
+| RMS | 16,094 | 1,241 s | 10 | 789 | 530 | 5.0630e-2 m |
+| **max** | 19,983 | 1,640 s | **0** | **0** | **0** | 5.0629e-2 m |
+
+Global `max_slip_rate` is unchanged: −5.75 at 0.5 h, the initial acceleration, in
+both runs.
+
 ## Consequences
 
 - PW's reported global `max_slip_rate` (peak −3.99) and V at station (0, 0) are, at
@@ -153,6 +197,8 @@ this way.
     outputs.
   - If they remain: the drift is in the step solutions themselves; look at the
     nonlinear-solve tolerance at floored nodes.
+- [x] **Max-norm fix (§6).** `internalnorm = max_norm` is the PW default.
+      **Remaining:** regenerate `pw 10 1600 1600` with it.
 - [x] **Update `PROGRESS.md`** "σ̄_min as a regularization" and "Known limitations" 3
       with the Δz = 10 m finding and the mechanism, once settled.
 - [ ] **σ̄_min sensitivity (only after the above).** Rerun with 1 kPa, 10 kPa and

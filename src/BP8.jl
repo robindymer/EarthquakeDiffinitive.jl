@@ -822,9 +822,13 @@ end
 """
 default_integrator(m::BP8Model) = m.injection === :peaceman ? QNDF() : Tsit5()
 
+# Step-error / Newton norm for BP8-PW; see `run_bp8`'s `internalnorm`. Also
+# called on scalars, which `maximum(abs, x)` handles.
+max_norm(u, t) = maximum(abs, u)
+
 """
     run_bp8(m; tspan=(0.0, m.par.t_f), alg=default_integrator(m), reltol=1e-8,
-              saveat=3600.0, verbose=false, pressure_kwargs=(;), kwargs...)
+              saveat=3600.0, land_on_saveat, internalnorm, verbose=false, pressure_kwargs=(;), kwargs...)
 
 Integrates slip and state. Absolute tolerances are per block (slip, ln θ),
 which live on very different scales.
@@ -851,10 +855,19 @@ solve.
 a `σ̄_min`-floored node V is ill-conditioned in (τ, θ), and interpolated rows
 showed V spikes >1 decade above the true slip rate; see `PEACEMAN_SPIKES.md`.
 
+`internalnorm` (default for the Peaceman well: max norm) is the norm the step
+error and Newton convergence are measured in. The default RMS over all `3nf`
+states lets one node carry ~√(3nf) ≈ 140× the tolerance, which at a floored
+node (V changes a decade per 37 Pa of τ) gave V₂ dips of up to 10 decades and
+sign-flipping τ₃. Max norm: 0 such rows over 0-60 h at Δz = 10 m for +47% steps
+(`PEACEMAN_SPIKES.md` §6).
+
 `progress` (defaults to `verbose`) shows a bar tracking `t/tspan[2]`.
 """
 function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=default_integrator(m), reltol=1e-8,
-                 saveat=3600.0, land_on_saveat=m.injection === :peaceman, verbose=false, progress=verbose,
+                 saveat=3600.0, land_on_saveat=m.injection === :peaceman,
+                 internalnorm=m.injection === :peaceman ? max_norm : nothing,
+                 verbose=false, progress=verbose,
                  pressure_kwargs=(;), kwargs...)
     covers = m.pressure.sol !== nothing &&
              m.pressure.tspan[1] <= tspan[1] && tspan[2] <= m.pressure.tspan[2]
@@ -877,7 +890,8 @@ function run_bp8(m::BP8Model; tspan=(0.0, m.par.t_f), alg=default_integrator(m),
         grid = saveat isa Number ? collect(tspan[1]:saveat:tspan[2]) : collect(saveat)
         tstops = sort!(unique!(vcat(tstops, grid)))
     end
-    solve_kwargs = (; reltol, abstol, saveat, save_everystep=false, tstops, kwargs...)
+    solve_kwargs = (; reltol, abstol, saveat, save_everystep=false, tstops,
+                    (internalnorm === nothing ? (;) : (; internalnorm))..., kwargs...)
     if progress
         prog = Progress(100; desc="bp8: ")
         # `u_modified!(integrator, false)` is NOT optional. A `DiscreteCallback`
