@@ -1,6 +1,10 @@
 # Compare finished BP8 output directories against each other.
 #
 #   julia --project=scripts scripts/bp8_compare_runs.jl [dir ...]
+#   BP8_COMPARE_VARIANT=GS julia --project=scripts scripts/bp8_compare_runs.jl pelle/output
+#
+# A `dir` without a `global.dat` is a parent: its `BP8-QD-*` runs are picked up
+# as in the no-argument case (which scans `output/`).
 #
 # With no arguments it picks up every `output/BP8-QD-*` directory and takes the
 # **finest Δz** as the reference, ties broken by the largest elastic domain.
@@ -157,11 +161,30 @@ function worstrel(ref, cmp, field, window)
     return (100worst, at)
 end
 
-explicit = !isempty(ARGS)
-dirs = isempty(ARGS) ?
-       sort(filter(isdir, [joinpath("output", d) for d in
-                           (isdir("output") ? readdir("output") : String[])
-                           if startswith(d, "BP8-QD-")])) : ARGS
+"`BP8-QD-*` run directories directly under `parent`, sorted."
+discover(parent) = sort(filter(isdir, [joinpath(parent, d) for d in
+                                       (isdir(parent) ? readdir(parent) : String[])
+                                       if startswith(d, "BP8-QD-")]))
+
+# An argument without a `global.dat` is a parent (e.g. a copied-down cluster
+# `output/`) and is expanded like the no-argument default. Only runs named one
+# by one count as explicit, so a parent still gets the finest-Δz reference.
+isrun(d) = isfile(joinpath(d, "global.dat"))
+explicit = !isempty(ARGS) && all(isrun, ARGS)
+dirs = isempty(ARGS) ? discover("output") :
+       reduce(vcat, [isrun(a) ? [a] : discover(a) for a in ARGS])
+
+# GS and PW are different problems; discovery must not score one against the
+# other. `BP8_COMPARE_VARIANT=GS` picks one when a parent holds both.
+variant(d) = (m = match(r"^BP8-QD-([A-Za-z]+)", basename(d)); m === nothing ? "?" : m.captures[1])
+if !explicit
+    want = get(ENV, "BP8_COMPARE_VARIANT", "")
+    isempty(want) || filter!(d -> variant(d) == want, dirs)
+    vs = unique(variant.(dirs))
+    length(vs) > 1 && error("""
+        discovered runs mix variants $(join(vs, ", ")); comparing across them is meaningless.
+        Set BP8_COMPARE_VARIANT to one of them, e.g. BP8_COMPARE_VARIANT=$(first(vs)).""")
+end
 length(dirs) >= 2 || error("""
     need at least two output directories to compare, found $(length(dirs)).
     Pass them explicitly, or copy the cluster's `output/` down first.""")
